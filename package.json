@@ -1,0 +1,17 @@
+{
+  "name": "meridien-api",
+  "version": "1.0.0",
+  "description": "API backend Eaji — rémunération de créateurs",
+  "main": "api-server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "bcrypt": "^5.1.1",
+    "pg": "^8.11.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
