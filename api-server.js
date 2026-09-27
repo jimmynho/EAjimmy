@@ -12,6 +12,7 @@
  */
 
 const express = require('express');
+const cors = require('cors');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 
@@ -20,6 +21,7 @@ const { resolvePaymentProvider, PROVIDER } = require('./payment-provider-router'
 const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissionRecord } = require('./admin-commission-engine');
 
 const app = express();
+app.use(cors()); // Autorise les appels depuis Netlify (à restreindre à ton domaine précis plus tard si besoin).
 app.use(express.json());
 
 const { Pool } = require('pg');
