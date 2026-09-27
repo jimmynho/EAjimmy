@@ -22,10 +22,29 @@ const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissi
 const app = express();
 app.use(express.json());
 
-// db : à remplacer par un vrai client (ex: require('./db') basé sur `pg`)
+const { Pool } = require('pg');
+
+// db : connexion réelle à PostgreSQL via la variable d'environnement DATABASE_URL
+// (fournie automatiquement par Railway une fois la base de données ajoutée au projet).
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
+});
+
 const db = {
-  query: async (_sql, _params) => { throw new Error('Connecter un vrai client PostgreSQL ici.'); },
+  // Retourne la première ligne du résultat (adapté à la plupart des requêtes de ce fichier,
+  // qui attendent un seul enregistrement — un créateur, un admin, etc.).
+  query: async (sql, params = []) => {
+    const result = await pool.query(sql, params);
+    return result.rows[0];
+  },
 };
+
+// Route de test simple : permet de vérifier que l'API répond, en ouvrant
+// simplement ton domaine dans un navigateur.
+app.get('/', (req, res) => {
+  res.json({ status: 'Eaji API en ligne', time: new Date().toISOString() });
+});
 
 // ==================== MIDDLEWARES ====================
 
