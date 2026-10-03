@@ -67,31 +67,47 @@ async function requireAuth(req, res, next) {
   }
 }
 
-async function requireAdminPrincipal(req, res, next) {
-  const adminId = req.headers['x-admin-id'];
+// Vérifie le jeton signé envoyé par le tableau de bord admin et renvoie
+// l'id admin qu'il contient — jamais fait confiance à un en-tête non signé.
+async function authenticateAdminToken(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) throw new Error('Authentification admin requise.');
+  const adminId = verifySessionToken(token); // lève une erreur si invalide/expiré
   const admin = await db.query('SELECT * FROM admins WHERE id = $1', [adminId]);
-  if (!admin || admin.role !== 'admin_principal') {
-    return res.status(403).json({ error: "Seul l'administrateur principal peut effectuer cette action." });
+  if (!admin || admin.status !== 'actif') throw new Error('Administrateur inconnu ou suspendu.');
+  return admin;
+}
+
+async function requireAdminPrincipal(req, res, next) {
+  try {
+    const admin = await authenticateAdminToken(req);
+    if (admin.role !== 'admin_principal') {
+      return res.status(403).json({ error: "Seul l'administrateur principal peut effectuer cette action." });
+    }
+    req.adminId = admin.id;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: e.message });
   }
-  req.adminId = adminId;
-  next();
 }
 
 // Laisse passer l'admin principal (accès total) ou un admin secondaire qui
 // détient explicitement la permission demandée.
 function requireAdminPermission(permission) {
   return async (req, res, next) => {
-    const adminId = req.headers['x-admin-id'];
-    const admin = await db.query('SELECT * FROM admins WHERE id = $1', [adminId]);
-    if (!admin) return res.status(403).json({ error: 'Administrateur inconnu.' });
-    if (admin.role === 'admin_principal') { req.adminId = adminId; return next(); }
-    const granted = await db.query(
-      'SELECT 1 FROM admin_permissions WHERE admin_id = $1 AND permission = $2',
-      [adminId, permission]
-    );
-    if (!granted) return res.status(403).json({ error: `Permission "${permission}" non accordée à cet administrateur.` });
-    req.adminId = adminId;
-    next();
+    try {
+      const admin = await authenticateAdminToken(req);
+      if (admin.role === 'admin_principal') { req.adminId = admin.id; return next(); }
+      const granted = await db.query(
+        'SELECT 1 FROM admin_permissions WHERE admin_id = $1 AND permission = $2',
+        [admin.id, permission]
+      );
+      if (!granted) return res.status(403).json({ error: `Permission "${permission}" non accordée à cet administrateur.` });
+      req.adminId = admin.id;
+      next();
+    } catch (e) {
+      res.status(401).json({ error: e.message });
+    }
   };
 }
 
@@ -640,6 +656,98 @@ app.patch('/api/admin/creators/:id', requireAdminPermission('gerer_comptes_utili
   res.json({ updated: true });
 });
 
+// ==================== CONNEXION ADMINISTRATEUR (DÉDIÉE) ====================
+// Les administrateurs ne sont PAS des créateurs — ce système est séparé de
+// /api/auth/login, qui ne concerne que les créateurs.
+
+// À exécuter UNE SEULE FOIS, au tout premier déploiement : crée l'administrateur
+// principal. Refuse de s'exécuter si un admin principal existe déjà, pour
+// qu'on ne puisse pas s'en servir pour prendre le contrôle plus tard.
+app.post('/api/admin/auth/bootstrap-principal', async (req, res) => {
+  const existing = await db.query("SELECT 1 FROM admins WHERE role = 'admin_principal'");
+  if (existing) {
+    return res.status(403).json({ error: 'Un administrateur principal existe déjà — cette route est à usage unique.' });
+  }
+  const { name, password, phones } = req.body; // phones : tableau, ex: ['+243823239572', '+243850171480']
+  if (!name || !password || !Array.isArray(phones) || phones.length === 0) {
+    return res.status(400).json({ error: 'name, password et phones (tableau) sont requis.' });
+  }
+  const passwordHash = await bcrypt.hash(password, 12);
+  const admin = await db.query(
+    "INSERT INTO admins (name, phone, password_hash, role) VALUES ($1, $2, $3, 'admin_principal') RETURNING id",
+    [name, phones[0], passwordHash]
+  );
+  for (const phone of phones) {
+    await db.query('INSERT INTO admin_phone_numbers (admin_id, phone) VALUES ($1, $2)', [admin.id, phone]);
+  }
+  res.status(201).json({ adminId: admin.id });
+});
+
+app.post('/api/admin/auth/login', async (req, res) => {
+  const { phone, password, ipAddress, deviceFingerprint } = req.body;
+
+  if (await isBlocklisted(ipAddress, deviceFingerprint)) {
+    return res.status(403).json({ error: 'Accès bloqué.' });
+  }
+
+  const phoneRow = await db.query('SELECT admin_id FROM admin_phone_numbers WHERE phone = $1', [phone]);
+  const admin = phoneRow ? await db.query('SELECT * FROM admins WHERE id = $1', [phoneRow.admin_id]) : null;
+  const passwordOk = admin && (await bcrypt.compare(password, admin.password_hash));
+
+  await db.query(
+    'INSERT INTO admin_login_attempts (phone_attempted, ip_address, device_fingerprint, success) VALUES ($1, $2, $3, $4)',
+    [phone, ipAddress, deviceFingerprint, !!passwordOk]
+  );
+
+  if (!passwordOk) {
+    const recentFailures = await db.query(
+      "SELECT COUNT(*) FROM admin_login_attempts WHERE ip_address = $1 AND success = FALSE AND created_at > now() - interval '15 minutes'",
+      [ipAddress]
+    );
+    if (recentFailures?.count >= 3) {
+      const alertCode = crypto.randomInt(100000, 999999).toString();
+      const alertHash = await bcrypt.hash(alertCode, 10);
+      await db.query(
+        'INSERT INTO admin_security_alerts (ip_address, device_fingerprint, confirmation_code_hash) VALUES ($1, $2, $3)',
+        [ipAddress, deviceFingerprint, alertHash]
+      );
+      // ⚠️ Mode test : brancher ici le vrai envoi SMS vers le(s) numéro(s) admin enregistré(s).
+    }
+    return res.status(401).json({ error: 'Identifiants refusés.' });
+  }
+
+  const code = await sendAdminVerificationCode(admin.id);
+  res.json({
+    adminId: admin.id,
+    message: 'Code de vérification envoyé.',
+    ...(code ? { devCode: code, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
+  });
+});
+
+app.post('/api/admin/auth/login/verify-2fa', async (req, res) => {
+  const { adminId, code } = req.body;
+  const record = await db.query(
+    'SELECT * FROM admin_verifications WHERE admin_id = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1',
+    [adminId]
+  );
+  if (!record || !(await bcrypt.compare(code, record.code_hash)) || new Date() > record.expires_at) {
+    return res.status(401).json({ error: 'Code invalide ou expiré.' });
+  }
+  await db.query('UPDATE admin_verifications SET verified = TRUE WHERE id = $1', [record.id]);
+  const token = signSessionToken(adminId);
+  res.json({ token, adminId });
+});
+
+async function sendAdminVerificationCode(adminId) {
+  const code = crypto.randomInt(100000, 999999).toString();
+  const codeHash = await bcrypt.hash(code, 10);
+  await db.query(
+    `INSERT INTO admin_verifications (admin_id, code_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')`,
+    [adminId, codeHash]
+  );
+  return SMS_PROVIDER_CONNECTED ? null : code;
+}
+
 // ==================== PROTECTION RENFORCÉE DU COMPTE ADMIN ====================
 // Rappel honnête : aucune mesure ne rend un compte "inviolable" à 100% — ce qui
 // suit empile plusieurs couches (détection, alerte humaine, blocage) plutôt que
@@ -652,44 +760,6 @@ async function isBlocklisted(ipAddress, deviceFingerprint) {
   );
   return !!hit;
 }
-
-// À appeler avant toute tentative de connexion admin (à brancher sur la route
-// de connexion admin réelle une fois le frontend admin relié à l'API).
-app.post('/api/admin/auth/login-attempt', async (req, res) => {
-  const { phone, password, ipAddress, deviceFingerprint } = req.body;
-
-  if (await isBlocklisted(ipAddress, deviceFingerprint)) {
-    return res.status(403).json({ error: 'Accès bloqué.' });
-  }
-
-  const admin = await db.query('SELECT * FROM admin_phone_numbers WHERE phone = $1', [phone]);
-  const success = !!admin; // la vérification réelle du mot de passe admin est à compléter ici
-
-  await db.query(
-    'INSERT INTO admin_login_attempts (phone_attempted, ip_address, device_fingerprint, success) VALUES ($1, $2, $3, $4)',
-    [phone, ipAddress, deviceFingerprint, success]
-  );
-
-  if (!success) {
-    const recentFailures = await db.query(
-      "SELECT COUNT(*) FROM admin_login_attempts WHERE ip_address = $1 AND success = FALSE AND created_at > now() - interval '15 minutes'",
-      [ipAddress]
-    );
-    if (recentFailures?.count >= 3) {
-      const code = crypto.randomInt(100000, 999999).toString();
-      const codeHash = await bcrypt.hash(code, 10);
-      await db.query(
-        'INSERT INTO admin_security_alerts (ip_address, device_fingerprint, confirmation_code_hash) VALUES ($1, $2, $3)',
-        [ipAddress, deviceFingerprint, codeHash]
-      );
-      // Brancher ici l'envoi réel du SMS au(x) numéro(s) admin enregistré(s),
-      // contenant ce code et demandant confirmation pour bloquer la source.
-    }
-    return res.status(401).json({ error: 'Identifiants refusés.' });
-  }
-
-  res.json({ success: true });
-});
 
 // Jimmy Komba confirme par le code reçu par SMS pour bloquer définitivement
 // la source d'une tentative suspecte.
