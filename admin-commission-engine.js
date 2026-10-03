@@ -7,9 +7,9 @@
  */
 
 const OPENING_COMMISSION = {
-  USD: 10,
-  EUR: 10,
-  CDF: 25000,
+  USD: 2,
+  EUR: 2,
+  CDF: 5000,
 };
 
 const WITHDRAWAL_COMMISSION_RATE = 0.01; // 1%
@@ -76,7 +76,7 @@ module.exports = {
 // ---- Exemple d'utilisation ----
 if (require.main === module) {
   console.log(calculateOpeningCommission('CDF'));
-  // → { amount: 25000, currency: 'CDF', type: 'ouverture' }
+  // → { amount: 5000, currency: 'CDF', type: 'ouverture' }
 
   console.log(calculateWithdrawalCommission(142.50, 'USD'));
   // → { amount: 1.43, currency: 'USD', type: 'retrait', netToCreator: 141.07 }
