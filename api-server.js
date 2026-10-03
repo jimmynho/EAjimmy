@@ -60,7 +60,7 @@ async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Authentification requise.' });
   try {
-    req.creatorId = await verifySessionToken(token); // à implémenter (JWT ou session store)
+    req.creatorId = verifySessionToken(token);
     next();
   } catch {
     res.status(401).json({ error: 'Session invalide ou expirée.' });
@@ -95,8 +95,29 @@ function requireAdminPermission(permission) {
   };
 }
 
-async function verifySessionToken(_token) {
-  throw new Error('À implémenter avec un vrai système de session/JWT.');
+// Jeton de session signé (sans dépendance externe type JWT) : contient l'id du
+// créateur + une expiration, signés avec une clé secrète. Si le jeton est modifié,
+// la signature ne correspond plus et il est rejeté.
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+  console.warn('⚠️  SESSION_SECRET manquant — définis une variable d\'environnement SESSION_SECRET longue et aléatoire sur Railway avant d\'accepter de vrais utilisateurs.');
+}
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
+
+function signSessionToken(creatorId) {
+  const payload = Buffer.from(JSON.stringify({ sub: creatorId, exp: Date.now() + SESSION_DURATION_MS })).toString('base64url');
+  const signature = crypto.createHmac('sha256', SESSION_SECRET || 'dev-secret-non-securise').update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifySessionToken(token) {
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) throw new Error('Jeton malformé.');
+  const expectedSignature = crypto.createHmac('sha256', SESSION_SECRET || 'dev-secret-non-securise').update(payload).digest('base64url');
+  if (signature !== expectedSignature) throw new Error('Signature invalide.');
+  const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+  if (Date.now() > data.exp) throw new Error('Jeton expiré.');
+  return data.sub;
 }
 
 // ==================== AUTHENTIFICATION & 2FA ====================
@@ -113,7 +134,7 @@ app.post('/api/auth/register', async (req, res) => {
     [name, email, phone, passwordHash, countryCode, zone, primaryContentType]
   );
 
-  await sendVerificationCode(creator.id, 'sms', phone);
+  const smsCode = await sendVerificationCode(creator.id, 'sms', phone);
   await sendVerificationCode(creator.id, 'gmail', email);
 
   // Commission d'ouverture de compte pour l'admin qui a traité l'inscription
@@ -121,7 +142,11 @@ app.post('/api/auth/register', async (req, res) => {
   // const commission = calculateOpeningCommission(req.body.currency);
   // await db.query('INSERT INTO admin_commissions ...', buildCommissionRecord({...}));
 
-  res.status(201).json({ creatorId: creator.id, message: 'Codes de vérification envoyés (SMS + Gmail).' });
+  res.status(201).json({
+    creatorId: creator.id,
+    message: 'Codes de vérification envoyés (SMS + Gmail).',
+    ...(smsCode ? { devCode: smsCode, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
+  });
 });
 
 // Vérifie un des deux canaux (sms ou gmail). Le compte est actif
@@ -150,8 +175,12 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (!passwordOk) return res.status(401).json({ error: 'Identifiants invalides.' });
 
-  await sendVerificationCode(creator.id, 'sms', creator.phone);
-  res.json({ creatorId: creator.id, message: 'Code de vérification envoyé par SMS.' });
+  const smsCode = await sendVerificationCode(creator.id, 'sms', creator.phone);
+  res.json({
+    creatorId: creator.id,
+    message: 'Code de vérification envoyé par SMS.',
+    ...(smsCode ? { devCode: smsCode, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
+  });
 });
 
 // Connexion étape 2 : validation de l'OTP → émission de la session.
@@ -164,9 +193,18 @@ app.post('/api/auth/login/verify-2fa', async (req, res) => {
   if (!record || !(await bcrypt.compare(code, record.code_hash))) {
     return res.status(401).json({ error: 'Code invalide.' });
   }
-  const token = crypto.randomBytes(32).toString('hex'); // à remplacer par un vrai JWT signé
+  await db.query('UPDATE account_verifications SET verified = TRUE WHERE id = $1', [record.id]);
+  const token = signSessionToken(creatorId);
   res.json({ token });
 });
+
+// ⚠️ MODE TEST : tant qu'aucun fournisseur SMS/email réel n'est branché (voir plus
+// bas), cette fonction renvoie le code en clair pour que l'inscription/connexion
+// reste testable avec de vrais comptes. SMS_PROVIDER_CONNECTED doit passer à "true"
+// dans les variables Railway dès qu'un vrai envoi est en place — sinon n'importe qui
+// connaissant un email/téléphone peut usurper un compte. Ne jamais ouvrir de vrais
+// paiements tant que ce n'est pas fait.
+const SMS_PROVIDER_CONNECTED = process.env.SMS_PROVIDER_CONNECTED === 'true';
 
 async function sendVerificationCode(creatorId, channel, _destination) {
   const code = crypto.randomInt(100000, 999999).toString();
@@ -177,6 +215,7 @@ async function sendVerificationCode(creatorId, channel, _destination) {
     [creatorId, channel, codeHash]
   );
   // Brancher ici l'envoi réel : SMS (ex: Twilio/Africa's Talking) ou email (Gmail API/SMTP).
+  return SMS_PROVIDER_CONNECTED ? null : code;
 }
 
 async function logLoginAttempt({ creatorId, ipAddress, deviceFingerprint, success }) {
