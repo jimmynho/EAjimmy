@@ -300,9 +300,32 @@ CREATE TABLE admins (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
   phone TEXT NOT NULL,
+  password_hash TEXT, -- NULL tant que le premier mot de passe n'a pas été défini (voir /api/admin/auth/set-initial-password)
   role TEXT NOT NULL CHECK (role IN ('admin_principal', 'admin')),
   approved_by UUID REFERENCES admins(id), -- NULL uniquement pour l'admin principal fondateur
   status TEXT NOT NULL DEFAULT 'actif' CHECK (status IN ('actif', 'suspendu')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Vérification 2FA dédiée aux administrateurs — distincte de account_verifications
+-- (réservée aux créateurs), car un admin n'est pas une ligne de la table creators.
+CREATE TABLE admin_verifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_id UUID NOT NULL REFERENCES admins(id),
+  code_hash TEXT NOT NULL,
+  verified BOOLEAN NOT NULL DEFAULT FALSE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Codes de vérification 2FA propres aux administrateurs (distinct de
+-- account_verifications, qui concerne les créateurs).
+CREATE TABLE admin_verifications (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_id UUID NOT NULL REFERENCES admins(id),
+  code_hash TEXT NOT NULL,
+  verified BOOLEAN NOT NULL DEFAULT FALSE,
+  expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -326,6 +349,7 @@ CREATE TABLE admin_commissions (
 
 -- ==================== DONNÉE INITIALE ====================
 
--- Administrateur principal (Jimmy Komba), à insérer au déploiement initial.
--- INSERT INTO admins (name, role) VALUES ('Jimmy Komba', 'admin_principal');
--- Puis lier les deux numéros dans admin_phone_numbers.
+-- L'administrateur principal (Jimmy Komba) n'est plus inséré ici manuellement :
+-- il se crée une seule fois via POST /api/admin/auth/bootstrap-principal
+-- (voir api-server.js), qui fixe son mot de passe correctement haché et refuse
+-- de s'exécuter une deuxième fois une fois qu'un admin principal existe déjà.
