@@ -191,19 +191,21 @@ app.post('/api/auth/login', async (req, res) => {
 
   if (!passwordOk) return res.status(401).json({ error: 'Identifiants invalides.' });
 
-  const smsCode = await sendVerificationCode(creator.id, 'sms', creator.phone);
+  const { code: devCode, channel } = await sendLoginOtp(creator);
+  const channelLabel = { gmail: 'par email', sms: 'par SMS', demo: '(mode test)' }[channel];
   res.json({
     creatorId: creator.id,
-    message: 'Code de vérification envoyé par SMS.',
-    ...(smsCode ? { devCode: smsCode, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
+    message: `Code de vérification envoyé ${channelLabel}.`,
+    ...(devCode ? { devCode, devWarning: 'Mode test — aucun email/SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
   });
 });
 
 // Connexion étape 2 : validation de l'OTP → émission de la session.
+// Peu importe le canal utilisé (email ou SMS) — on prend le dernier code non vérifié.
 app.post('/api/auth/login/verify-2fa', async (req, res) => {
   const { creatorId, code } = req.body;
   const record = await db.query(
-    "SELECT * FROM account_verifications WHERE creator_id = $1 AND channel = 'sms' AND verified = FALSE ORDER BY created_at DESC LIMIT 1",
+    "SELECT * FROM account_verifications WHERE creator_id = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1",
     [creatorId]
   );
   if (!record || !(await bcrypt.compare(code, record.code_hash))) {
@@ -214,15 +216,89 @@ app.post('/api/auth/login/verify-2fa', async (req, res) => {
   res.json({ token });
 });
 
-// ⚠️ MODE TEST : tant qu'aucun fournisseur SMS/email réel n'est branché (voir plus
-// bas), cette fonction renvoie le code en clair pour que l'inscription/connexion
-// reste testable avec de vrais comptes. SMS_PROVIDER_CONNECTED doit passer à "true"
-// dans les variables Railway dès qu'un vrai envoi est en place — sinon n'importe qui
-// connaissant un email/téléphone peut usurper un compte. Ne jamais ouvrir de vrais
-// paiements tant que ce n'est pas fait.
-const SMS_PROVIDER_CONNECTED = process.env.SMS_PROVIDER_CONNECTED === 'true';
+// SMS réel via Twilio — s'active automatiquement dès que les 3 variables
+// TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER sont présentes
+// sur Railway. Tant qu'elles n'y sont pas, le code reste exposé en clair dans
+// la réponse API (mode test) pour que l'inscription/connexion reste testable.
+// ⚠️ Ne jamais ouvrir de vrais paiements tant que SMS_PROVIDER_CONNECTED n'est
+// pas vrai — sinon n'importe qui connaissant un téléphone peut usurper un compte.
+const SMS_PROVIDER_CONNECTED = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
 
-async function sendVerificationCode(creatorId, channel, _destination) {
+let twilioClient = null;
+if (SMS_PROVIDER_CONNECTED) {
+  twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+} else {
+  console.warn('⚠️  Twilio non configuré — les codes de vérification restent en mode test (exposés dans la réponse API, jamais envoyés par vrai SMS).');
+}
+
+async function sendSmsReal(toPhone, body) {
+  await twilioClient.messages.create({
+    to: toPhone,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    body,
+  });
+}
+
+// Email réel et GRATUIT via Gmail — s'active dès que GMAIL_USER et
+// GMAIL_APP_PASSWORD sont présents sur Railway. GMAIL_APP_PASSWORD n'est PAS
+// le mot de passe normal du compte Gmail : c'est un "mot de passe d'application"
+// à 16 caractères, généré depuis myaccount.google.com/apppasswords (nécessite
+// la validation en 2 étapes activée sur ce compte Gmail — gratuit, aucune carte
+// bancaire requise).
+const EMAIL_PROVIDER_CONNECTED = !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+
+let mailTransporter = null;
+if (EMAIL_PROVIDER_CONNECTED) {
+  mailTransporter = require('nodemailer').createTransport({
+    service: 'gmail',
+    auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+  });
+} else {
+  console.warn('⚠️  Gmail non configuré — pas d\'envoi d\'email réel pour l\'instant.');
+}
+
+async function sendEmailReal(toEmail, subject, text) {
+  await mailTransporter.sendMail({ from: process.env.GMAIL_USER, to: toEmail, subject, text });
+}
+
+// Choisit le meilleur canal disponible pour un code de connexion, en
+// privilégiant toujours le gratuit (email) tant que Twilio n'est pas payé.
+// Écrit dans account_verifications avec le canal réellement utilisé, pour
+// que verify-2fa retrouve le bon enregistrement peu importe le canal.
+async function sendLoginOtp(creator) {
+  const code = crypto.randomInt(100000, 999999).toString();
+  const codeHash = await bcrypt.hash(code, 10);
+
+  let channel = 'demo';
+  if (EMAIL_PROVIDER_CONNECTED) channel = 'gmail';
+  else if (SMS_PROVIDER_CONNECTED) channel = 'sms';
+
+  await db.query(
+    `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at)
+     VALUES ($1, $2, $3, now() + interval '10 minutes')`,
+    [creator.id, channel, codeHash]
+  );
+
+  if (channel === 'gmail') {
+    try {
+      await sendEmailReal(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable 10 minutes).`);
+      return { code: null, channel };
+    } catch (e) {
+      console.error('Échec envoi email Gmail :', e.message);
+    }
+  } else if (channel === 'sms') {
+    try {
+      await sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`);
+      return { code: null, channel };
+    } catch (e) {
+      console.error('Échec envoi SMS Twilio :', e.message);
+    }
+  }
+
+  return { code, channel: 'demo' }; // repli mode test si rien n'est configuré ou que l'envoi échoue
+}
+
+async function sendVerificationCode(creatorId, channel, destination) {
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
   await db.query(
@@ -230,8 +306,28 @@ async function sendVerificationCode(creatorId, channel, _destination) {
      VALUES ($1, $2, $3, now() + interval '10 minutes')`,
     [creatorId, channel, codeHash]
   );
-  // Brancher ici l'envoi réel : SMS (ex: Twilio/Africa's Talking) ou email (Gmail API/SMTP).
-  return SMS_PROVIDER_CONNECTED ? null : code;
+
+  if (channel === 'sms' && SMS_PROVIDER_CONNECTED) {
+    try {
+      await sendSmsReal(destination, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`);
+    } catch (e) {
+      console.error('Échec envoi SMS Twilio :', e.message);
+      // On ne bloque pas l'inscription/connexion si Twilio échoue temporairement,
+      // mais le code n'a alors été transmis nulle part — à surveiller en prod.
+    }
+    return null;
+  }
+
+  if (channel === 'gmail' && EMAIL_PROVIDER_CONNECTED) {
+    try {
+      await sendEmailReal(destination, 'Eaji — confirme ton compte', `Ton code de vérification : ${code} (valable 10 minutes).`);
+    } catch (e) {
+      console.error('Échec envoi email Gmail :', e.message);
+    }
+    return null;
+  }
+
+  return code; // mode test : aucun des deux canaux n'est configuré pour ce type d'envoi
 }
 
 async function logLoginAttempt({ creatorId, ipAddress, deviceFingerprint, success }) {
@@ -707,16 +803,27 @@ app.post('/api/admin/auth/login', async (req, res) => {
     if (recentFailures?.count >= 3) {
       const alertCode = crypto.randomInt(100000, 999999).toString();
       const alertHash = await bcrypt.hash(alertCode, 10);
-      await db.query(
-        'INSERT INTO admin_security_alerts (ip_address, device_fingerprint, confirmation_code_hash) VALUES ($1, $2, $3)',
+      const alert = await db.query(
+        'INSERT INTO admin_security_alerts (ip_address, device_fingerprint, confirmation_code_hash) VALUES ($1, $2, $3) RETURNING id',
         [ipAddress, deviceFingerprint, alertHash]
       );
-      // ⚠️ Mode test : brancher ici le vrai envoi SMS vers le(s) numéro(s) admin enregistré(s).
+      if (SMS_PROVIDER_CONNECTED) {
+        const allAdminPhones = await db.all('SELECT phone FROM admin_phone_numbers');
+        for (const row of allAdminPhones) {
+          try {
+            await sendSmsReal(row.phone, `Eaji — tentative de connexion suspecte sur le compte admin (ref. ${alert.id.slice(0, 8)}). Code pour bloquer la source : ${alertCode}`);
+          } catch (e) {
+            console.error('Échec envoi SMS alerte sécurité :', e.message);
+          }
+        }
+      } else {
+        console.warn(`⚠️ Mode test — code de blocage de sécurité (alerte ${alert.id}) : ${alertCode}`);
+      }
     }
     return res.status(401).json({ error: 'Identifiants refusés.' });
   }
 
-  const code = await sendAdminVerificationCode(admin.id);
+  const code = await sendAdminVerificationCode(admin.id, phone);
   res.json({
     adminId: admin.id,
     message: 'Code de vérification envoyé.',
@@ -738,13 +845,22 @@ app.post('/api/admin/auth/login/verify-2fa', async (req, res) => {
   res.json({ token, adminId });
 });
 
-async function sendAdminVerificationCode(adminId) {
+async function sendAdminVerificationCode(adminId, phone) {
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
   await db.query(
     `INSERT INTO admin_verifications (admin_id, code_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')`,
     [adminId, codeHash]
   );
+
+  if (SMS_PROVIDER_CONNECTED && phone) {
+    try {
+      await sendSmsReal(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`);
+    } catch (e) {
+      console.error('Échec envoi SMS admin Twilio :', e.message);
+    }
+    return null;
+  }
   return SMS_PROVIDER_CONNECTED ? null : code;
 }
 
