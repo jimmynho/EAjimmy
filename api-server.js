@@ -1,4 +1,5 @@
-* API backend — Eaji
+/**
+ * API backend — Eaji
  * -----------------------------------------------------------------
  * Relie les modules déjà écrits (rate-engine, payment-provider-router,
  * admin-commission-engine) au schéma de données (schema.sql) via une
