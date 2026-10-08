@@ -26,6 +26,20 @@ const app = express();
 app.use(cors()); // Autorise les appels depuis Netlify (à restreindre à ton domaine précis plus tard si besoin).
 app.use(express.json());
 
+// Filet de sécurité : une erreur dans une route (base de données, etc.) renvoie un message
+// propre au lieu de faire planter tout le serveur.
+for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+  const original = app[method].bind(app);
+  app[method] = (path, ...handlers) => {
+    if (handlers.length === 0) return original(path); // app.get('réglage') d'Express
+    return original(path, ...handlers.map((h) =>
+      typeof h === 'function' && h.length < 4
+        ? (req, res, next) => Promise.resolve(h(req, res, next)).catch(next)
+        : h
+    ));
+  };
+}
+
 const { Pool } = require('pg');
 
 // db : connexion réelle à PostgreSQL via la variable d'environnement DATABASE_URL
@@ -915,6 +929,20 @@ app.post('/api/admin/security/confirm-block', async (req, res) => {
     [alert.ip_address, alert.device_fingerprint]
   );
   res.json({ blocked: true });
+});
+
+// Gestionnaire d'erreurs final (doit rester après toutes les routes).
+app.use((err, req, res, next) => {
+  console.error('[Eaji] Erreur sur', req.method, req.path, '→', err.message);
+  if (res.headersSent) return next(err);
+  if (err && err.code === '23505') {
+    return res.status(409).json({ error: 'Cet email ou ce numéro de téléphone est déjà utilisé.' });
+  }
+  res.status(500).json({ error: 'Erreur du serveur. Réessaie dans un instant.' });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Eaji] Erreur non gérée :', reason);
 });
 
 module.exports = app;
