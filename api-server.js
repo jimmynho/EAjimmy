@@ -1,5 +1,4 @@
-/**
- * API backend — Eaji
+* API backend — Eaji
  * -----------------------------------------------------------------
  * Relie les modules déjà écrits (rate-engine, payment-provider-router,
  * admin-commission-engine) au schéma de données (schema.sql) via une
@@ -20,6 +19,7 @@ const { calculateEligibility, calculateMonthlyPayout } = require('./rate-engine'
 const { resolvePaymentProvider, PROVIDER } = require('./payment-provider-router');
 const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissionRecord } = require('./admin-commission-engine');
 const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require('./content-limits');
+const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl } = require('./storage');
 
 const app = express();
 app.use(cors()); // Autorise les appels depuis Netlify (à restreindre à ton domaine précis plus tard si besoin).
@@ -447,6 +447,21 @@ async function getLatestMetrics(creatorId) {
 
 // ==================== CONTENUS & MODÉRATION ====================
 
+// Étape 1 de l'envoi d'un fichier : le site demande une adresse temporaire,
+// puis envoie le fichier directement au stockage (B2), puis appelle POST /api/content.
+app.post('/api/content/upload-url', requireAuth, async (req, res) => {
+  if (!STORAGE_CONNECTED) {
+    return res.status(503).json({ error: "Le stockage de fichiers n'est pas encore activé sur le serveur." });
+  }
+  const { contentType, fileName, mimeType, fileSizeBytes } = req.body;
+  const sizeCheck = validateFileSize(contentType, fileSizeBytes);
+  if (!sizeCheck.valid) return res.status(400).json({ error: sizeCheck.error });
+
+  const storageKey = buildStorageKey(req.creatorId, fileName);
+  const uploadUrl = await createUploadUrl(storageKey, mimeType);
+  res.json({ uploadUrl, storageKey });
+});
+
 app.post('/api/content', requireAuth, async (req, res) => {
   const { contentType, title, storageUrl, visibilityScope, fileSizeBytes } = req.body;
 
@@ -504,6 +519,7 @@ app.post('/api/gifts', requireAuth, async (req, res) => {
 app.get('/api/feed', async (req, res) => {
   const items = await db.all(
     `SELECT c.id, c.title, c.content_type, c.created_at,
+            c.storage_url,
             cr.id AS creator_id, cr.name AS creator_name,
             (SELECT COUNT(*) FROM content_likes WHERE content_id = c.id) AS like_count,
             (SELECT COUNT(*) FROM content_comments WHERE content_id = c.id) AS comment_count
@@ -513,6 +529,10 @@ app.get('/api/feed', async (req, res) => {
      ORDER BY c.created_at DESC
      LIMIT 30`
   );
+  for (const item of items) {
+    item.fileUrl = await createDownloadUrl(item.storage_url).catch(() => null);
+    delete item.storage_url;
+  }
   res.json({ items });
 });
 
