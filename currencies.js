@@ -34,6 +34,20 @@ const COUNTRY_CURRENCIES = {
   TH: ['THB'], TL: ['USD'], TM: ['TMT'], TR: ['TRY'], VN: ['VND'], YE: ['YER'],
   // Europe centrale
   DE: ['EUR'], AT: ['EUR'], HU: ['HUF'], LI: ['CHF'], PL: ['PLN'], SK: ['EUR'], SI: ['EUR'], CH: ['CHF'], CZ: ['CZK'],
+  HK: ['HKD'], MO: ['MOP'],
+  // Amérique
+  US: ['USD'], CA: ['CAD'], MX: ['MXN'], GT: ['GTQ'], BZ: ['BZD'], HN: ['HNL'], SV: ['USD'], NI: ['NIO'], CR: ['CRC'],
+  PA: ['USD', 'PAB'], CO: ['COP'], VE: ['VES', 'USD'], EC: ['USD'], PE: ['PEN'], BO: ['BOB'], BR: ['BRL'], PY: ['PYG'],
+  UY: ['UYU'], AR: ['ARS'], CL: ['CLP'], GY: ['GYD'], SR: ['SRD'], PR: ['USD'],
+  // Europe
+  FR: ['EUR'], BE: ['EUR'], NL: ['EUR'], LU: ['EUR'], GB: ['GBP'], IE: ['EUR'], ES: ['EUR'], PT: ['EUR'], IT: ['EUR'],
+  MT: ['EUR'], GR: ['EUR'], CY: ['EUR'], DK: ['DKK'], SE: ['SEK'], NO: ['NOK'], FI: ['EUR'], IS: ['ISK'], EE: ['EUR'],
+  LV: ['EUR'], LT: ['EUR'], RO: ['RON'], BG: ['EUR'], HR: ['EUR'], RS: ['RSD'], BA: ['BAM'], ME: ['EUR'], MK: ['MKD'],
+  AL: ['ALL'], XK: ['EUR'], MD: ['MDL'], UA: ['UAH'], BY: ['BYN'], RU: ['RUB'], MC: ['EUR'], AD: ['EUR'], SM: ['EUR'],
+  VA: ['EUR'],
+  // Océanie
+  AU: ['AUD'], NZ: ['NZD'], PG: ['PGK'], FJ: ['FJD'], SB: ['SBD'], VU: ['VUV'], WS: ['WST'], TO: ['TOP'], KI: ['AUD'],
+  TV: ['AUD'], NR: ['AUD'], PW: ['USD'], FM: ['USD'], MH: ['USD'],
 };
 
 // Devises internationales proposées à tout le monde.
