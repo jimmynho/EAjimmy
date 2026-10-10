@@ -21,6 +21,8 @@ const DELETION_STATEMENTS = [
   'DELETE FROM ad_subscriptions WHERE creator_id = $1',
   'DELETE FROM live_sessions WHERE creator_id = $1',
   'DELETE FROM follows WHERE follower_id = $1 OR followed_id = $1',
+  'DELETE FROM blocks WHERE blocker_id = $1 OR blocked_id = $1',
+  'DELETE FROM calls WHERE caller_id = $1 OR callee_id = $1',
   'DELETE FROM direct_messages WHERE sender_id = $1 OR recipient_id = $1',
   'DELETE FROM account_verifications WHERE creator_id = $1',
   'DELETE FROM login_attempts WHERE creator_id = $1',
