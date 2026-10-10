@@ -24,6 +24,8 @@ const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require(
 const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl, uploadThroughServer, tryEnableBrowserUploads } = require('./storage');
 const { deleteCreatorAccount } = require('./account-deletion');
 const moneyRoutes = require('./monetization-routes');
+const liveRoutes = require('./live-routes');
+const extrasRoutes = require('./extras-routes');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -100,6 +102,10 @@ async function runStartupMigrations() {
        ('afrique', 'caraibes', 'amerique', 'asie', 'europe', 'oceanie'))`,
     // Argent : paiements, premium, vidéos payantes, ventes, publicité, portefeuille (monetization-routes.js).
     ...moneyRoutes.MIGRATIONS,
+    // Direct : spectateurs connectés et fil du live (live-routes.js).
+    ...liveRoutes.MIGRATIONS,
+    // Rémunération mensuelle, mot de passe oublié, notifications (extras-routes.js).
+    ...extrasRoutes.MIGRATIONS,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -109,6 +115,7 @@ async function runStartupMigrations() {
 runStartupMigrations();
 tryEnableBrowserUploads();
 
+// (les notifications sont créées après la définition de db, voir plus bas)
 const db = {
   // Retourne la première ligne du résultat (adapté à la plupart des requêtes de ce fichier,
   // qui attendent un seul enregistrement — un créateur, un admin, etc.).
@@ -122,6 +129,9 @@ const db = {
     return result.rows;
   },
 };
+
+// Notifications dans l'application (nouvel abonné, message, cadeau, paiement, live...).
+const notify = extrasRoutes.makeNotifier(db);
 
 // Route de test simple : permet de vérifier que l'API répond, en ouvrant
 // simplement ton domaine dans un navigateur.
@@ -255,6 +265,9 @@ app.post('/api/auth/register', async (req, res) => {
     [String(name).trim(), email, String(phone).replace(/[\s.-]/g, ''), passwordHash, String(countryCode).toUpperCase(), zone,
      primaryContentType || 'video_courte', language || 'fr', giftCurrency]
   );
+  if (req.body.acceptTerms === true) {
+    await db.query('UPDATE creators SET terms_accepted_at = now() WHERE id = $1', [creator.id]);
+  }
   // Pas d'envoi de code ici : le site enchaîne aussitôt sur la connexion, qui envoie UN seul code.
   // (Avant, deux codes différents partaient par email, et le premier ne marchait plus.)
   const smsCode = null;
@@ -740,15 +753,31 @@ app.post('/api/live/start', requireAuth, async (req, res) => {
   if (!isLiveEligible(subscribers)) {
     return res.status(403).json({ error: `Live réservé aux créateurs ayant au moins ${LIVE_SUBSCRIBER_THRESHOLD} abonnés.` });
   }
+  // Un seul live à la fois : un ancien live resté ouvert (téléphone éteint…) est fermé.
+  await db.query("UPDATE live_sessions SET status = 'termine', ended_at = now() WHERE creator_id = $1 AND status = 'en_cours'", [req.creatorId]);
   const session = await db.query(
     'INSERT INTO live_sessions (creator_id) VALUES ($1) RETURNING id',
     [req.creatorId]
   );
+  // Les abonnés sont prévenus que le live commence.
+  const host = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
+  await db.query(
+    `INSERT INTO notifications (creator_id, kind, text, link)
+     SELECT follower_id, 'live', $2, $3 FROM follows WHERE followed_id = $1`,
+    [req.creatorId, `🔴 ${host.name} est en direct maintenant !`, `live:${session.id}`]
+  ).catch(() => {});
   res.status(201).json({ liveSessionId: session.id });
 });
 
+// Seul le créateur peut terminer SON live.
 app.post('/api/live/:id/end', requireAuth, async (req, res) => {
-  await db.query("UPDATE live_sessions SET status = 'termine', ended_at = now() WHERE id = $1", [req.params.id]);
+  const live = await db.query(
+    "UPDATE live_sessions SET status = 'termine', ended_at = now() WHERE id = $1 AND creator_id = $2 AND status = 'en_cours' RETURNING id",
+    [req.params.id, req.creatorId]
+  );
+  if (!live) return res.status(404).json({ error: 'Live introuvable ou déjà terminé.' });
+  await db.query('UPDATE live_viewers SET left_at = now() WHERE live_id = $1 AND left_at IS NULL', [live.id]);
+  await db.query("INSERT INTO live_events (live_id, author_id, kind, text) VALUES ($1, $2, 'fin', 'Le live est terminé.')", [live.id, req.creatorId]);
   res.json({ ended: true });
 });
 
@@ -935,6 +964,8 @@ app.post('/api/creators/:id/follow', requireAuth, async (req, res) => {
      ON CONFLICT (follower_id, followed_id) DO NOTHING`,
     [req.creatorId, req.params.id]
   );
+  const fan = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
+  if (fan) notify(req.params.id, 'abonne', `👤 ${fan.name} s'est abonné(e) à toi.`, `creator:${req.creatorId}`);
   res.status(201).json({ following: true });
 });
 
@@ -1077,8 +1108,13 @@ app.get('/api/currencies', (req, res) => {
 
 // ==================== ARGENT : PREMIUM, VENTES, CADEAUX, DONS, PUBLICITÉ, PORTEFEUILLE ====================
 const money = moneyRoutes.register({
-  app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency,
+  app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify,
 });
+extrasRoutes.register({
+  app, db, bcrypt, requireAuth, requireAdminPrincipal, requireAdminPermission, optionalViewerId, createDownloadUrl, isMonetizedCreator,
+  trySendEmail, sendSms: SMS_PROVIDER_CONNECTED ? sendSmsReal : null, notify,
+});
+liveRoutes.register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, isBlockedBetween, isMonetizedCreator });
 
 // Prix de vente d'un contenu (réservé aux membres premium). null = pas à vendre.
 async function parseSalePrice(raw, creatorId) {
@@ -1337,6 +1373,8 @@ app.post('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
     'INSERT INTO direct_messages (sender_id, recipient_id, text) VALUES ($1, $2, $3) RETURNING id',
     [req.creatorId, req.params.withCreatorId, text]
   );
+  const sender = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
+  if (sender) notify(req.params.withCreatorId, 'message', `💬 Nouveau message de ${sender.name}.`, `dm:${req.creatorId}`);
   res.status(201).json({ messageId: message.id });
 });
 
@@ -1486,7 +1524,10 @@ app.get('/api/admin/creators', requireAdminPermission('gerer_comptes_utilisateur
               COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id
                         ORDER BY verified_at DESC LIMIT 1), 0),
               (SELECT COUNT(*)::int FROM follows WHERE followed_id = c.id)
-            ) AS subscribers
+            ) AS subscribers,
+            (SELECT MAX(ends_at) FROM premium_subscriptions WHERE creator_id = c.id AND ends_at > now()) AS premium_until,
+            (SELECT MAX(ends_at) FROM premium_subscriptions WHERE creator_id = c.id AND ends_at > now() AND plan LIKE 'entreprise%') AS business_until,
+            EXISTS (SELECT 1 FROM premium_subscriptions WHERE creator_id = c.id AND ends_at > now() AND plan LIKE '%_offert') AS has_gift
      FROM creators c ORDER BY c.created_at DESC LIMIT 500`
   );
   creators.forEach((c) => { c.monetized = isMonetizedCreator(c.country_code, c.phone); });
