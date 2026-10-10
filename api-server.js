@@ -21,6 +21,7 @@ const { resolvePaymentProvider, PROVIDER } = require('./payment-provider-router'
 const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissionRecord } = require('./admin-commission-engine');
 const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require('./content-limits');
 const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl } = require('./storage');
+const { deleteCreatorAccount } = require('./account-deletion');
 
 const app = express();
 app.use(cors()); // Autorise les appels depuis Netlify (à restreindre à ton domaine précis plus tard si besoin).
@@ -48,6 +49,31 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
 });
+
+// Mises à jour de la base appliquées automatiquement au démarrage du serveur.
+// Chacune est sans risque si elle a déjà été faite (IF NOT EXISTS).
+// Aucun argent ne doit être annoncé comme encaissé ou versé tant qu'un vrai prestataire de
+// paiement (mobile money / Stripe) n'est pas branché. Mettre PAYMENTS_ENABLED=true sur Railway
+// seulement à ce moment-là.
+const PAYMENTS_ENABLED = process.env.PAYMENTS_ENABLED === 'true';
+const PAYMENTS_DISABLED_MESSAGE =
+  "Les paiements en ligne ne sont pas encore activés. Ils le seront dès l'ouverture du compte de paiement (mobile money / Stripe).";
+function requirePayments(req, res, next) {
+  if (!PAYMENTS_ENABLED) return res.status(503).json({ error: PAYMENTS_DISABLED_MESSAGE });
+  next();
+}
+
+async function runStartupMigrations() {
+  const steps = [
+    // Compteur de vues par contenu : nécessaire à la règle « 1 000 vues ».
+    'ALTER TABLE content_items ADD COLUMN IF NOT EXISTS view_count INTEGER NOT NULL DEFAULT 0',
+  ];
+  for (const sql of steps) {
+    try { await pool.query(sql); }
+    catch (e) { console.error('[Eaji] Mise à jour de la base ignorée :', e.message); }
+  }
+}
+runStartupMigrations();
 
 const db = {
   // Retourne la première ligne du résultat (adapté à la plupart des requêtes de ce fichier,
@@ -168,10 +194,21 @@ app.post('/api/auth/register', async (req, res) => {
   const smsCode = await sendVerificationCode(creator.id, 'sms', phone);
   await sendVerificationCode(creator.id, 'gmail', email);
 
-  // Commission d'ouverture de compte pour l'admin qui a traité l'inscription
-  // (currency à déterminer selon le choix de l'utilisateur à l'inscription).
-  // const commission = calculateOpeningCommission(req.body.currency);
-  // await db.query('INSERT INTO admin_commissions ...', buildCommissionRecord({...}));
+  // Commission d'ouverture de compte (2 $ / 2 € / 5 000 FC) créditée à l'administrateur principal.
+  // Ne bloque jamais l'inscription si l'enregistrement échoue.
+  try {
+    const principal = await db.query("SELECT id FROM admins WHERE role = 'admin_principal' LIMIT 1");
+    if (principal) {
+      const commission = calculateOpeningCommission(req.body.currency || 'USD');
+      await db.query(
+        `INSERT INTO admin_commissions (admin_id, creator_id, type, amount, currency)
+         VALUES ($1, $2, 'ouverture', $3, $4)`,
+        [principal.id, creator.id, commission.amount, commission.currency]
+      );
+    }
+  } catch (e) {
+    console.error('[Eaji] Commission d\'ouverture non enregistrée :', e.message);
+  }
 
   res.status(201).json({
     creatorId: creator.id,
@@ -205,6 +242,9 @@ app.post('/api/auth/login', async (req, res) => {
   await logLoginAttempt({ creatorId: creator?.id, ipAddress, deviceFingerprint, success: !!passwordOk });
 
   if (!passwordOk) return res.status(401).json({ error: 'Identifiants invalides.' });
+  if (creator.account_status && creator.account_status !== 'actif') {
+    return res.status(403).json({ error: 'Ce compte est suspendu. Contacte l\'administrateur.' });
+  }
 
   const { code: devCode, channel } = await sendLoginOtp(creator);
   const channelLabel = { gmail: 'par email', sms: 'par SMS', demo: '(mode test)' }[channel];
@@ -288,10 +328,12 @@ async function sendLoginOtp(creator) {
   if (EMAIL_PROVIDER_CONNECTED) channel = 'gmail';
   else if (SMS_PROVIDER_CONNECTED) channel = 'sms';
 
+  // La base n'accepte que 'sms' ou 'gmail' comme canal : en mode test (aucun envoi
+  // configuré), on enregistre 'gmail' — le code reste valable de la même façon.
   await db.query(
     `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at)
      VALUES ($1, $2, $3, now() + interval '10 minutes')`,
-    [creator.id, channel, codeHash]
+    [creator.id, channel === 'sms' ? 'sms' : 'gmail', codeHash]
   );
 
   if (channel === 'gmail') {
@@ -370,6 +412,15 @@ async function notifyAccountOwnerImmediately(_creatorId) {
 // ==================== PROFIL & CONFIDENTIALITÉ ====================
 
 // Le solde n'est jamais renvoyé à quelqu'un d'autre que le propriétaire.
+// Historique réel des paiements du créateur connecté.
+app.get('/api/creators/me/transactions', requireAuth, async (req, res) => {
+  const transactions = await db.all(
+    'SELECT amount, currency, status, period_start, period_end, created_at FROM transactions WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 50',
+    [req.creatorId]
+  );
+  res.json({ transactions });
+});
+
 app.get('/api/creators/:id', requireAuth, async (req, res) => {
   const creator = await db.query('SELECT * FROM creators WHERE id = $1', [req.params.id]);
   const isOwner = req.creatorId === req.params.id;
@@ -378,13 +429,19 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
     id: creator.id,
     name: creator.name,
     zone: creator.zone,
+    photoUrl: await createDownloadUrl(creator.photo_url).catch(() => null),
     subscriberCount: creator.subscriber_count_public || isOwner ? creator.subscriber_count : undefined,
   };
 
   if (isOwner) {
     const balance = await db.query('SELECT * FROM creator_balances WHERE creator_id = $1', [creator.id]);
-    publicProfile.balance = balance.balance;
-    publicProfile.currency = balance.currency;
+    // Un compte neuf n'a pas encore de ligne de solde : on renvoie 0 au lieu de planter.
+    publicProfile.balance = balance ? balance.balance : 0;
+    publicProfile.currency = balance ? balance.currency : 'USD';
+    publicProfile.withdrawalPhone = creator.withdrawal_phone;
+    publicProfile.countryCode = creator.country_code;
+    publicProfile.primaryContentType = creator.primary_content_type;
+    publicProfile.verificationStatus = creator.verification_status;
   }
 
   res.json(publicProfile);
@@ -429,11 +486,14 @@ app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const currency = req.query.currency || 'USD';
-  res.json(calculateMonthlyPayout({ subscribers, views, currency }));
+  res.json({ subscribers, views, ...calculateMonthlyPayout({ subscribers, views, currency }) });
 });
 
-app.post('/api/payouts/withdraw', requireAuth, async (req, res) => {
+app.post('/api/payouts/withdraw', requireAuth, requirePayments, async (req, res) => {
   const { amount, currency } = req.body;
+  if (typeof amount !== 'number' || amount <= 0) {
+    return res.status(400).json({ error: 'Indique un montant de retrait positif.' });
+  }
   const creator = await db.query('SELECT country_code FROM creators WHERE id = $1', [req.creatorId]);
   const providerConfig = resolvePaymentProvider(creator.country_code);
 
@@ -457,7 +517,12 @@ async function getLatestMetrics(creatorId) {
     'SELECT COALESCE(SUM(view_count), 0) AS total FROM content_items WHERE creator_id = $1',
     [creatorId]
   );
-  return { subscribers: row?.subscriber_count || 0, views: views?.total || 0 };
+  // Abonnés : ceux qui suivent le créateur sur Eaji (ou un chiffre vérifié plus élevé s'il existe).
+  const followers = await db.query('SELECT COUNT(*)::int AS total FROM follows WHERE followed_id = $1', [creatorId]);
+  return {
+    subscribers: Math.max(Number(row?.subscriber_count || 0), Number(followers?.total || 0)),
+    views: Number(views?.total || 0),
+  };
 }
 
 // ==================== CONTENUS & MODÉRATION ====================
@@ -515,7 +580,7 @@ app.post('/api/live/:id/end', requireAuth, async (req, res) => {
 });
 
 // Cadeau en argent — toujours versé dans la devise choisie par le destinataire (gift_currency).
-app.post('/api/gifts', requireAuth, async (req, res) => {
+app.post('/api/gifts', requireAuth, requirePayments, async (req, res) => {
   const { toCreatorId, contentId, liveSessionId, amount } = req.body;
   if (!contentId && !liveSessionId) {
     return res.status(400).json({ error: 'Un cadeau doit être associé à un contenu ou à un live.' });
@@ -540,7 +605,7 @@ app.get('/api/feed', async (req, res) => {
             (SELECT COUNT(*) FROM content_comments WHERE content_id = c.id) AS comment_count
      FROM content_items c
      JOIN creators cr ON cr.id = c.creator_id
-     WHERE c.visibility_scope = 'public' AND c.status = 'actif'
+     WHERE c.visibility_scope = 'public' AND c.status = 'actif' AND cr.account_status = 'actif'
      ORDER BY c.created_at DESC
      LIMIT 30`
   );
@@ -549,6 +614,20 @@ app.get('/api/feed', async (req, res) => {
     delete item.storage_url;
   }
   res.json({ items });
+});
+
+// Une vue est comptée quand quelqu'un regarde/écoute/ouvre un contenu.
+// Les vues du créateur sur ses propres contenus ne comptent pas.
+app.post('/api/content/:id/view', async (req, res) => {
+  let viewerId = null;
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (token) { try { viewerId = verifySessionToken(token); } catch { /* visiteur non connecté */ } }
+  await db.query(
+    `UPDATE content_items SET view_count = view_count + 1
+     WHERE id = $1 AND status = 'actif' AND creator_id IS DISTINCT FROM $2`,
+    [req.params.id, viewerId]
+  );
+  res.json({ counted: true });
 });
 
 app.post('/api/content/:id/like', requireAuth, async (req, res) => {
@@ -585,6 +664,9 @@ app.post('/api/content/:id/comments', requireAuth, async (req, res) => {
 });
 
 app.post('/api/creators/:id/follow', requireAuth, async (req, res) => {
+  if (req.params.id === req.creatorId) {
+    return res.status(400).json({ error: 'Tu ne peux pas t\'abonner à ton propre compte.' });
+  }
   await db.query(
     `INSERT INTO follows (follower_id, followed_id) VALUES ($1, $2)
      ON CONFLICT (follower_id, followed_id) DO NOTHING`,
@@ -652,7 +734,7 @@ const AD_TIERS = {
   illimite: { price: 100, currency: 'USD', articleLimit: null, durationDays: 180 },
 };
 
-app.post('/api/ads/subscribe', requireAuth, async (req, res) => {
+app.post('/api/ads/subscribe', requireAuth, requirePayments, async (req, res) => {
   const { tier, contentIds } = req.body; // contentIds : articles à promouvoir (jusqu'à articleLimit)
   const plan = AD_TIERS[tier];
   if (!plan) return res.status(400).json({ error: `Formule inconnue : "${tier}". Formules valides : ${Object.keys(AD_TIERS).join(', ')}` });
@@ -704,6 +786,21 @@ app.get('/api/admin/finances', requireAdminPrincipal, async (req, res) => {
 
 // ==================== MESSAGERIE PRIVÉE ====================
 
+// Liste des conversations du créateur connecté : dernier message avec chaque personne.
+app.get('/api/conversations', requireAuth, async (req, res) => {
+  const conversations = await db.all(
+    `SELECT DISTINCT ON (other_id) other_id, cr.name AS other_name, m.text AS last_text, m.created_at
+     FROM (
+       SELECT CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_id, text, created_at
+       FROM direct_messages WHERE sender_id = $1 OR recipient_id = $1
+     ) m JOIN creators cr ON cr.id = m.other_id
+     ORDER BY other_id, m.created_at DESC`,
+    [req.creatorId]
+  );
+  conversations.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  res.json({ conversations });
+});
+
 app.get('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
   const messages = await db.all(
     `SELECT * FROM direct_messages
@@ -716,6 +813,8 @@ app.get('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
 
 app.post('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
   const { text } = req.body;
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'Message vide.' });
+  if (req.params.withCreatorId === req.creatorId) return res.status(400).json({ error: 'Tu ne peux pas t\'écrire à toi-même.' });
   const message = await db.query(
     'INSERT INTO direct_messages (sender_id, recipient_id, text) VALUES ($1, $2, $3) RETURNING id',
     [req.creatorId, req.params.withCreatorId, text]
@@ -724,7 +823,7 @@ app.post('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
 });
 
 app.post('/api/content/:id/report', requireAuth, async (req, res) => {
-  const { reason } = req.body;
+  const reason = (req.body.reason || '').trim() || 'Contenu inapproprié';
   await db.query(
     'INSERT INTO content_reports (content_id, reported_by, reason) VALUES ($1, $2, $3)',
     [req.params.id, req.creatorId, reason]
@@ -733,8 +832,8 @@ app.post('/api/content/:id/report', requireAuth, async (req, res) => {
 });
 
 // Retrait de contenu : réservé aux administrateurs, toujours journalisé.
-app.delete('/api/content/:id', requireAdminPrincipal, async (req, res) => {
-  const { reason } = req.body;
+app.delete('/api/content/:id', requireAdminPermission('moderer_contenu'), async (req, res) => {
+  const reason = req.body.reason || 'Retiré par un administrateur';
   await db.query("UPDATE content_items SET status = 'retire' WHERE id = $1", [req.params.id]);
   await db.query(
     "INSERT INTO moderation_actions (content_id, admin_id, action, reason) VALUES ($1, $2, 'retrait', $3)",
@@ -747,13 +846,98 @@ app.delete('/api/content/:id', requireAdminPrincipal, async (req, res) => {
 
 // Seul l'admin principal peut approuver un nouvel administrateur.
 app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
-  const { name, phone } = req.body;
+  const { name, phone, password, permissions } = req.body;
+  if (!name || !phone || !password || password.length < 8) {
+    return res.status(400).json({ error: 'Nom, téléphone et mot de passe initial (8 caractères minimum) sont requis.' });
+  }
+  const taken = await db.query('SELECT 1 FROM admin_phone_numbers WHERE phone = $1', [phone]);
+  if (taken) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un administrateur.' });
+  const passwordHash = await bcrypt.hash(password, 12);
   const admin = await db.query(
-    "INSERT INTO admins (name, role, approved_by) VALUES ($1, 'admin', $2) RETURNING id",
-    [name, req.adminId]
+    "INSERT INTO admins (name, phone, password_hash, role, approved_by) VALUES ($1, $2, $3, 'admin', $4) RETURNING id",
+    [name, phone, passwordHash, req.adminId]
   );
   await db.query('INSERT INTO admin_phone_numbers (admin_id, phone) VALUES ($1, $2)', [admin.id, phone]);
+  const allowed = ['moderer_contenu', 'gerer_comptes_utilisateurs', 'repondre_signalements'];
+  for (const permission of (permissions || []).filter((p) => allowed.includes(p))) {
+    await db.query(
+      'INSERT INTO admin_permissions (admin_id, permission, granted_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+      [admin.id, permission, req.adminId]
+    );
+  }
   res.status(201).json({ adminId: admin.id });
+});
+
+// Qui suis-je ? (nom et rôle de l'administrateur connecté)
+app.get('/api/admin/me', async (req, res) => {
+  try {
+    const admin = await authenticateAdminToken(req);
+    res.json({ id: admin.id, name: admin.name, role: admin.role });
+  } catch (e) {
+    res.status(401).json({ error: e.message });
+  }
+});
+
+// Liste des administrateurs et de leurs permissions (principal uniquement).
+app.get('/api/admin/admins', requireAdminPrincipal, async (req, res) => {
+  const admins = await db.all(
+    `SELECT a.id, a.name, a.role, a.status,
+            (SELECT string_agg(phone, ', ') FROM admin_phone_numbers WHERE admin_id = a.id) AS phones,
+            (SELECT string_agg(permission, ', ') FROM admin_permissions WHERE admin_id = a.id) AS permissions
+     FROM admins a ORDER BY a.role DESC, a.created_at`
+  );
+  res.json({ admins });
+});
+
+// Chiffres réels du tableau de bord administrateur.
+app.get('/api/admin/stats', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
+  const counts = await db.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM creators) AS creators,
+       (SELECT COUNT(*)::int FROM creators WHERE account_status = 'suspendu') AS suspended,
+       (SELECT COUNT(*)::int FROM content_items WHERE status = 'actif') AS contents,
+       (SELECT COUNT(*)::int FROM content_reports r JOIN content_items c ON c.id = r.content_id
+          WHERE c.status = 'actif') AS open_reports,
+       (SELECT COUNT(*)::int FROM creators c WHERE
+          GREATEST(COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id
+                             ORDER BY verified_at DESC LIMIT 1), 0),
+                   (SELECT COUNT(*) FROM follows WHERE followed_id = c.id)) >= 1000
+          AND (SELECT COALESCE(SUM(view_count), 0) FROM content_items WHERE creator_id = c.id) >= 1000) AS eligible`
+  );
+  const latest = await db.all(
+    'SELECT name, country_code, created_at FROM creators ORDER BY created_at DESC LIMIT 5'
+  );
+  res.json({ ...counts, latest });
+});
+
+// Contenus signalés par les utilisateurs.
+app.get('/api/admin/reports', requireAdminPermission('moderer_contenu'), async (req, res) => {
+  const reports = await db.all(
+    `SELECT r.id, r.reason, r.created_at, c.id AS content_id, c.title, c.content_type, c.status,
+            cr.name AS creator_name, rp.name AS reported_by_name
+     FROM content_reports r
+     JOIN content_items c ON c.id = r.content_id
+     JOIN creators cr ON cr.id = c.creator_id
+     LEFT JOIN creators rp ON rp.id = r.reported_by
+     ORDER BY r.created_at DESC LIMIT 200`
+  );
+  res.json({ reports });
+});
+
+// Changement de mot de passe d'un administrateur (vérifie l'ancien).
+app.post('/api/admin/auth/change-password', async (req, res) => {
+  let admin;
+  try { admin = await authenticateAdminToken(req); }
+  catch (e) { return res.status(401).json({ error: e.message }); }
+  const { currentPassword, newPassword } = req.body;
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 8 caractères.' });
+  }
+  if (!(await bcrypt.compare(currentPassword || '', admin.password_hash || ''))) {
+    return res.status(401).json({ error: 'Mot de passe actuel incorrect.' });
+  }
+  await db.query('UPDATE admins SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(newPassword, 12), admin.id]);
+  res.json({ updated: true });
 });
 
 // Seul l'administrateur principal choisit les permissions d'un administrateur secondaire.
@@ -774,6 +958,29 @@ app.delete('/api/admin/:id/permissions/:permission', requireAdminPrincipal, asyn
 
 // Modifier ou suspendre le compte d'un utilisateur — pour agir contre un
 // utilisateur dangereux à tout moment. Réservé aux admins avec la permission dédiée.
+// Liste réelle des comptes créateurs (pour le panneau administrateur).
+app.get('/api/admin/creators', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
+  const creators = await db.all(
+    `SELECT c.id, c.name, c.email, c.phone, c.country_code, c.account_status, c.created_at,
+            GREATEST(
+              COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id
+                        ORDER BY verified_at DESC LIMIT 1), 0),
+              (SELECT COUNT(*)::int FROM follows WHERE followed_id = c.id)
+            ) AS subscribers
+     FROM creators c ORDER BY c.created_at DESC LIMIT 500`
+  );
+  res.json({ creators });
+});
+
+// Suppression DÉFINITIVE d'un compte et de toutes ses données — administrateur principal uniquement
+// (jamais accordable à un administrateur secondaire).
+app.delete('/api/admin/creators/:id', requireAdminPrincipal, async (req, res) => {
+  const deleted = await deleteCreatorAccount(pool, req.params.id);
+  if (!deleted) return res.status(404).json({ error: 'Compte introuvable.' });
+  console.log(`[Eaji] Compte ${req.params.id} supprimé par l'administrateur ${req.adminId}`);
+  res.json({ deleted: true });
+});
+
 app.patch('/api/admin/creators/:id', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
   const { accountStatus, name, profileVisibility } = req.body;
   await db.query(
@@ -935,6 +1142,9 @@ app.post('/api/admin/security/confirm-block', async (req, res) => {
 app.use((err, req, res, next) => {
   console.error('[Eaji] Erreur sur', req.method, req.path, '→', err.message);
   if (res.headersSent) return next(err);
+  if (err && err.code === '22P02') {
+    return res.status(400).json({ error: 'Identifiant invalide.' });
+  }
   if (err && err.code === '23505') {
     return res.status(409).json({ error: 'Cet email ou ce numéro de téléphone est déjà utilisé.' });
   }
