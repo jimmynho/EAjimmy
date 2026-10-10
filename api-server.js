@@ -23,6 +23,9 @@ const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissi
 const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require('./content-limits');
 const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl, uploadThroughServer, tryEnableBrowserUploads } = require('./storage');
 const { deleteCreatorAccount } = require('./account-deletion');
+const moneyRoutes = require('./monetization-routes');
+const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
+const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
 const app = express();
 app.use(cors()); // Autorise les appels depuis Netlify (à restreindre à ton domaine précis plus tard si besoin).
@@ -89,6 +92,14 @@ async function runStartupMigrations() {
        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
      )`,
+    // Tous les pays du monde : zones Afrique, Caraïbes, Amérique, Asie, Europe, Océanie.
+    // L'ancienne zone « Europe centrale » est regroupée dans « Europe ».
+    'ALTER TABLE creators DROP CONSTRAINT IF EXISTS creators_zone_check',
+    "UPDATE creators SET zone = 'europe' WHERE zone = 'europe_centrale'",
+    `ALTER TABLE creators ADD CONSTRAINT creators_zone_check CHECK (zone IN
+       ('afrique', 'caraibes', 'amerique', 'asie', 'europe', 'oceanie'))`,
+    // Argent : paiements, premium, vidéos payantes, ventes, publicité, portefeuille (monetization-routes.js).
+    ...moneyRoutes.MIGRATIONS,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -137,7 +148,7 @@ async function isBlockedBetween(a, b) {
   return Boolean(row);
 }
 
-const VALID_ZONES = ['afrique', 'caraibes', 'asie', 'europe_centrale'];
+const VALID_ZONES = ZONES;
 const VALID_CURRENCIES = ['USD', 'EUR', 'CDF'];
 
 async function requireAuth(req, res, next) {
@@ -226,13 +237,14 @@ function verifySessionToken(token) {
 app.post('/api/auth/register', async (req, res) => {
   const { name, phone, password, countryCode, primaryContentType, language, currency } = req.body;
   const email = String(req.body.email || '').trim().toLowerCase();
-  const zone = req.body.zone;
+  // La zone est déduite du pays (tous les pays du monde sont acceptés).
+  const zone = zoneOf(req.body.countryCode);
 
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Indique ton nom.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Adresse email invalide (exemple : nom@gmail.com).' });
   if (!phone || String(phone).replace(/\D/g, '').length < 8) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
   if (!password || password.length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
-  if (!countryCode || !VALID_ZONES.includes(zone)) return res.status(400).json({ error: 'Choisis ton pays.' });
+  if (!isKnownCountry(countryCode) || !VALID_ZONES.includes(zone)) return res.status(400).json({ error: 'Choisis ton pays.' });
 
   const passwordHash = await bcrypt.hash(password, 12);
   const giftCurrency = isSupportedCurrency(currency) ? String(currency).toUpperCase() : 'USD';
@@ -240,7 +252,7 @@ app.post('/api/auth/register', async (req, res) => {
   const creator = await db.query(
     `INSERT INTO creators (name, email, phone, password_hash, country_code, zone, primary_content_type, language, gift_currency)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, country_code`,
-    [String(name).trim(), email, String(phone).replace(/[\s.-]/g, ''), passwordHash, countryCode, zone,
+    [String(name).trim(), email, String(phone).replace(/[\s.-]/g, ''), passwordHash, String(countryCode).toUpperCase(), zone,
      primaryContentType || 'video_courte', language || 'fr', giftCurrency]
   );
   // Pas d'envoi de code ici : le site enchaîne aussitôt sur la connexion, qui envoie UN seul code.
@@ -554,6 +566,9 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
     publicProfile.giftCurrency = creator.gift_currency;
     publicProfile.profileVisibility = creator.profile_visibility;
     publicProfile.subscriberCountPublic = creator.subscriber_count_public;
+    publicProfile.premiumUntil = await money.premiumUntil(creator.id);
+    publicProfile.monetized = isMonetizedCreator(creator.country_code, creator.phone);
+    publicProfile.monetizationReason = monetizationReason(creator.country_code, creator.phone);
   }
 
   res.json(publicProfile);
@@ -590,15 +605,34 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 
 // ==================== RÉMUNÉRATION & PAIEMENTS ====================
 
+// Monétisation réservée aux créateurs des pays éligibles (voir world-countries.js).
+async function monetizationOf(creatorId) {
+  const c = await db.query('SELECT country_code, phone FROM creators WHERE id = $1', [creatorId]);
+  if (!c) return { monetized: false, reason: 'pays' };
+  return { monetized: isMonetizedCreator(c.country_code, c.phone), reason: monetizationReason(c.country_code, c.phone) };
+}
+
 app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
-  res.json(calculateEligibility(subscribers, views));
+  const m = await monetizationOf(req.params.id);
+  const result = calculateEligibility(subscribers, views);
+  res.json({ ...result, eligible: m.monetized && result.eligible, monetized: m.monetized, monetizationReason: m.reason });
 });
 
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const currency = isSupportedCurrency(req.query.currency) ? String(req.query.currency).toUpperCase() : 'USD';
-  res.json({ subscribers, views, ...payoutInCurrency({ subscribers, views, currency }) });
+  const m = await monetizationOf(req.params.id);
+  const payout = payoutInCurrency({ subscribers, views, currency });
+  if (!m.monetized) {
+    return res.json({ subscribers, views, ...payout, eligible: false, amount: 0, monetized: false, monetizationReason: m.reason });
+  }
+  res.json({ subscribers, views, ...payout, monetized: true });
+});
+
+// Liste des pays où les créateurs peuvent gagner de l'argent.
+app.get('/api/countries/monetized', (req, res) => {
+  res.json({ monetized: [...MONETIZED_COUNTRIES] });
 });
 
 app.post('/api/payouts/withdraw', requireAuth, requirePayments, async (req, res) => {
@@ -679,10 +713,18 @@ app.post('/api/content', requireAuth, async (req, res) => {
   const sizeCheck = validateFileSize(contentType, fileSizeBytes);
   if (!sizeCheck.valid) return res.status(400).json({ error: sizeCheck.error });
 
+  // Durée des vidéos (lue par le téléphone avant l'envoi) : 60 minutes au maximum.
+  const durationSeconds = Number(req.body.durationSeconds) > 0 ? Math.round(Number(req.body.durationSeconds)) : null;
+  if (VIDEO_TYPES.includes(contentType) && durationSeconds > MAX_VIDEO_SECONDS) {
+    return res.status(400).json({ error: 'Une vidéo ne peut pas dépasser 60 minutes.' });
+  }
+  const sale = await parseSalePrice(req.body.salePrice, req.creatorId);
+  if (sale.error) return res.status(400).json({ error: sale.error });
+
   const content = await db.query(
-    `INSERT INTO content_items (creator_id, content_type, title, storage_url, file_size_bytes, visibility_scope)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    [req.creatorId, contentType, title, storageUrl, fileSizeBytes || null, visibilityScope || 'public']
+    `INSERT INTO content_items (creator_id, content_type, title, storage_url, file_size_bytes, visibility_scope, duration_seconds, sale_price)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [req.creatorId, contentType, title, storageUrl, fileSizeBytes || null, visibilityScope || 'public', durationSeconds, sale.skip ? null : sale.value]
   );
   res.status(201).json({ contentId: content.id });
 });
@@ -738,8 +780,11 @@ app.get('/api/feed', async (req, res) => {
   const country = /^[A-Z]{2}$/.test(String(req.query.country || '')) ? req.query.country : null;
   const items = await db.all(
     `SELECT c.id, c.title, c.content_type, c.created_at, c.visibility_scope,
-            c.storage_url,
+            c.storage_url, c.duration_seconds, c.sale_price,
             cr.id AS creator_id, cr.name AS creator_name, cr.country_code AS creator_country, cr.photo_url AS creator_photo_key,
+            cr.phone AS creator_phone,
+            EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = cr.id AND ps.ends_at > now()) AS creator_premium,
+            EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = cr.id AND ps.ends_at > now() AND ps.plan LIKE 'entreprise%') AS creator_business,
             (SELECT COUNT(*) FROM content_likes WHERE content_id = c.id) AS like_count,
             (SELECT COUNT(*) FROM content_comments WHERE content_id = c.id) AS comment_count
      FROM content_items c
@@ -751,12 +796,26 @@ app.get('/api/feed', async (req, res) => {
             OR EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followed_id = c.creator_id))
        AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = c.creator_id AND b.blocked_id = $2)
                                                 OR (b.blocker_id = $2 AND b.blocked_id = c.creator_id))
-     ORDER BY c.created_at DESC
+     -- Les membres premium gagnent en visibilité : leurs publications de la semaine passent devant.
+     ORDER BY (EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = cr.id AND ps.ends_at > now())
+               AND c.created_at > now() - interval '7 days') DESC,
+              c.created_at DESC
      LIMIT 50`,
     [country, viewerId]
   );
   for (const item of items) {
-    item.fileUrl = await createDownloadUrl(item.storage_url).catch(() => null);
+    // Le numéro n'est jamais envoyé : il sert seulement à savoir si le créateur est monétisé.
+    item.creator_monetized = isMonetizedCreator(item.creator_country, item.creator_phone);
+    delete item.creator_phone;
+  }
+  const access = await money.accessMap(viewerId, items);
+  for (const item of items) {
+    const a = access.get(item.id);
+    item.price = a.price;
+    item.for_sale = a.forSale;
+    item.locked = a.locked;
+    // Contenu payant pas encore débloqué : le fichier n'est pas envoyé.
+    item.fileUrl = a.locked ? null : await createDownloadUrl(item.storage_url).catch(() => null);
     item.creator_photo = await createDownloadUrl(item.creator_photo_key).catch(() => null);
     delete item.storage_url;
     delete item.creator_photo_key;
@@ -765,7 +824,8 @@ app.get('/api/feed', async (req, res) => {
   if (viewerId) {
     following = (await db.all('SELECT followed_id FROM follows WHERE follower_id = $1', [viewerId])).map((r) => r.followed_id);
   }
-  res.json({ items, following });
+  const ads = await money.adsForFeed(country).catch(() => []);
+  res.json({ items, following, ads });
 });
 
 // 6. Profil public d'un créateur : visible par tous, abonnés ou non, pour pouvoir s'abonner.
@@ -782,13 +842,14 @@ app.get('/api/creators/:id/public', async (req, res) => {
     ? Boolean(await db.query('SELECT 1 FROM follows WHERE follower_id = $1 AND followed_id = $2', [viewerId, creator.id]))
     : false;
   const contents = await db.all(
-    `SELECT id, title, content_type, created_at FROM content_items
+    `SELECT id, title, content_type, created_at, duration_seconds, sale_price, creator_id, $4::boolean AS creator_monetized FROM content_items
      WHERE creator_id = $1 AND status = 'actif'
        AND (visibility_scope = 'public' OR $2::boolean OR creator_id = $3)
      ORDER BY created_at DESC LIMIT 50`,
-    [creator.id, isFollowing, viewerId]
+    [creator.id, isFollowing, viewerId, isMonetizedCreator(creator.country_code, creator.phone)]
   );
   res.json({
+    monetized: isMonetizedCreator(creator.country_code, creator.phone),
     id: creator.id,
     name: creator.name,
     countryCode: creator.country_code,
@@ -798,7 +859,16 @@ app.get('/api/creators/:id/public', async (req, res) => {
     subscriberCount: creator.subscriber_count_public || viewerId === creator.id ? followers.total : null,
     isFollowing,
     isMe: viewerId === creator.id,
-    contents,
+    premium: Boolean(await money.premiumUntil(creator.id)),
+    business: Boolean(await money.businessUntil(creator.id)),
+    contents: await (async () => {
+      const access = await money.accessMap(viewerId, contents);
+      return contents.map((c) => {
+        const a = access.get(c.id);
+        return { id: c.id, title: c.title, content_type: c.content_type, created_at: c.created_at,
+                 duration_seconds: c.duration_seconds, price: a.price, for_sale: a.forSale, locked: a.locked };
+      });
+    })(),
   });
 });
 
@@ -878,11 +948,13 @@ app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
   const { name, photoUrl, withdrawalPhone, countryCode, language, primaryContentType } = req.body;
   const giftCurrency = req.body.giftCurrency ? String(req.body.giftCurrency).toUpperCase() : null;
   if (giftCurrency && !isSupportedCurrency(giftCurrency)) return res.status(400).json({ error: 'Devise non prise en charge.' });
-  if (req.body.zone && !VALID_ZONES.includes(req.body.zone)) return res.status(400).json({ error: 'Zone inconnue.' });
-  if (req.body.zone || primaryContentType) {
+  if (countryCode && !isKnownCountry(countryCode)) return res.status(400).json({ error: 'Pays inconnu.' });
+  // La zone suit toujours le pays.
+  const newZone = countryCode ? zoneOf(countryCode) : null;
+  if (newZone || primaryContentType) {
     await db.query(
       'UPDATE creators SET zone = COALESCE($1, zone), primary_content_type = COALESCE($2, primary_content_type) WHERE id = $3',
-      [req.body.zone || null, primaryContentType || null, req.creatorId]
+      [newZone, primaryContentType || null, req.creatorId]
     );
   }
   await db.query(
@@ -894,7 +966,7 @@ app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
        language = COALESCE($5, language),
        gift_currency = COALESCE($6, gift_currency)
      WHERE id = $7`,
-    [name, photoUrl, withdrawalPhone, countryCode, language, giftCurrency, req.creatorId]
+    [name, photoUrl, withdrawalPhone, countryCode ? String(countryCode).toUpperCase() : null, language, giftCurrency, req.creatorId]
   );
   res.json({ updated: true });
 });
@@ -1003,11 +1075,34 @@ app.get('/api/currencies', (req, res) => {
   res.json(currencyCatalog());
 });
 
+// ==================== ARGENT : PREMIUM, VENTES, CADEAUX, DONS, PUBLICITÉ, PORTEFEUILLE ====================
+const money = moneyRoutes.register({
+  app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency,
+});
+
+// Prix de vente d'un contenu (réservé aux membres premium). null = pas à vendre.
+async function parseSalePrice(raw, creatorId) {
+  if (raw === undefined) return { skip: true };
+  if (raw === null || raw === '' || Number(raw) === 0) return { value: null };
+  const price = round2(raw);
+  if (!(price >= SALE_PRICE_MIN && price <= SALE_PRICE_MAX)) {
+    return { error: `Le prix doit être entre ${SALE_PRICE_MIN} $ et ${SALE_PRICE_MAX} $.` };
+  }
+  if (!(await monetizationOf(creatorId)).monetized) {
+    return { error: "La vente de contenus n'est pas disponible dans ton pays." };
+  }
+  if (!(await money.premiumUntil(creatorId))) {
+    return { error: 'Vendre tes contenus est réservé aux membres premium.' };
+  }
+  return { value: price };
+}
+
 // ==================== MES PUBLICATIONS (point 8) ====================
 
 app.get('/api/my/content', requireAuth, async (req, res) => {
   const items = await db.all(
-    `SELECT c.id, c.title, c.content_type, c.visibility_scope, c.created_at, c.view_count,
+    `SELECT c.id, c.title, c.content_type, c.visibility_scope, c.created_at, c.view_count, c.duration_seconds, c.sale_price,
+            (SELECT COUNT(*)::int FROM content_access WHERE content_id = c.id) AS sales_count,
             (SELECT COUNT(*)::int FROM content_likes WHERE content_id = c.id) AS like_count
      FROM content_items c WHERE c.creator_id = $1 AND c.status = 'actif' ORDER BY c.created_at DESC`,
     [req.creatorId]
@@ -1020,10 +1115,13 @@ app.patch('/api/my/content/:id', requireAuth, async (req, res) => {
   const scope = req.body.visibilityScope;
   if (title === '') return res.status(400).json({ error: 'Le titre ne peut pas être vide.' });
   if (scope && !['public', 'abonnes'].includes(scope)) return res.status(400).json({ error: 'Visibilité inconnue.' });
+  const sale = await parseSalePrice(req.body.salePrice, req.creatorId);
+  if (sale.error) return res.status(400).json({ error: sale.error });
   const updated = await db.query(
-    `UPDATE content_items SET title = COALESCE($1, title), visibility_scope = COALESCE($2, visibility_scope)
+    `UPDATE content_items SET title = COALESCE($1, title), visibility_scope = COALESCE($2, visibility_scope),
+            sale_price = CASE WHEN $5::boolean THEN sale_price ELSE $6::numeric END
      WHERE id = $3 AND creator_id = $4 AND status = 'actif' RETURNING id`,
-    [title, scope || null, req.params.id, req.creatorId]
+    [title, scope || null, req.params.id, req.creatorId, Boolean(sale.skip), sale.skip ? null : sale.value]
   );
   if (!updated) return res.status(404).json({ error: 'Publication introuvable.' });
   res.json({ updated: true });
@@ -1322,7 +1420,9 @@ app.get('/api/admin/stats', requireAdminPermission('gerer_comptes_utilisateurs')
           GREATEST(COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id
                              ORDER BY verified_at DESC LIMIT 1), 0),
                    (SELECT COUNT(*) FROM follows WHERE followed_id = c.id)) >= 1000
-          AND (SELECT COALESCE(SUM(view_count), 0) FROM content_items WHERE creator_id = c.id) >= 1000) AS eligible`
+          AND (SELECT COALESCE(SUM(view_count), 0) FROM content_items WHERE creator_id = c.id) >= 1000
+          AND c.country_code = ANY($1::text[])) AS eligible`,
+    [`{${[...MONETIZED_COUNTRIES].join(',')}}`]
   );
   const latest = await db.all(
     'SELECT name, country_code, created_at FROM creators ORDER BY created_at DESC LIMIT 5'
@@ -1381,7 +1481,7 @@ app.delete('/api/admin/:id/permissions/:permission', requireAdminPrincipal, asyn
 // Liste réelle des comptes créateurs (pour le panneau administrateur).
 app.get('/api/admin/creators', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
   const creators = await db.all(
-    `SELECT c.id, c.name, c.email, c.phone, c.country_code, c.account_status, c.created_at,
+    `SELECT c.id, c.name, c.email, c.phone, c.country_code, c.zone, c.account_status, c.created_at,
             GREATEST(
               COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id
                         ORDER BY verified_at DESC LIMIT 1), 0),
@@ -1389,6 +1489,7 @@ app.get('/api/admin/creators', requireAdminPermission('gerer_comptes_utilisateur
             ) AS subscribers
      FROM creators c ORDER BY c.created_at DESC LIMIT 500`
   );
+  creators.forEach((c) => { c.monetized = isMonetizedCreator(c.country_code, c.phone); });
   res.json({ creators });
 });
 
