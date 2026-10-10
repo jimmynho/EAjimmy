@@ -20,7 +20,7 @@ const { calculateEligibility, calculateMonthlyPayout } = require('./rate-engine'
 const { resolvePaymentProvider, PROVIDER } = require('./payment-provider-router');
 const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissionRecord } = require('./admin-commission-engine');
 const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require('./content-limits');
-const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl } = require('./storage');
+const { STORAGE_CONNECTED, buildStorageKey, createUploadUrl, createDownloadUrl, uploadThroughServer, tryEnableBrowserUploads } = require('./storage');
 const { deleteCreatorAccount } = require('./account-deletion');
 
 const app = express();
@@ -74,6 +74,7 @@ async function runStartupMigrations() {
   }
 }
 runStartupMigrations();
+tryEnableBrowserUploads();
 
 const db = {
   // Retourne la première ligne du résultat (adapté à la plupart des requêtes de ce fichier,
@@ -540,6 +541,25 @@ app.post('/api/content/upload-url', requireAuth, async (req, res) => {
   const storageKey = buildStorageKey(req.creatorId, fileName);
   const uploadUrl = await createUploadUrl(storageKey, mimeType);
   res.json({ uploadUrl, storageKey });
+});
+
+// Chemin relais : si le navigateur ne peut pas envoyer directement à B2, il envoie le
+// fichier ici et le serveur le transmet. La clé doit avoir été délivrée à ce créateur.
+const MAX_RELAY_BYTES = 1024 * 1024 * 1024; // 1 Go, la plus grande limite (vidéos)
+app.put('/api/content/upload-proxy', requireAuth, async (req, res) => {
+  if (!STORAGE_CONNECTED) {
+    return res.status(503).json({ error: "Le stockage de fichiers n'est pas encore activé sur le serveur." });
+  }
+  const storageKey = String(req.query.key || '');
+  if (!storageKey.startsWith(`${req.creatorId}/`) || storageKey.includes('..')) {
+    return res.status(403).json({ error: 'Envoi non autorisé pour ce fichier.' });
+  }
+  const length = Number(req.headers['content-length']);
+  if (!length || length > MAX_RELAY_BYTES) {
+    return res.status(400).json({ error: 'Taille de fichier invalide ou trop grande.' });
+  }
+  await uploadThroughServer(storageKey, req.headers['content-type'], req, length);
+  res.json({ uploaded: true });
 });
 
 app.post('/api/content', requireAuth, async (req, res) => {
