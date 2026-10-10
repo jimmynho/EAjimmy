@@ -17,6 +17,7 @@ const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 
 const { calculateEligibility, calculateMonthlyPayout } = require('./rate-engine');
+const { isSupportedCurrency, convertFromUSD, payoutInCurrency, openingCommissionInCurrency, currencyCatalog } = require('./currencies');
 const { resolvePaymentProvider, PROVIDER } = require('./payment-provider-router');
 const { calculateOpeningCommission, calculateWithdrawalCommission, buildCommissionRecord } = require('./admin-commission-engine');
 const { validateFileSize, isLiveEligible, LIVE_SUBSCRIBER_THRESHOLD } = require('./content-limits');
@@ -234,7 +235,7 @@ app.post('/api/auth/register', async (req, res) => {
   if (!countryCode || !VALID_ZONES.includes(zone)) return res.status(400).json({ error: 'Choisis ton pays.' });
 
   const passwordHash = await bcrypt.hash(password, 12);
-  const giftCurrency = VALID_CURRENCIES.includes(String(currency || '').toUpperCase()) ? String(currency).toUpperCase() : 'USD';
+  const giftCurrency = isSupportedCurrency(currency) ? String(currency).toUpperCase() : 'USD';
 
   const creator = await db.query(
     `INSERT INTO creators (name, email, phone, password_hash, country_code, zone, primary_content_type, language, gift_currency)
@@ -251,7 +252,7 @@ app.post('/api/auth/register', async (req, res) => {
   try {
     const principal = await db.query("SELECT id FROM admins WHERE role = 'admin_principal' LIMIT 1");
     if (principal) {
-      const commission = calculateOpeningCommission(giftCurrency);
+      const commission = openingCommissionInCurrency(giftCurrency);
       await db.query(
         `INSERT INTO admin_commissions (admin_id, creator_id, type, amount, currency)
          VALUES ($1, $2, 'ouverture', $3, $4)`,
@@ -596,8 +597,8 @@ app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
 
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
-  const currency = req.query.currency || 'USD';
-  res.json({ subscribers, views, ...calculateMonthlyPayout({ subscribers, views, currency }) });
+  const currency = isSupportedCurrency(req.query.currency) ? String(req.query.currency).toUpperCase() : 'USD';
+  res.json({ subscribers, views, ...payoutInCurrency({ subscribers, views, currency }) });
 });
 
 app.post('/api/payouts/withdraw', requireAuth, requirePayments, async (req, res) => {
@@ -716,12 +717,18 @@ app.post('/api/gifts', requireAuth, requirePayments, async (req, res) => {
     return res.status(400).json({ error: 'Un cadeau doit être associé à un contenu ou à un live.' });
   }
   const recipient = await db.query('SELECT gift_currency FROM creators WHERE id = $1', [toCreatorId]);
+  if (!recipient) return res.status(404).json({ error: 'Compte introuvable.' });
+  // Les montants proposés (1 $, 5 $, ...) sont convertis au taux du jour dans la devise du destinataire.
+  let currency = recipient.gift_currency;
+  let converted;
+  try { converted = convertFromUSD(Number(amount), currency); }
+  catch (e) { currency = 'USD'; converted = Number(amount); }
   const gift = await db.query(
     `INSERT INTO gifts (from_creator_id, to_creator_id, content_id, live_session_id, amount, currency)
      VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    [req.creatorId, toCreatorId, contentId || null, liveSessionId || null, amount, recipient.gift_currency]
+    [req.creatorId, toCreatorId, contentId || null, liveSessionId || null, converted, currency]
   );
-  res.status(201).json({ giftId: gift.id, currency: recipient.gift_currency });
+  res.status(201).json({ giftId: gift.id, currency, amount: converted });
 });
 
 // Fil de contenus publics (découverte) : les plus récents en premier,
@@ -870,7 +877,7 @@ app.delete('/api/creators/:id/follow', requireAuth, async (req, res) => {
 app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
   const { name, photoUrl, withdrawalPhone, countryCode, language, primaryContentType } = req.body;
   const giftCurrency = req.body.giftCurrency ? String(req.body.giftCurrency).toUpperCase() : null;
-  if (giftCurrency && !VALID_CURRENCIES.includes(giftCurrency)) return res.status(400).json({ error: 'Devise non prise en charge.' });
+  if (giftCurrency && !isSupportedCurrency(giftCurrency)) return res.status(400).json({ error: 'Devise non prise en charge.' });
   if (req.body.zone && !VALID_ZONES.includes(req.body.zone)) return res.status(400).json({ error: 'Zone inconnue.' });
   if (req.body.zone || primaryContentType) {
     await db.query(
@@ -989,6 +996,11 @@ app.get('/api/admin/finances', requireAdminPrincipal, async (req, res) => {
   const commissions = await db.all('SELECT * FROM admin_commissions ORDER BY created_at DESC LIMIT 100');
   const adRevenue = await db.all('SELECT * FROM ad_payments ORDER BY created_at DESC LIMIT 100');
   res.json({ commissions, adRevenue });
+});
+
+// Devises proposées par pays + devises internationales (seulement celles dont on connaît le taux).
+app.get('/api/currencies', (req, res) => {
+  res.json(currencyCatalog());
 });
 
 // ==================== MES PUBLICATIONS (point 8) ====================
