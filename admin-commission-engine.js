@@ -3,7 +3,7 @@
  * -----------------------------------------------------------------
  * Deux types de commission :
  *   1. Ouverture de compte créateur : montant fixe selon la devise.
- *   2. Retrait de gains par un créateur : 1% du montant retiré.
+ *   2. Retrait de gains par un créateur : 15 % du montant retiré.
  */
 
 const OPENING_COMMISSION = {
@@ -12,7 +12,7 @@ const OPENING_COMMISSION = {
   CDF: 5000,
 };
 
-const WITHDRAWAL_COMMISSION_RATE = 0.01; // 1%
+const WITHDRAWAL_COMMISSION_RATE = 0.15; // 15 % (voir aussi monetization.js)
 
 /**
  * Calcule la commission due à l'administrateur pour l'ouverture
