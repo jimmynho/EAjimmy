@@ -10,8 +10,11 @@ const crypto = require('crypto');
 const M = require('./monetization');
 const { isMonetizedCreator } = require('./world-countries');
 
-// Le transfert d'argent entre personnes exige normalement un agrément de la Banque Centrale.
-// Il reste éteint tant que TRANSFERS_ENABLED=true n'est pas mis sur Railway.
+// SOLDE EAJI : chacun peut déposer de l'argent (2 % de frais) et l'utiliser DANS Eaji
+// (cadeaux, vidéos, achats, premium, publicité) sans attendre de confirmation à chaque fois.
+// Le transfert d'argent entre personnes et le retrait du solde en argent exigent normalement
+// un agrément de la Banque Centrale : ils restent éteints tant que TRANSFERS_ENABLED=true
+// n'est pas mis sur Railway.
 const TRANSFERS_ENABLED = process.env.TRANSFERS_ENABLED === 'true';
 const TRANSFERS_DISABLED_MESSAGE =
   "Le transfert d'argent n'est pas encore ouvert. Il le sera dès que l'autorisation nécessaire sera obtenue.";
@@ -40,7 +43,7 @@ const MIGRATIONS = [
      confirmed_at TIMESTAMPTZ)`,
   'ALTER TABLE payment_requests DROP CONSTRAINT IF EXISTS payment_requests_purpose_check',
   `ALTER TABLE payment_requests ADD CONSTRAINT payment_requests_purpose_check CHECK (purpose IN
-     ('premium_mois','premium_annee','entreprise_mois','entreprise_annee','video','achat','cadeau','don','annonce','depot'))`,
+     ('premium_mois','premium_annee','entreprise_mois','entreprise_annee','video','achat','cadeau','cadeau_live','don','annonce','depot'))`,
   `CREATE TABLE IF NOT EXISTS business_broadcasts (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
@@ -94,6 +97,9 @@ const MIGRATIONS = [
      payment_id UUID,
      note TEXT,
      created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  'ALTER TABLE wallet_entries DROP CONSTRAINT IF EXISTS wallet_entries_kind_check',
+  `ALTER TABLE wallet_entries ADD CONSTRAINT wallet_entries_kind_check CHECK (kind IN
+     ('depot','envoi','reception','retrait','remboursement','achat'))`,
   `CREATE TABLE IF NOT EXISTS withdrawal_requests (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
@@ -115,7 +121,7 @@ const MIGRATIONS = [
 const PURPOSE_LABELS = {
   premium_mois: 'Abonnement premium 1 mois', premium_annee: 'Abonnement premium 1 an',
   entreprise_mois: 'Compte Entreprise 1 mois', entreprise_annee: 'Compte Entreprise 1 an',
-  video: 'Vidéo payante', achat: 'Achat de contenu', cadeau: 'Cadeau à un créateur',
+  video: 'Vidéo payante', achat: 'Achat de contenu', cadeau: 'Cadeau à un créateur', cadeau_live: 'Cadeau pendant un live',
   don: 'Don à Eaji', annonce: 'Publicité entreprise', depot: 'Dépôt sur le portefeuille',
 };
 
@@ -126,7 +132,7 @@ function newReference() {
   return ref;
 }
 
-function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency }) {
+function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify = async () => {} }) {
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   // Montant en devise locale (repli en dollars si le taux manque).
@@ -249,6 +255,18 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
         amountUsd = access.price;
         description = `${access.forSale ? 'Achat' : 'Vidéo'} : « ${content.title} »`;
       }
+    } else if (purpose === 'cadeau_live') {
+      // Cadeau envoyé pendant un direct.
+      const live = await db.query(
+        `SELECT l.id, l.creator_id, cr.name AS creator_name, cr.country_code, cr.phone FROM live_sessions l
+         JOIN creators cr ON cr.id = l.creator_id WHERE l.id = $1 AND l.status = 'en_cours'`, [targetId]);
+      if (!live) return res.status(404).json({ error: 'Ce live est terminé.' });
+      if (live.creator_id === req.creatorId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer un cadeau." });
+      // Les cadeaux en direct sont ouverts aux créateurs de TOUS les pays (Eaji garde 40 %),
+      // même hors des pays monétisés : ce revenu aide à financer les créateurs des pays éligibles.
+      amountUsd = Number(req.body.amount);
+      if (!M.GIFT_AMOUNTS.includes(amountUsd)) return res.status(400).json({ error: 'Montant de cadeau invalide.' });
+      description = `Cadeau en direct à ${live.creator_name}`;
     } else if (purpose === 'don') {
       amountUsd = M.round2(req.body.amount);
       if (!(amountUsd >= M.DONATION_MIN) || amountUsd > 10000) return res.status(400).json({ error: `Le don minimum est de ${M.DONATION_MIN} $.` });
@@ -258,7 +276,6 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       amountUsd = M.BUSINESS_AD_PLANS[ad.plan].price;
       description = `Publicité « ${ad.company} » (${M.BUSINESS_AD_PLANS[ad.plan].label})`;
     } else if (purpose === 'depot') {
-      if (!TRANSFERS_ENABLED) return res.status(503).json({ error: TRANSFERS_DISABLED_MESSAGE });
       amountUsd = M.round2(req.body.amount);
       if (!(amountUsd >= 1) || amountUsd > 10000) return res.status(400).json({ error: 'Montant de dépôt invalide.' });
     }
@@ -303,6 +320,36 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       [req.params.id, req.creatorId]);
     if (!updated) return res.status(404).json({ error: 'Paiement introuvable ou déjà traité.' });
     res.json({ cancelled: true });
+  });
+
+  // Payer une demande en attente avec son solde Eaji : immédiat, sans vérification manuelle.
+  app.post('/api/payments/:id/pay-with-balance', requireAuth, async (req, res) => {
+    const outcome = await withAccountLock(req.creatorId, async () => {
+      const p = await db.query(
+        "SELECT * FROM payment_requests WHERE id = $1 AND payer_id = $2 AND status = 'en_attente'", [req.params.id, req.creatorId]);
+      if (!p) return { status: 404, error: 'Paiement introuvable ou déjà traité.' };
+      if (p.purpose === 'depot') return { status: 400, error: 'Un dépôt se paie par mobile money.' };
+      const balance = await walletBalance(req.creatorId);
+      if (Number(p.amount_usd) > balance) return { status: 400, error: `Solde insuffisant (disponible : ${balance} $). Fais d'abord un dépôt.` };
+      const done = await db.query(
+        `UPDATE payment_requests SET status = 'confirme', confirmed_at = now(), proof = 'solde Eaji', admin_note = 'Payé avec le solde'
+         WHERE id = $1 AND status = 'en_attente' RETURNING *`, [p.id]);
+      if (!done) return { status: 404, error: 'Paiement déjà traité.' };
+      await db.query(
+        "INSERT INTO wallet_entries (creator_id, amount_usd, kind, payment_id, note) VALUES ($1, $2, 'achat', $3, $4)",
+        [req.creatorId, -Number(p.amount_usd), p.id, p.description]);
+      try {
+        await fulfill(done);
+      } catch (e) {
+        // En cas d'échec, on rembourse et on remet le paiement en attente.
+        await db.query("DELETE FROM wallet_entries WHERE payment_id = $1 AND kind = 'achat'", [p.id]);
+        await db.query("UPDATE payment_requests SET status = 'en_attente', confirmed_at = NULL, proof = NULL, admin_note = NULL WHERE id = $1", [p.id]);
+        throw e;
+      }
+      return { status: 200, balance: await walletBalance(req.creatorId) };
+    });
+    if (outcome.error) return res.status(outcome.status).json({ error: outcome.error });
+    res.json({ paid: true, balance: outcome.balance });
   });
 
   app.get('/api/payments/mine', requireAuth, async (req, res) => {
@@ -412,8 +459,28 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
           [p.target_id, p.payer_id, p.id]);
       }
       const source = { video: 'video', achat: 'vente', cadeau: 'cadeau' }[p.purpose];
+      if (content) {
+        const who = await db.query('SELECT name FROM creators WHERE id = $1', [p.payer_id]);
+        const what = { video: 'a payé pour regarder ta vidéo', achat: 'a acheté ton contenu', cadeau: `t'a envoyé un cadeau de ${amount} $` }[p.purpose];
+        await notify(content.creator_id, p.purpose === 'cadeau' ? 'cadeau' : 'vente', `🎁 ${who ? who.name : 'Quelqu\'un'} ${what} (+${split.creator} $ pour toi).`, 's-paiements');
+      }
       await ledger('eaji', null, source, split.eaji);
       await ledger('createur', content ? content.creator_id : null, source, split.creator);
+    } else if (p.purpose === 'cadeau_live') {
+      const live = await db.query('SELECT creator_id FROM live_sessions WHERE id = $1', [p.target_id]);
+      const split = M.splitForCreator(amount);
+      const recipient = await db.query('SELECT gift_currency FROM creators WHERE id = $1', [live.creator_id]);
+      const local = toLocal(split.creator, recipient ? recipient.gift_currency : 'USD');
+      await db.query(
+        'INSERT INTO gifts (from_creator_id, to_creator_id, live_session_id, amount, currency) VALUES ($1, $2, $3, $4, $5)',
+        [p.payer_id, live.creator_id, p.target_id, local.amount, local.currency]);
+      await ledger('eaji', null, 'cadeau', split.eaji);
+      await ledger('createur', live.creator_id, 'cadeau', split.creator);
+      const payer = await db.query('SELECT name FROM creators WHERE id = $1', [p.payer_id]);
+      await db.query(
+        "INSERT INTO live_events (live_id, author_id, kind, text, amount_usd) VALUES ($1, $2, 'cadeau', $3, $4)",
+        [p.target_id, p.payer_id, `${payer ? payer.name : 'Quelqu\'un'} a envoyé un cadeau de ${amount} $ 🎁`, amount]);
+      await notify(live.creator_id, 'cadeau', `🎁 ${payer ? payer.name : 'Quelqu\'un'} t'a envoyé un cadeau de ${amount} $ pendant ton live (+${split.creator} $ pour toi).`, 's-paiements');
     } else if (p.purpose === 'don') {
       await ledger('eaji', null, 'don', amount);
     } else if (p.purpose === 'annonce') {
@@ -533,7 +600,8 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
        FROM wallet_entries w LEFT JOIN creators cr ON cr.id = w.counterpart_id
        WHERE w.creator_id = $1 ORDER BY w.created_at DESC LIMIT 50`, [req.creatorId]);
     res.json({
-      enabled: TRANSFERS_ENABLED, message: TRANSFERS_ENABLED ? null : TRANSFERS_DISABLED_MESSAGE,
+      depositEnabled: true, enabled: TRANSFERS_ENABLED, transfersEnabled: TRANSFERS_ENABLED,
+      message: TRANSFERS_ENABLED ? null : TRANSFERS_DISABLED_MESSAGE,
       balance, balanceLocal: toLocal(balance, me.gift_currency),
       depositFee: 0.02, withdrawalFee: 0.04, entries,
     });
@@ -653,6 +721,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       await db.query("UPDATE payment_requests SET status = 'en_attente', confirmed_at = NULL WHERE id = $1", [p.id]);
       throw e;
     }
+    await notify(p.payer_id, 'paiement', `✅ Paiement ${p.reference} confirmé : ${p.description}.`, 's-paiements');
     res.json({ confirmed: true });
   });
 
@@ -662,6 +731,8 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
        WHERE id = $1 AND status = 'en_attente' RETURNING id`,
       [req.params.id, req.adminId, String(req.body.note || '').slice(0, 200) || 'Paiement non reçu.']);
     if (!p) return res.status(404).json({ error: 'Paiement introuvable ou déjà traité.' });
+    const refused = await db.query('SELECT payer_id, reference, admin_note FROM payment_requests WHERE id = $1', [p.id]);
+    await notify(refused.payer_id, 'paiement', `❌ Paiement ${refused.reference} refusé : ${refused.admin_note}`, 's-paiements');
     res.json({ refused: true });
   });
 
@@ -683,6 +754,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     await db.query(
       'INSERT INTO revenue_ledger (beneficiary, creator_id, source, amount_usd) VALUES ($1, $2, $3, $4)',
       ['eaji', w.creator_id, w.source === 'portefeuille' ? 'frais_retrait_portefeuille' : 'frais_retrait', w.fee_usd]);
+    await notify(w.creator_id, 'retrait', `💸 Ton retrait de ${Number(w.net_usd).toFixed(2)} $ a été envoyé (${w.method}).`, 's-paiements');
     res.json({ paid: true });
   });
 
@@ -697,7 +769,33 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
         "INSERT INTO wallet_entries (creator_id, amount_usd, kind, note) VALUES ($1, $2, 'remboursement', 'Retrait refusé')",
         [w.creator_id, w.amount_usd]);
     }
+    await notify(w.creator_id, 'retrait', `❌ Ton retrait a été refusé${w.admin_note ? ' : ' + w.admin_note : ''}. Le montant reste disponible.`, 's-paiements');
     res.json({ refused: true });
+  });
+
+  // L'administrateur principal peut offrir le Premium ou le compte Entreprise (essai gratuit).
+  app.post('/api/admin/creators/:id/grant', requireAdminPrincipal, async (req, res) => {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+    const kind = req.body.kind === 'entreprise' ? 'entreprise' : 'premium';
+    const days = Math.round(Number(req.body.days));
+    if (!(days >= 1 && days <= 3650)) return res.status(400).json({ error: 'Durée invalide (1 à 3650 jours).' });
+    const creator = await db.query('SELECT id FROM creators WHERE id = $1', [req.params.id]);
+    if (!creator) return res.status(404).json({ error: 'Compte introuvable.' });
+    const current = kind === 'entreprise' ? await businessUntil(creator.id) : await premiumUntil(creator.id);
+    const from = current || new Date();
+    const row = await db.query(
+      `INSERT INTO premium_subscriptions (creator_id, plan, starts_at, ends_at)
+       VALUES ($1, $2, $3::timestamptz, $3::timestamptz + ($4 || ' days')::interval) RETURNING ends_at`,
+      [creator.id, `${kind}_offert`, new Date(from).toISOString(), days]);
+    await notify(creator.id, 'offre', `🎉 L'équipe Eaji t'offre ${kind === 'entreprise' ? 'le compte Entreprise' : 'le Premium'} pendant ${days} jours !`, 's-paiements');
+    res.status(201).json({ granted: kind, endsAt: row.ends_at });
+  });
+
+  app.post('/api/admin/creators/:id/revoke-gift', requireAdminPrincipal, async (req, res) => {
+    if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+    await db.query(
+      "UPDATE premium_subscriptions SET ends_at = now() WHERE creator_id = $1 AND plan LIKE '%_offert' AND ends_at > now()", [req.params.id]);
+    res.json({ revoked: true });
   });
 
   app.get('/api/admin/business-ads', requireAdminPrincipal, async (req, res) => {
