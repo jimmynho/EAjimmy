@@ -67,6 +67,27 @@ async function runStartupMigrations() {
   const steps = [
     // Compteur de vues par contenu : nécessaire à la règle « 1 000 vues ».
     'ALTER TABLE content_items ADD COLUMN IF NOT EXISTS view_count INTEGER NOT NULL DEFAULT 0',
+    // Comptes bloqués par un créateur (ne peuvent plus le suivre, lui écrire ni commenter).
+    `CREATE TABLE IF NOT EXISTS blocks (
+       blocker_id UUID NOT NULL REFERENCES creators(id),
+       blocked_id UUID NOT NULL REFERENCES creators(id),
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       PRIMARY KEY (blocker_id, blocked_id)
+     )`,
+    // Messages vocaux : fichier audio rattaché à un message privé.
+    'ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS audio_key TEXT',
+    // Appels audio/vidéo : la mise en relation des deux téléphones passe par ici.
+    `CREATE TABLE IF NOT EXISTS calls (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+       caller_id UUID NOT NULL REFERENCES creators(id),
+       callee_id UUID NOT NULL REFERENCES creators(id),
+       kind TEXT NOT NULL CHECK (kind IN ('audio', 'video')),
+       offer_sdp TEXT NOT NULL,
+       answer_sdp TEXT,
+       status TEXT NOT NULL DEFAULT 'ringing' CHECK (status IN ('ringing', 'accepted', 'rejected', 'ended', 'missed')),
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -97,6 +118,26 @@ app.get('/', (req, res) => {
 });
 
 // ==================== MIDDLEWARES ====================
+
+// Identifie le visiteur s'il est connecté, sans l'exiger (fil public, profils publics...).
+function optionalViewerId(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return null;
+  try { return verifySessionToken(token); } catch { return null; }
+}
+
+// Vrai si l'un des deux a bloqué l'autre.
+async function isBlockedBetween(a, b) {
+  if (!a || !b) return false;
+  const row = await db.query(
+    'SELECT 1 FROM blocks WHERE (blocker_id = $1 AND blocked_id = $2) OR (blocker_id = $2 AND blocked_id = $1)',
+    [a, b]
+  );
+  return Boolean(row);
+}
+
+const VALID_ZONES = ['afrique', 'caraibes', 'asie', 'europe_centrale'];
+const VALID_CURRENCIES = ['USD', 'EUR', 'CDF'];
 
 async function requireAuth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -182,25 +223,35 @@ function verifySessionToken(token) {
 
 // Inscription : crée le compte, déclenche l'envoi des deux codes de vérification.
 app.post('/api/auth/register', async (req, res) => {
-  const { name, email, phone, password, countryCode, zone, primaryContentType } = req.body;
+  const { name, phone, password, countryCode, primaryContentType, language, currency } = req.body;
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const zone = req.body.zone;
+
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'Indique ton nom.' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Adresse email invalide (exemple : nom@gmail.com).' });
+  if (!phone || String(phone).replace(/\D/g, '').length < 8) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
+  if (!password || password.length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
+  if (!countryCode || !VALID_ZONES.includes(zone)) return res.status(400).json({ error: 'Choisis ton pays.' });
 
   const passwordHash = await bcrypt.hash(password, 12);
+  const giftCurrency = VALID_CURRENCIES.includes(String(currency || '').toUpperCase()) ? String(currency).toUpperCase() : 'USD';
 
   const creator = await db.query(
-    `INSERT INTO creators (name, email, phone, password_hash, country_code, zone, primary_content_type)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, country_code`,
-    [name, email, phone, passwordHash, countryCode, zone, primaryContentType]
+    `INSERT INTO creators (name, email, phone, password_hash, country_code, zone, primary_content_type, language, gift_currency)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, country_code`,
+    [String(name).trim(), email, String(phone).replace(/[\s.-]/g, ''), passwordHash, countryCode, zone,
+     primaryContentType || 'video_courte', language || 'fr', giftCurrency]
   );
-
-  const smsCode = await sendVerificationCode(creator.id, 'sms', phone);
-  await sendVerificationCode(creator.id, 'gmail', email);
+  // Pas d'envoi de code ici : le site enchaîne aussitôt sur la connexion, qui envoie UN seul code.
+  // (Avant, deux codes différents partaient par email, et le premier ne marchait plus.)
+  const smsCode = null;
 
   // Commission d'ouverture de compte (2 $ / 2 € / 5 000 FC) créditée à l'administrateur principal.
   // Ne bloque jamais l'inscription si l'enregistrement échoue.
   try {
     const principal = await db.query("SELECT id FROM admins WHERE role = 'admin_principal' LIMIT 1");
     if (principal) {
-      const commission = calculateOpeningCommission(req.body.currency || 'USD');
+      const commission = calculateOpeningCommission(giftCurrency);
       await db.query(
         `INSERT INTO admin_commissions (admin_id, creator_id, type, amount, currency)
          VALUES ($1, $2, 'ouverture', $3, $4)`,
@@ -213,7 +264,7 @@ app.post('/api/auth/register', async (req, res) => {
 
   res.status(201).json({
     creatorId: creator.id,
-    message: 'Codes de vérification envoyés (SMS + Gmail).',
+    message: 'Compte créé.',
     ...(smsCode ? { devCode: smsCode, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
   });
 });
@@ -236,9 +287,9 @@ app.post('/api/auth/verify', async (req, res) => {
 // Connexion étape 1 : mot de passe. Déclenche l'envoi d'un OTP (2ème facteur).
 app.post('/api/auth/login', async (req, res) => {
   const { email, password, ipAddress, deviceFingerprint } = req.body;
-  const creator = await db.query('SELECT * FROM creators WHERE email = $1', [email]);
+  const creator = await db.query('SELECT * FROM creators WHERE lower(email) = lower($1)', [String(email || '').trim()]);
 
-  const passwordOk = creator && (await bcrypt.compare(password, creator.password_hash));
+  const passwordOk = creator && (await bcrypt.compare(password || '', creator.password_hash));
 
   await logLoginAttempt({ creatorId: creator?.id, ipAddress, deviceFingerprint, success: !!passwordOk });
 
@@ -337,20 +388,15 @@ async function sendLoginOtp(creator) {
     [creator.id, channel === 'sms' ? 'sms' : 'gmail', codeHash]
   );
 
+  // Envoi en arrière-plan : l'écran du code s'affiche tout de suite, l'email arrive juste après.
   if (channel === 'gmail') {
-    try {
-      await sendEmailReal(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable 10 minutes).`);
-      return { code: null, channel };
-    } catch (e) {
-      console.error('Échec envoi email Gmail :', e.message);
-    }
+    sendEmailReal(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable 10 minutes).`)
+      .catch((e) => console.error('Échec envoi email Gmail :', e.message));
+    return { code: null, channel };
   } else if (channel === 'sms') {
-    try {
-      await sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`);
-      return { code: null, channel };
-    } catch (e) {
-      console.error('Échec envoi SMS Twilio :', e.message);
-    }
+    sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`)
+      .catch((e) => console.error('Échec envoi SMS Twilio :', e.message));
+    return { code: null, channel };
   }
 
   return { code, channel: 'demo' }; // repli mode test si rien n'est configuré ou que l'envoi échoue
@@ -424,6 +470,7 @@ app.get('/api/creators/me/transactions', requireAuth, async (req, res) => {
 
 app.get('/api/creators/:id', requireAuth, async (req, res) => {
   const creator = await db.query('SELECT * FROM creators WHERE id = $1', [req.params.id]);
+  if (!creator) return res.status(404).json({ error: 'Compte introuvable.' });
   const isOwner = req.creatorId === req.params.id;
 
   const publicProfile = {
@@ -443,6 +490,12 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
     publicProfile.countryCode = creator.country_code;
     publicProfile.primaryContentType = creator.primary_content_type;
     publicProfile.verificationStatus = creator.verification_status;
+    publicProfile.email = creator.email;
+    publicProfile.phone = creator.phone;
+    publicProfile.language = creator.language;
+    publicProfile.giftCurrency = creator.gift_currency;
+    publicProfile.profileVisibility = creator.profile_visibility;
+    publicProfile.subscriberCountPublic = creator.subscriber_count_public;
   }
 
   res.json(publicProfile);
@@ -451,7 +504,7 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
 app.patch('/api/creators/me/visibility', requireAuth, async (req, res) => {
   const { profileVisibility, subscriberCountPublic } = req.body;
   await db.query(
-    'UPDATE creators SET profile_visibility = $1, subscriber_count_public = $2 WHERE id = $3',
+    'UPDATE creators SET profile_visibility = COALESCE($1, profile_visibility), subscriber_count_public = COALESCE($2, subscriber_count_public) WHERE id = $3',
     [profileVisibility, subscriberCountPublic, req.creatorId]
   );
   res.json({ updated: true });
@@ -617,23 +670,72 @@ app.post('/api/gifts', requireAuth, requirePayments, async (req, res) => {
 // Fil de contenus publics (découverte) : les plus récents en premier,
 // avec le nom du créateur et les compteurs likes/commentaires.
 app.get('/api/feed', async (req, res) => {
+  const viewerId = optionalViewerId(req);
+  const country = /^[A-Z]{2}$/.test(String(req.query.country || '')) ? req.query.country : null;
   const items = await db.all(
-    `SELECT c.id, c.title, c.content_type, c.created_at,
+    `SELECT c.id, c.title, c.content_type, c.created_at, c.visibility_scope,
             c.storage_url,
-            cr.id AS creator_id, cr.name AS creator_name,
+            cr.id AS creator_id, cr.name AS creator_name, cr.country_code AS creator_country, cr.photo_url AS creator_photo_key,
             (SELECT COUNT(*) FROM content_likes WHERE content_id = c.id) AS like_count,
             (SELECT COUNT(*) FROM content_comments WHERE content_id = c.id) AS comment_count
      FROM content_items c
      JOIN creators cr ON cr.id = c.creator_id
-     WHERE c.visibility_scope = 'public' AND c.status = 'actif' AND cr.account_status = 'actif'
+     WHERE c.status = 'actif' AND cr.account_status = 'actif'
+       AND ($1::text IS NULL OR cr.country_code = $1)
+       AND (c.visibility_scope = 'public'
+            OR c.creator_id = $2
+            OR EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followed_id = c.creator_id))
+       AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = c.creator_id AND b.blocked_id = $2)
+                                                OR (b.blocker_id = $2 AND b.blocked_id = c.creator_id))
      ORDER BY c.created_at DESC
-     LIMIT 30`
+     LIMIT 50`,
+    [country, viewerId]
   );
   for (const item of items) {
     item.fileUrl = await createDownloadUrl(item.storage_url).catch(() => null);
+    item.creator_photo = await createDownloadUrl(item.creator_photo_key).catch(() => null);
     delete item.storage_url;
+    delete item.creator_photo_key;
   }
-  res.json({ items });
+  let following = [];
+  if (viewerId) {
+    following = (await db.all('SELECT followed_id FROM follows WHERE follower_id = $1', [viewerId])).map((r) => r.followed_id);
+  }
+  res.json({ items, following });
+});
+
+// 6. Profil public d'un créateur : visible par tous, abonnés ou non, pour pouvoir s'abonner.
+app.get('/api/creators/:id/public', async (req, res) => {
+  const viewerId = optionalViewerId(req);
+  const creator = await db.query(
+    "SELECT * FROM creators WHERE id = $1 AND account_status = 'actif'", [req.params.id]
+  );
+  if (!creator || (await isBlockedBetween(viewerId, creator.id))) {
+    return res.status(404).json({ error: 'Compte introuvable.' });
+  }
+  const followers = await db.query('SELECT COUNT(*)::int AS total FROM follows WHERE followed_id = $1', [creator.id]);
+  const isFollowing = viewerId
+    ? Boolean(await db.query('SELECT 1 FROM follows WHERE follower_id = $1 AND followed_id = $2', [viewerId, creator.id]))
+    : false;
+  const contents = await db.all(
+    `SELECT id, title, content_type, created_at FROM content_items
+     WHERE creator_id = $1 AND status = 'actif'
+       AND (visibility_scope = 'public' OR $2::boolean OR creator_id = $3)
+     ORDER BY created_at DESC LIMIT 50`,
+    [creator.id, isFollowing, viewerId]
+  );
+  res.json({
+    id: creator.id,
+    name: creator.name,
+    countryCode: creator.country_code,
+    zone: creator.zone,
+    primaryContentType: creator.primary_content_type,
+    photoUrl: await createDownloadUrl(creator.photo_url).catch(() => null),
+    subscriberCount: creator.subscriber_count_public || viewerId === creator.id ? followers.total : null,
+    isFollowing,
+    isMe: viewerId === creator.id,
+    contents,
+  });
 });
 
 // Une vue est comptée quand quelqu'un regarde/écoute/ouvre un contenu.
@@ -676,6 +778,10 @@ app.get('/api/content/:id/comments', async (req, res) => {
 
 app.post('/api/content/:id/comments', requireAuth, async (req, res) => {
   const { text } = req.body;
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'Commentaire vide.' });
+  const target = await db.query('SELECT creator_id FROM content_items WHERE id = $1', [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Contenu introuvable.' });
+  if (await isBlockedBetween(req.creatorId, target.creator_id)) return res.status(403).json({ error: 'Tu ne peux pas commenter ce contenu.' });
   const comment = await db.query(
     'INSERT INTO content_comments (content_id, creator_id, text) VALUES ($1, $2, $3) RETURNING id',
     [req.params.id, req.creatorId, text]
@@ -686,6 +792,9 @@ app.post('/api/content/:id/comments', requireAuth, async (req, res) => {
 app.post('/api/creators/:id/follow', requireAuth, async (req, res) => {
   if (req.params.id === req.creatorId) {
     return res.status(400).json({ error: 'Tu ne peux pas t\'abonner à ton propre compte.' });
+  }
+  if (await isBlockedBetween(req.creatorId, req.params.id)) {
+    return res.status(403).json({ error: 'Tu ne peux pas t\'abonner à ce compte.' });
   }
   await db.query(
     `INSERT INTO follows (follower_id, followed_id) VALUES ($1, $2)
@@ -702,7 +811,16 @@ app.delete('/api/creators/:id/follow', requireAuth, async (req, res) => {
 
 // Modification du profil : nom, photo, numéro de retrait, pays.
 app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
-  const { name, photoUrl, withdrawalPhone, countryCode, language, giftCurrency } = req.body;
+  const { name, photoUrl, withdrawalPhone, countryCode, language, primaryContentType } = req.body;
+  const giftCurrency = req.body.giftCurrency ? String(req.body.giftCurrency).toUpperCase() : null;
+  if (giftCurrency && !VALID_CURRENCIES.includes(giftCurrency)) return res.status(400).json({ error: 'Devise non prise en charge.' });
+  if (req.body.zone && !VALID_ZONES.includes(req.body.zone)) return res.status(400).json({ error: 'Zone inconnue.' });
+  if (req.body.zone || primaryContentType) {
+    await db.query(
+      'UPDATE creators SET zone = COALESCE($1, zone), primary_content_type = COALESCE($2, primary_content_type) WHERE id = $3',
+      [req.body.zone || null, primaryContentType || null, req.creatorId]
+    );
+  }
   await db.query(
     `UPDATE creators SET
        name = COALESCE($1, name),
@@ -720,7 +838,10 @@ app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
 // Changement de numéro de téléphone : jamais direct — un code de vérification
 // est d'abord envoyé au NOUVEAU numéro, pour prouver qu'on le contrôle bien.
 app.post('/api/auth/change-phone/request', requireAuth, async (req, res) => {
-  const { newPhone } = req.body;
+  const newPhone = String(req.body.newPhone || '').replace(/[\s.-]/g, '');
+  if (newPhone.replace(/\D/g, '').length < 8) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
+  const taken = await db.query('SELECT 1 FROM creators WHERE phone = $1 AND id <> $2', [newPhone, req.creatorId]);
+  if (taken) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un autre compte.' });
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
   const request = await db.query(
@@ -728,8 +849,18 @@ app.post('/api/auth/change-phone/request', requireAuth, async (req, res) => {
      VALUES ($1, $2, $3, now() + interval '10 minutes') RETURNING id`,
     [req.creatorId, newPhone, codeHash]
   );
-  // Brancher ici l'envoi réel du SMS vers newPhone.
-  res.status(201).json({ requestId: request.id, message: 'Code envoyé au nouveau numéro.' });
+  // Le code part par SMS vers le nouveau numéro si Twilio est actif, sinon par email au titulaire du compte.
+  const me = await db.query('SELECT email FROM creators WHERE id = $1', [req.creatorId]);
+  const text = `Eaji — code pour confirmer ton nouveau numéro : ${code} (valable 10 minutes).`;
+  if (SMS_PROVIDER_CONNECTED) {
+    sendSmsReal(newPhone, text).catch((e) => console.error('Échec SMS changement de numéro :', e.message));
+    return res.status(201).json({ requestId: request.id, message: 'Code envoyé par SMS au nouveau numéro.' });
+  }
+  if (EMAIL_PROVIDER_CONNECTED) {
+    sendEmailReal(me.email, 'Eaji — confirme ton nouveau numéro', text).catch((e) => console.error('Échec email changement de numéro :', e.message));
+    return res.status(201).json({ requestId: request.id, message: 'Code envoyé par email.' });
+  }
+  res.status(201).json({ requestId: request.id, message: 'Mode test : code affiché.', devCode: code });
 });
 
 app.post('/api/auth/change-phone/confirm', requireAuth, async (req, res) => {
@@ -804,6 +935,191 @@ app.get('/api/admin/finances', requireAdminPrincipal, async (req, res) => {
   res.json({ commissions, adRevenue });
 });
 
+// ==================== MES PUBLICATIONS (point 8) ====================
+
+app.get('/api/my/content', requireAuth, async (req, res) => {
+  const items = await db.all(
+    `SELECT c.id, c.title, c.content_type, c.visibility_scope, c.created_at, c.view_count,
+            (SELECT COUNT(*)::int FROM content_likes WHERE content_id = c.id) AS like_count
+     FROM content_items c WHERE c.creator_id = $1 AND c.status = 'actif' ORDER BY c.created_at DESC`,
+    [req.creatorId]
+  );
+  res.json({ items });
+});
+
+app.patch('/api/my/content/:id', requireAuth, async (req, res) => {
+  const title = req.body.title !== undefined ? String(req.body.title).trim() : null;
+  const scope = req.body.visibilityScope;
+  if (title === '') return res.status(400).json({ error: 'Le titre ne peut pas être vide.' });
+  if (scope && !['public', 'abonnes'].includes(scope)) return res.status(400).json({ error: 'Visibilité inconnue.' });
+  const updated = await db.query(
+    `UPDATE content_items SET title = COALESCE($1, title), visibility_scope = COALESCE($2, visibility_scope)
+     WHERE id = $3 AND creator_id = $4 AND status = 'actif' RETURNING id`,
+    [title, scope || null, req.params.id, req.creatorId]
+  );
+  if (!updated) return res.status(404).json({ error: 'Publication introuvable.' });
+  res.json({ updated: true });
+});
+
+app.delete('/api/my/content/:id', requireAuth, async (req, res) => {
+  const removed = await db.query(
+    "UPDATE content_items SET status = 'retire' WHERE id = $1 AND creator_id = $2 AND status = 'actif' RETURNING id",
+    [req.params.id, req.creatorId]
+  );
+  if (!removed) return res.status(404).json({ error: 'Publication introuvable.' });
+  res.json({ deleted: true });
+});
+
+// ==================== ABONNÉS ET BLOCAGES (point 9) ====================
+
+app.get('/api/creators/me/followers', requireAuth, async (req, res) => {
+  const followers = await db.all(
+    `SELECT cr.id, cr.name, cr.country_code FROM follows f JOIN creators cr ON cr.id = f.follower_id
+     WHERE f.followed_id = $1 ORDER BY f.created_at DESC`,
+    [req.creatorId]
+  );
+  res.json({ followers });
+});
+
+app.delete('/api/creators/me/followers/:id', requireAuth, async (req, res) => {
+  await db.query('DELETE FROM follows WHERE follower_id = $1 AND followed_id = $2', [req.params.id, req.creatorId]);
+  res.json({ removed: true });
+});
+
+app.get('/api/creators/me/blocks', requireAuth, async (req, res) => {
+  const blocked = await db.all(
+    `SELECT cr.id, cr.name FROM blocks b JOIN creators cr ON cr.id = b.blocked_id
+     WHERE b.blocker_id = $1 ORDER BY b.created_at DESC`,
+    [req.creatorId]
+  );
+  res.json({ blocked });
+});
+
+app.post('/api/creators/me/blocks/:id', requireAuth, async (req, res) => {
+  if (req.params.id === req.creatorId) return res.status(400).json({ error: 'Tu ne peux pas te bloquer toi-même.' });
+  await db.query('INSERT INTO blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.creatorId, req.params.id]);
+  // Bloquer retire aussi l'abonnement dans les deux sens.
+  await db.query(
+    'DELETE FROM follows WHERE (follower_id = $1 AND followed_id = $2) OR (follower_id = $2 AND followed_id = $1)',
+    [req.creatorId, req.params.id]
+  );
+  res.status(201).json({ blocked: true });
+});
+
+app.delete('/api/creators/me/blocks/:id', requireAuth, async (req, res) => {
+  await db.query('DELETE FROM blocks WHERE blocker_id = $1 AND blocked_id = $2', [req.creatorId, req.params.id]);
+  res.json({ unblocked: true });
+});
+
+// ==================== MODE DE RETRAIT (point 9) ====================
+
+app.get('/api/creators/me/payout-account', requireAuth, async (req, res) => {
+  const account = await db.query(
+    'SELECT provider, aggregator, external_account_id, status FROM payout_accounts WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 1',
+    [req.creatorId]
+  );
+  res.json({ account: account || null });
+});
+
+app.put('/api/creators/me/payout-account', requireAuth, async (req, res) => {
+  const { method, operator, accountNumber } = req.body;
+  if (!['mobile_money', 'virement'].includes(method)) return res.status(400).json({ error: 'Choisis un mode de retrait.' });
+  if (!accountNumber || String(accountNumber).trim().length < 6) return res.status(400).json({ error: 'Numéro ou compte de retrait invalide.' });
+  const provider = method === 'mobile_money' ? 'mobile_money' : 'manual_review';
+  await db.query('DELETE FROM payout_accounts WHERE creator_id = $1', [req.creatorId]);
+  await db.query(
+    'INSERT INTO payout_accounts (creator_id, provider, aggregator, external_account_id) VALUES ($1, $2, $3, $4)',
+    [req.creatorId, provider, method === 'mobile_money' ? (operator || null) : 'virement_bancaire', String(accountNumber).trim()]
+  );
+  if (method === 'mobile_money') {
+    await db.query('UPDATE creators SET withdrawal_phone = $1 WHERE id = $2', [String(accountNumber).trim(), req.creatorId]);
+  }
+  res.json({ saved: true });
+});
+
+// ==================== APPELS AUDIO / VIDÉO ====================
+// Les deux téléphones se parlent directement (WebRTC). Le serveur ne fait que la mise en
+// relation : il transmet « l'offre » de l'appelant et « la réponse » de l'appelé.
+
+// Serveurs qui aident les téléphones à se trouver sur internet. Un serveur TURN (relais)
+// rend les appels fiables sur tous les réseaux mobiles : à ajouter via les variables
+// TURN_URL, TURN_USERNAME, TURN_CREDENTIAL sur Railway.
+app.get('/api/calls/ice-config', requireAuth, (req, res) => {
+  const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  if (process.env.TURN_URL) {
+    iceServers.push({ urls: process.env.TURN_URL.split(','), username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+  }
+  res.json({ iceServers });
+});
+
+app.post('/api/calls', requireAuth, async (req, res) => {
+  const { calleeId, kind, offer } = req.body;
+  if (!['audio', 'video'].includes(kind) || !offer) return res.status(400).json({ error: 'Appel invalide.' });
+  if (calleeId === req.creatorId) return res.status(400).json({ error: 'Tu ne peux pas t\'appeler toi-même.' });
+  const callee = await db.query("SELECT id FROM creators WHERE id = $1 AND account_status = 'actif'", [calleeId]);
+  if (!callee) return res.status(404).json({ error: 'Compte introuvable.' });
+  if (await isBlockedBetween(req.creatorId, calleeId)) return res.status(403).json({ error: 'Tu ne peux pas appeler ce compte.' });
+  // Un ancien appel resté « en sonnerie » est considéré comme manqué.
+  await db.query(
+    "UPDATE calls SET status = 'missed', updated_at = now() WHERE status = 'ringing' AND created_at < now() - interval '45 seconds'"
+  );
+  const call = await db.query(
+    'INSERT INTO calls (caller_id, callee_id, kind, offer_sdp) VALUES ($1, $2, $3, $4) RETURNING id',
+    [req.creatorId, calleeId, kind, String(offer)]
+  );
+  res.status(201).json({ callId: call.id });
+});
+
+// L'appelé demande régulièrement s'il a un appel entrant.
+app.get('/api/calls/incoming', requireAuth, async (req, res) => {
+  const call = await db.query(
+    `SELECT c.id, c.kind, c.offer_sdp, cr.name AS caller_name, c.caller_id
+     FROM calls c JOIN creators cr ON cr.id = c.caller_id
+     WHERE c.callee_id = $1 AND c.status = 'ringing' AND c.created_at > now() - interval '45 seconds'
+     ORDER BY c.created_at DESC LIMIT 1`,
+    [req.creatorId]
+  );
+  res.json({ call: call || null });
+});
+
+app.get('/api/calls/:id', requireAuth, async (req, res) => {
+  const call = await db.query(
+    'SELECT id, status, kind, answer_sdp, caller_id, callee_id, created_at FROM calls WHERE id = $1 AND (caller_id = $2 OR callee_id = $2)',
+    [req.params.id, req.creatorId]
+  );
+  if (!call) return res.status(404).json({ error: 'Appel introuvable.' });
+  if (call.status === 'ringing' && Date.now() - new Date(call.created_at).getTime() > 45000) {
+    await db.query("UPDATE calls SET status = 'missed', updated_at = now() WHERE id = $1", [call.id]);
+    call.status = 'missed';
+  }
+  res.json({ call });
+});
+
+app.post('/api/calls/:id/answer', requireAuth, async (req, res) => {
+  const updated = await db.query(
+    "UPDATE calls SET answer_sdp = $1, status = 'accepted', updated_at = now() WHERE id = $2 AND callee_id = $3 AND status = 'ringing' RETURNING id",
+    [String(req.body.answer || ''), req.params.id, req.creatorId]
+  );
+  if (!updated) return res.status(409).json({ error: 'Cet appel n\'est plus disponible.' });
+  res.json({ accepted: true });
+});
+
+app.post('/api/calls/:id/reject', requireAuth, async (req, res) => {
+  await db.query(
+    "UPDATE calls SET status = 'rejected', updated_at = now() WHERE id = $1 AND callee_id = $2 AND status = 'ringing'",
+    [req.params.id, req.creatorId]
+  );
+  res.json({ rejected: true });
+});
+
+app.post('/api/calls/:id/end', requireAuth, async (req, res) => {
+  await db.query(
+    "UPDATE calls SET status = CASE WHEN status = 'ringing' THEN 'missed' ELSE 'ended' END, updated_at = now() WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted')",
+    [req.params.id, req.creatorId]
+  );
+  res.json({ ended: true });
+});
+
 // ==================== MESSAGERIE PRIVÉE ====================
 
 // Liste des conversations du créateur connecté : dernier message avec chaque personne.
@@ -828,13 +1144,29 @@ app.get('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
      ORDER BY created_at ASC`,
     [req.creatorId, req.params.withCreatorId]
   );
+  for (const m of messages) {
+    m.audioUrl = m.audio_key ? await createDownloadUrl(m.audio_key).catch(() => null) : null;
+    delete m.audio_key;
+  }
   res.json({ messages });
 });
 
 app.post('/api/messages/:withCreatorId', requireAuth, async (req, res) => {
-  const { text } = req.body;
+  const { text, audioKey } = req.body;
+  if (audioKey) {
+    // Message vocal : la clé doit avoir été délivrée à cet expéditeur.
+    if (!String(audioKey).startsWith(`${req.creatorId}/`)) return res.status(403).json({ error: 'Message vocal non autorisé.' });
+    if (req.params.withCreatorId === req.creatorId) return res.status(400).json({ error: 'Tu ne peux pas t\'écrire à toi-même.' });
+    if (await isBlockedBetween(req.creatorId, req.params.withCreatorId)) return res.status(403).json({ error: 'Tu ne peux pas écrire à ce compte.' });
+    const voice = await db.query(
+      'INSERT INTO direct_messages (sender_id, recipient_id, text, audio_key) VALUES ($1, $2, $3, $4) RETURNING id',
+      [req.creatorId, req.params.withCreatorId, '🎤 Message vocal', audioKey]
+    );
+    return res.status(201).json({ messageId: voice.id });
+  }
   if (!text || !String(text).trim()) return res.status(400).json({ error: 'Message vide.' });
   if (req.params.withCreatorId === req.creatorId) return res.status(400).json({ error: 'Tu ne peux pas t\'écrire à toi-même.' });
+  if (await isBlockedBetween(req.creatorId, req.params.withCreatorId)) return res.status(403).json({ error: 'Tu ne peux pas écrire à ce compte.' });
   const message = await db.query(
     'INSERT INTO direct_messages (sender_id, recipient_id, text) VALUES ($1, $2, $3) RETURNING id',
     [req.creatorId, req.params.withCreatorId, text]
