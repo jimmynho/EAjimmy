@@ -303,7 +303,7 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({
     creatorId: creator.id,
     message: `Code de vérification envoyé ${channelLabel}.`,
-    ...(devCode ? { devCode, devWarning: 'Mode test — aucun email/SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
+    ...(devCode ? { devCode, devWarning: "L'email n'a pas pu être envoyé : le code est affiché ici." } : {}),
   });
 });
 
@@ -352,20 +352,78 @@ async function sendSmsReal(toPhone, body) {
 // à 16 caractères, généré depuis myaccount.google.com/apppasswords (nécessite
 // la validation en 2 étapes activée sur ce compte Gmail — gratuit, aucune carte
 // bancaire requise).
-const EMAIL_PROVIDER_CONNECTED = !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+// Deux façons d'envoyer les emails :
+//  - Brevo (recommandé) : passe par le web (HTTPS), jamais bloqué par Railway, gratuit jusqu'à 300 emails/jour.
+//    Variables : BREVO_API_KEY et BREVO_SENDER_EMAIL (l'adresse d'expéditeur validée chez Brevo).
+//  - Gmail (SMTP) : bloqué par Railway sauf sur l'offre Pro.
+const BREVO_CONNECTED = !!(process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL);
+const GMAIL_CONNECTED = !!(process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD);
+const EMAIL_PROVIDER_CONNECTED = BREVO_CONNECTED || GMAIL_CONNECTED;
 
 let mailTransporter = null;
-if (EMAIL_PROVIDER_CONNECTED) {
+if (GMAIL_CONNECTED && !BREVO_CONNECTED) {
   mailTransporter = require('nodemailer').createTransport({
     service: 'gmail',
     auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD },
+    // Échouer vite si l'hébergeur bloque l'envoi (au lieu d'attendre plusieurs minutes).
+    connectionTimeout: 5000, greetingTimeout: 5000, socketTimeout: 8000,
   });
-} else {
-  console.warn('⚠️  Gmail non configuré — pas d\'envoi d\'email réel pour l\'instant.');
 }
+if (BREVO_CONNECTED) console.log('[Eaji] Emails envoyés via Brevo.');
+else if (GMAIL_CONNECTED) console.warn('[Eaji] Emails via Gmail (SMTP) : Railway le bloque hors offre Pro. Si les codes n\'arrivent pas, ils s\'afficheront à l\'écran.');
+else console.warn('⚠️  Aucun envoi d\'email configuré — les codes s\'affichent à l\'écran.');
+
+// Après un échec d'envoi, on n'essaie plus pendant 10 minutes : le code s'affiche tout de suite.
+let emailBrokenUntil = 0;
+
+// Gmail (SMTP) : on vérifie dès le démarrage, puis toutes les 10 minutes, si l'envoi est possible.
+// S'il est bloqué, les codes s'affichent directement à l'écran, sans faire attendre personne.
+async function checkSmtpReachable() {
+  if (!mailTransporter) return;
+  try {
+    await Promise.race([mailTransporter.verify(), new Promise((_, r) => setTimeout(() => r(new Error('délai dépassé')), 6000))]);
+    emailBrokenUntil = 0;
+  } catch (e) {
+    emailBrokenUntil = Date.now() + 11 * 60 * 1000;
+    console.warn('[Eaji] Envoi Gmail impossible depuis ce serveur (' + e.message + ') : les codes seront affichés à l\'écran.');
+  }
+}
+checkSmtpReachable();
+setInterval(checkSmtpReachable, 10 * 60 * 1000).unref();
 
 async function sendEmailReal(toEmail, subject, text) {
+  if (BREVO_CONNECTED) {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: { 'api-key': process.env.BREVO_API_KEY, 'Content-Type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        sender: { email: process.env.BREVO_SENDER_EMAIL, name: 'Eaji' },
+        to: [{ email: toEmail }],
+        subject,
+        textContent: text,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) throw new Error(`Brevo ${res.status} : ${(await res.text()).slice(0, 200)}`);
+    return;
+  }
   await mailTransporter.sendMail({ from: process.env.GMAIL_USER, to: toEmail, subject, text });
+}
+
+// Envoie un email en attendant au plus 8 secondes. Renvoie true si c'est parti.
+async function trySendEmail(toEmail, subject, text) {
+  if (!EMAIL_PROVIDER_CONNECTED || Date.now() < emailBrokenUntil) return false;
+  try {
+    await Promise.race([
+      sendEmailReal(toEmail, subject, text),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('délai dépassé')), 6000)),
+    ]);
+    return true;
+  } catch (e) {
+    console.error('[Eaji] Échec envoi email :', e.message);
+    emailBrokenUntil = Date.now() + 10 * 60 * 1000;
+    return false;
+  }
 }
 
 // Choisit le meilleur canal disponible pour un code de connexion, en
@@ -388,11 +446,10 @@ async function sendLoginOtp(creator) {
     [creator.id, channel === 'sms' ? 'sms' : 'gmail', codeHash]
   );
 
-  // Envoi en arrière-plan : l'écran du code s'affiche tout de suite, l'email arrive juste après.
+  // Email : si l'envoi échoue (ou est bloqué), le code est affiché à l'écran au lieu de bloquer la personne.
   if (channel === 'gmail') {
-    sendEmailReal(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable 10 minutes).`)
-      .catch((e) => console.error('Échec envoi email Gmail :', e.message));
-    return { code: null, channel };
+    const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable 10 minutes).`);
+    return sent ? { code: null, channel } : { code, channel: 'demo' };
   } else if (channel === 'sms') {
     sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`)
       .catch((e) => console.error('Échec envoi SMS Twilio :', e.message));
@@ -856,11 +913,10 @@ app.post('/api/auth/change-phone/request', requireAuth, async (req, res) => {
     sendSmsReal(newPhone, text).catch((e) => console.error('Échec SMS changement de numéro :', e.message));
     return res.status(201).json({ requestId: request.id, message: 'Code envoyé par SMS au nouveau numéro.' });
   }
-  if (EMAIL_PROVIDER_CONNECTED) {
-    sendEmailReal(me.email, 'Eaji — confirme ton nouveau numéro', text).catch((e) => console.error('Échec email changement de numéro :', e.message));
+  if (await trySendEmail(me.email, 'Eaji — confirme ton nouveau numéro', text)) {
     return res.status(201).json({ requestId: request.id, message: 'Code envoyé par email.' });
   }
-  res.status(201).json({ requestId: request.id, message: 'Mode test : code affiché.', devCode: code });
+  res.status(201).json({ requestId: request.id, message: "L'email n'a pas pu partir. Ton code :", devCode: code });
 });
 
 app.post('/api/auth/change-phone/confirm', requireAuth, async (req, res) => {
