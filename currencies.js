@@ -107,10 +107,10 @@ function convertFromUSD(amountUsd, code) {
 }
 
 // Rémunération : règle d'origine pour USD/EUR/CDF, conversion du montant en dollars pour les autres.
-function payoutInCurrency({ subscribers, views, currency }) {
+function payoutInCurrency({ subscribers, views, monthlyViews, currency }) {
   const c = String(currency || 'USD').toUpperCase();
-  if (Object.prototype.hasOwnProperty.call(RATE_PER_UNIT, c)) return calculateMonthlyPayout({ subscribers, views, currency: c });
-  const usd = calculateMonthlyPayout({ subscribers, views, currency: 'USD' });
+  if (Object.prototype.hasOwnProperty.call(RATE_PER_UNIT, c)) return calculateMonthlyPayout({ subscribers, views, monthlyViews, currency: c });
+  const usd = calculateMonthlyPayout({ subscribers, views, monthlyViews, currency: 'USD' });
   return { ...usd, amount: convertFromUSD(usd.amount, c), currency: c, convertedFromUSD: usd.amount, rateUpdatedAt: ratesUpdatedAt };
 }
 
