@@ -46,6 +46,28 @@ function previousPeriod(date = new Date()) {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
+// Retrouve un compte avec son email OU son numéro de téléphone (avec ou sans indicatif : 0812 345 678,
+// 812345678, +243812345678, 00243…). countryCode (pays de l'appareil) départage un même numéro local.
+async function findAccount(db, identifier, countryCode) {
+  const raw = String(identifier || '').trim();
+  if (!raw) return { creator: null, via: 'email' };
+  if (raw.includes('@')) {
+    return { creator: await db.query('SELECT * FROM creators WHERE lower(email) = lower($1)', [raw]), via: 'email' };
+  }
+  let num = raw.replace(/[\s.()\-]/g, '');
+  if (num.startsWith('00')) num = '+' + num.slice(2);
+  if (!/^\+?\d{6,15}$/.test(num)) return { creator: null, via: 'telephone' };
+  if (num.startsWith('+')) return { creator: await db.query('SELECT * FROM creators WHERE phone = $1', [num]), via: 'telephone' };
+  const local = num.replace(/^0+/, '');
+  const rows = await db.all(
+    `SELECT * FROM creators WHERE phone = '+' || $1
+        OR (right(phone, length($1)) = $1 AND length(phone) BETWEEN length($1) + 2 AND length($1) + 5) LIMIT 10`, [local]);
+  if (rows.length <= 1) return { creator: rows[0] || null, via: 'telephone' };
+  const same = rows.filter((r) => r.country_code === String(countryCode || '').toUpperCase());
+  if (same.length === 1) return { creator: same[0], via: 'telephone' };
+  return { creator: null, via: 'telephone', ambiguous: true };
+}
+
 // opts : { title, body } pour le texte affiché sur le téléphone, inApp:false pour ne rien mettre dans la cloche.
 function makeNotifier(db, sendPush) {
   return async function notify(creatorId, kind, text, link = null, opts = {}) {
@@ -70,11 +92,13 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
       `SELECT c.id, c.country_code, c.phone,
               GREATEST(COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id ORDER BY verified_at DESC LIMIT 1), 0),
                        (SELECT COUNT(*)::int FROM follows WHERE followed_id = c.id)) AS subscribers,
-              (SELECT COALESCE(SUM(view_count), 0)::int FROM content_items WHERE creator_id = c.id) AS views
+              (SELECT COALESCE(SUM(view_count), 0)::int FROM content_items WHERE creator_id = c.id) AS views,
+              EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = c.id AND ps.ends_at > now()) AS premium
        FROM creators c WHERE c.account_status = 'actif'`);
     let created = 0;
     for (const r of rows) {
       if (!isMonetizedCreator(r.country_code, r.phone)) continue;
+      if (!r.premium) continue; // rémunération réservée aux comptes Premium
       const p = calculateMonthlyPayout({ subscribers: Number(r.subscribers), views: Number(r.views), currency: 'USD' });
       if (!p.eligible || !(p.amount > 0)) continue;
       const ins = await db.query(
@@ -145,10 +169,15 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
 
   // ==================== 2. MOT DE PASSE OUBLIÉ ====================
   app.post('/api/auth/forgot', async (req, res) => {
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const generic = { message: "Si un compte existe avec cet email, un code vient d'être envoyé (regarde aussi les spams). Sans réponse, contacte l'administrateur Eaji." };
-    const creator = await db.query("SELECT id, email, phone FROM creators WHERE lower(email) = $1 AND account_status = 'actif'", [email]);
+    const found = await findAccount(db, req.body.identifier || req.body.email, req.body.countryCode);
+    const byPhone = found.via === 'telephone';
+    const generic = { message: byPhone && !sendSms
+      ? "Pour un compte créé avec un numéro de téléphone, contacte l'administrateur Eaji : après vérification, il te donnera un mot de passe provisoire."
+      : "Si un compte existe, un code vient d'être envoyé (regarde aussi les spams). Sans réponse, contacte l'administrateur Eaji.", noCode: byPhone && !sendSms };
+    const creator = found.creator && found.creator.account_status === 'actif' ? found.creator : null;
     if (!creator) return res.json(generic);
+    // Ni email ni SMS possible : aucun code n'est créé (il ne doit jamais s'afficher à l'écran).
+    if (!sendSms && (byPhone || !creator.email)) return res.json(generic);
     const recent = await db.query("SELECT 1 FROM password_resets WHERE creator_id = $1 AND created_at > now() - interval '1 minute'", [creator.id]);
     if (recent) return res.json(generic);
     const code = crypto.randomInt(100000, 999999).toString();
@@ -157,17 +186,16 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
       [creator.id, await bcrypt.hash(code, 10)]);
     const text = `Eaji — code pour choisir un nouveau mot de passe : ${code} (valable 15 minutes). Si tu n'as rien demandé, ignore ce message.`;
     // Par sécurité, ce code n'est JAMAIS affiché à l'écran : il part seulement par email ou SMS.
-    await trySendEmail(creator.email, 'Eaji — nouveau mot de passe', text);
+    if (creator.email && !byPhone) await trySendEmail(creator.email, 'Eaji — nouveau mot de passe', text);
     if (sendSms) sendSms(creator.phone, text).catch(() => {});
     res.json(generic);
   });
 
   app.post('/api/auth/reset', async (req, res) => {
-    const email = String(req.body.email || '').trim().toLowerCase();
     const code = String(req.body.code || '').trim();
     const newPassword = String(req.body.newPassword || '');
     if (newPassword.length < 8) return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 8 caractères.' });
-    const creator = await db.query('SELECT id FROM creators WHERE lower(email) = $1', [email]);
+    const creator = (await findAccount(db, req.body.identifier || req.body.email, req.body.countryCode)).creator;
     const reset = creator && await db.query(
       `SELECT * FROM password_resets WHERE creator_id = $1 AND used = FALSE AND expires_at > now()
        ORDER BY created_at DESC LIMIT 1`, [creator.id]);
@@ -233,4 +261,4 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
   return { prepareMonthlyPayouts, previousPeriod };
 }
 
-module.exports = { register, MIGRATIONS, makeNotifier, previousPeriod };
+module.exports = { register, MIGRATIONS, makeNotifier, previousPeriod, findAccount };
