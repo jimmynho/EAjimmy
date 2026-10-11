@@ -17,6 +17,7 @@ const WALLET_WITHDRAWAL_FEE = 0.04;
 // Abonnement premium.
 const PREMIUM_PLANS = {
   premium_mois: { price: 10, days: 30, label: 'Premium 1 mois' },
+  premium_trimestre: { price: 20, days: 90, label: 'Premium 3 mois' },
   premium_annee: { price: 100, days: 365, label: 'Premium 1 an' },
 };
 
