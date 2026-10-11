@@ -134,6 +134,14 @@ async function runStartupMigrations() {
     'ALTER TABLE creators ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0',
     // Inscription possible avec le seul numéro de téléphone (l'email devient facultatif).
     'ALTER TABLE creators ALTER COLUMN email DROP NOT NULL',
+    // Vues : une seule par personne, par publication et par jour (sert aussi aux « vues du mois »).
+    `CREATE TABLE IF NOT EXISTS content_view_log (
+       content_id UUID NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+       creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+       viewer_key TEXT NOT NULL,
+       day DATE NOT NULL DEFAULT CURRENT_DATE,
+       PRIMARY KEY (content_id, viewer_key, day))`,
+    'CREATE INDEX IF NOT EXISTS content_view_log_creator_day ON content_view_log (creator_id, day)',
     'ALTER TABLE account_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
     // Tous les pays du monde : zones Afrique, Caraïbes, Amérique, Asie, Europe, Océanie.
     // L'ancienne zone « Europe centrale » est regroupée dans « Europe ».
@@ -766,15 +774,27 @@ app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
   res.json({ ...result, eligible: m.monetized && result.eligible, monetized: m.monetized, monetizationReason: m.reason });
 });
 
+// Vues reçues pendant un mois (« AAAA-MM ») sur toutes les publications d'un créateur.
+async function monthlyViewsOf(creatorId, period) {
+  const p = period || new Date().toISOString().slice(0, 7);
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM content_view_log
+     WHERE creator_id = $1 AND day >= ($2 || '-01')::date AND day < ($2 || '-01')::date + interval '1 month'`, [creatorId, p]);
+  return r ? r.n : 0;
+}
+
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const currency = isSupportedCurrency(req.query.currency) ? String(req.query.currency).toUpperCase() : 'USD';
   const m = await earningsOf(req.params.id);
-  const payout = payoutInCurrency({ subscribers, views, currency });
+  // Estimation sur le mois en cours (règle des 70 % de vues et paliers des grands comptes).
+  const monthlyViews = await monthlyViewsOf(req.params.id);
+  const payout = payoutInCurrency({ subscribers, views, monthlyViews, currency });
+  const viewsInfo = { monthlyViews, requiredMonthlyViews: Math.ceil(subscribers * 0.7) };
   if (!m.monetized) {
-    return res.json({ subscribers, views, ...payout, eligible: false, amount: 0, monetized: false, monetizationReason: m.reason });
+    return res.json({ subscribers, views, ...viewsInfo, ...payout, eligible: false, amount: 0, monetized: false, monetizationReason: m.reason });
   }
-  res.json({ subscribers, views, ...payout, monetized: true });
+  res.json({ subscribers, views, ...viewsInfo, ...payout, monetized: true });
 });
 
 // Liste des pays où les créateurs peuvent gagner de l'argent.
@@ -1062,12 +1082,16 @@ app.post('/api/content/:id/view', async (req, res) => {
   let viewerId = null;
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (token) { try { viewerId = verifySessionToken(token); } catch { /* visiteur non connecté */ } }
-  await db.query(
-    `UPDATE content_items SET view_count = view_count + 1
-     WHERE id = $1 AND status = 'actif' AND creator_id IS DISTINCT FROM $2`,
-    [req.params.id, viewerId]
-  );
-  res.json({ counted: true });
+  // Une vue par personne (compte, sinon appareil/réseau) et par jour : relancer la vidéo
+  // en boucle ne gonfle plus les vues. L'adresse IP n'est jamais gardée en clair.
+  const viewerKey = viewerId ? `u:${viewerId}` : `ip:${crypto.createHash('sha256').update(`eaji-vue:${req.ip}`).digest('hex').slice(0, 32)}`;
+  const fresh = await db.query(
+    `INSERT INTO content_view_log (content_id, creator_id, viewer_key)
+     SELECT id, creator_id, $2 FROM content_items WHERE id = $1 AND status = 'actif' AND creator_id IS DISTINCT FROM $3
+     ON CONFLICT DO NOTHING RETURNING content_id`,
+    [req.params.id, viewerKey, viewerId]);
+  if (fresh) await db.query('UPDATE content_items SET view_count = view_count + 1 WHERE id = $1', [req.params.id]);
+  res.json({ counted: Boolean(fresh) });
 });
 
 app.post('/api/content/:id/like', requireAuth, async (req, res) => {
