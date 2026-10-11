@@ -43,7 +43,7 @@ const MIGRATIONS = [
      confirmed_at TIMESTAMPTZ)`,
   'ALTER TABLE payment_requests DROP CONSTRAINT IF EXISTS payment_requests_purpose_check',
   `ALTER TABLE payment_requests ADD CONSTRAINT payment_requests_purpose_check CHECK (purpose IN
-     ('premium_mois','premium_annee','entreprise_mois','entreprise_annee','video','achat','cadeau','cadeau_live','don','annonce','depot'))`,
+     ('premium_mois','premium_trimestre','premium_annee','entreprise_mois','entreprise_annee','video','achat','cadeau','cadeau_live','don','annonce','depot'))`,
   `CREATE TABLE IF NOT EXISTS business_broadcasts (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
@@ -119,7 +119,7 @@ const MIGRATIONS = [
 ];
 
 const PURPOSE_LABELS = {
-  premium_mois: 'Abonnement premium 1 mois', premium_annee: 'Abonnement premium 1 an',
+  premium_mois: 'Abonnement premium 1 mois', premium_trimestre: 'Abonnement premium 3 mois', premium_annee: 'Abonnement premium 1 an',
   entreprise_mois: 'Compte Entreprise 1 mois', entreprise_annee: 'Compte Entreprise 1 an',
   video: 'Vidéo payante', achat: 'Achat de contenu', cadeau: 'Cadeau à un créateur', cadeau_live: 'Cadeau pendant un live',
   don: 'Don à Eaji', annonce: 'Publicité entreprise', depot: 'Dépôt sur le portefeuille',
@@ -228,7 +228,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     let amountUsd;
     let description = PURPOSE_LABELS[purpose];
 
-    if (purpose === 'premium_mois' || purpose === 'premium_annee') {
+    if (M.PREMIUM_PLANS[purpose]) {
       amountUsd = M.PREMIUM_PLANS[purpose].price;
     } else if (M.BUSINESS_PLANS[purpose]) {
       amountUsd = M.BUSINESS_PLANS[purpose].price;
@@ -245,6 +245,10 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       if (purpose === 'cadeau') {
         if (!content.creator_monetized) {
           return res.status(400).json({ error: "Ce créateur ne peut pas encore recevoir de cadeaux : la monétisation n'est pas ouverte dans son pays." });
+        }
+        // Cadeaux sur les publications : réservés aux créateurs Premium (les autres reçoivent ceux de leurs lives).
+        if (!(await premiumUntil(content.creator_id))) {
+          return res.status(400).json({ error: "Ce créateur a un compte gratuit : il reçoit les cadeaux seulement pendant ses lives. Les cadeaux sur les publications sont réservés aux créateurs Premium." });
         }
         amountUsd = M.round2(req.body.amount);
         if (!M.isValidGiftAmount(amountUsd)) return res.status(400).json({ error: `Le cadeau doit être entre ${M.GIFT_MIN} $ et ${M.GIFT_MAX} $.` });
@@ -427,7 +431,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       [p.id, beneficiary, creatorId, source, amount]);
     const amount = Number(p.amount_usd);
 
-    if (p.purpose === 'premium_mois' || p.purpose === 'premium_annee') {
+    if (M.PREMIUM_PLANS[p.purpose]) {
       const plan = M.PREMIUM_PLANS[p.purpose];
       const from = (await premiumUntil(p.payer_id)) || new Date();
       await db.query(
@@ -459,6 +463,15 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
           [p.target_id, p.payer_id, p.id]);
       }
       const source = { video: 'video', achat: 'vente', cadeau: 'cadeau' }[p.purpose];
+      // Monétisation réservée au Premium : la vidéo d'un créateur au compte gratuit reste payante pour
+      // le spectateur, mais Eaji garde tout tant que le créateur n'est pas Premium.
+      if (p.purpose !== 'cadeau' && content && !(await premiumUntil(content.creator_id))) {
+        const who = await db.query('SELECT name FROM creators WHERE id = $1', [p.payer_id]);
+        const what = p.purpose === 'video' ? 'a payé pour regarder ta vidéo' : 'a acheté ton contenu';
+        await notify(content.creator_id, 'vente', `💡 ${who ? who.name : 'Quelqu\'un'} ${what}. Passe au Premium pour toucher ${Math.round(M.CREATOR_SHARE * 100)} % de chaque paiement (${split.creator} $ ici).`, 's-paiements');
+        await ledger('eaji', null, source, amount);
+        return;
+      }
       if (content) {
         const who = await db.query('SELECT name FROM creators WHERE id = $1', [p.payer_id]);
         const what = { video: 'a payé pour regarder ta vidéo', achat: 'a acheté ton contenu', cadeau: `t'a envoyé un cadeau de ${amount} $` }[p.purpose];
