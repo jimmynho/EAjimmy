@@ -29,6 +29,11 @@ const MIGRATIONS = [
      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
      credited_at TIMESTAMPTZ,
      UNIQUE (period, creator_id))`,
+  // Détail du calcul : vues du mois, abonnés payés (règle des 70 %), montant avant budget, part du budget.
+  'ALTER TABLE monthly_payouts ADD COLUMN IF NOT EXISTS monthly_views INTEGER',
+  'ALTER TABLE monthly_payouts ADD COLUMN IF NOT EXISTS paid_subscribers INTEGER',
+  'ALTER TABLE monthly_payouts ADD COLUMN IF NOT EXISTS base_amount_usd NUMERIC(12,2)',
+  'ALTER TABLE monthly_payouts ADD COLUMN IF NOT EXISTS budget_factor NUMERIC(6,4)',
   `CREATE TABLE IF NOT EXISTS password_resets (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
@@ -87,23 +92,64 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   // ==================== 1. RÉMUNÉRATION MENSUELLE ====================
+  // Budget : la rémunération totale d'un mois ne dépasse jamais ce pourcentage de ce qu'Eaji a gagné
+  // ce mois-là (réglable par l'administrateur principal). Si les montants calculés dépassent le budget,
+  // chaque créateur reçoit la même proportion de son montant.
+  const DEFAULT_BUDGET_PERCENT = 30;
+  async function budgetPercent() {
+    const r = await db.query("SELECT value FROM app_settings WHERE key = 'payout_budget_percent'");
+    const v = r ? Number(r.value) : DEFAULT_BUDGET_PERCENT;
+    return Number.isFinite(v) && v >= 0 && v <= 100 ? v : DEFAULT_BUDGET_PERCENT;
+  }
+  async function eajiRevenueOf(period) {
+    const r = await db.query(
+      `SELECT COALESCE(SUM(amount_usd), 0)::float AS total FROM revenue_ledger
+       WHERE beneficiary = 'eaji' AND created_at >= ($1 || '-01')::date AND created_at < ($1 || '-01')::date + interval '1 month'`, [period]);
+    return Math.round((r ? r.total : 0) * 100) / 100;
+  }
+  async function budgetOf(period) {
+    const percent = await budgetPercent();
+    const revenue = await eajiRevenueOf(period);
+    const budget = Math.round(revenue * percent) / 100;
+    const used = await db.query("SELECT COALESCE(SUM(amount_usd), 0)::float AS total FROM monthly_payouts WHERE period = $1 AND status <> 'annule'", [period]);
+    return { percent, revenue, budget, used: Math.round((used ? used.total : 0) * 100) / 100 };
+  }
+
   async function prepareMonthlyPayouts(period) {
     const rows = await db.all(
       `SELECT c.id, c.country_code, c.phone,
               GREATEST(COALESCE((SELECT subscriber_count FROM subscriber_counts WHERE creator_id = c.id ORDER BY verified_at DESC LIMIT 1), 0),
                        (SELECT COUNT(*)::int FROM follows WHERE followed_id = c.id)) AS subscribers,
               (SELECT COALESCE(SUM(view_count), 0)::int FROM content_items WHERE creator_id = c.id) AS views,
-              EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = c.id AND ps.ends_at > now()) AS premium
-       FROM creators c WHERE c.account_status = 'actif'`);
-    let created = 0;
+              (SELECT COUNT(*)::int FROM content_view_log v WHERE v.creator_id = c.id
+                 AND v.day >= ($1 || '-01')::date AND v.day < ($1 || '-01')::date + interval '1 month') AS monthly_views,
+              EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = c.id AND ps.ends_at > now()) AS premium,
+              EXISTS (SELECT 1 FROM monthly_payouts mp WHERE mp.creator_id = c.id AND mp.period = $1) AS already
+       FROM creators c WHERE c.account_status = 'actif'`, [period]);
+    const candidates = [];
     for (const r of rows) {
+      if (r.already) continue;
       if (!isMonetizedCreator(r.country_code, r.phone)) continue;
       if (!r.premium) continue; // rémunération réservée aux comptes Premium
-      const p = calculateMonthlyPayout({ subscribers: Number(r.subscribers), views: Number(r.views), currency: 'USD' });
+      // Paliers des grands comptes + règle des 70 % de vues du mois.
+      const p = calculateMonthlyPayout({ subscribers: Number(r.subscribers), views: Number(r.views), monthlyViews: Number(r.monthly_views), currency: 'USD' });
       if (!p.eligible || !(p.amount > 0)) continue;
+      candidates.push({ r, p });
+    }
+    if (!candidates.length) return 0;
+    // Budget du mois : ce qui reste après les lignes déjà préparées.
+    const b = await budgetOf(period);
+    const remaining = Math.max(0, b.budget - b.used);
+    const totalBase = candidates.reduce((s, c) => s + c.p.amount, 0);
+    const factor = totalBase > remaining ? remaining / totalBase : 1;
+    let created = 0;
+    for (const { r, p } of candidates) {
+      const amount = Math.floor(p.amount * factor * 100) / 100;
       const ins = await db.query(
-        `INSERT INTO monthly_payouts (period, creator_id, subscribers, views, amount_usd) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (period, creator_id) DO NOTHING RETURNING id`, [period, r.id, r.subscribers, r.views, p.amount]);
+        `INSERT INTO monthly_payouts (period, creator_id, subscribers, views, amount_usd, monthly_views, paid_subscribers, base_amount_usd, budget_factor)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (period, creator_id) DO NOTHING RETURNING id`,
+        [period, r.id, r.subscribers, r.views, amount, r.monthly_views, p.paidSubscribers, p.amount, Math.round(factor * 10000) / 10000]);
       if (ins) created++;
     }
     return created;
@@ -128,13 +174,25 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
   app.get('/api/admin/payouts', requireAdminPrincipal, async (req, res) => {
     const period = /^\d{4}-\d{2}$/.test(String(req.query.period || '')) ? req.query.period : previousPeriod();
     const items = await db.all(
-      `SELECT m.id, m.period, m.subscribers, m.views, m.amount_usd, m.status, m.credited_at, cr.name, cr.country_code
+      `SELECT m.id, m.period, m.subscribers, m.views, m.amount_usd, m.status, m.credited_at, cr.name, cr.country_code,
+              m.monthly_views, m.paid_subscribers, m.base_amount_usd, m.budget_factor
        FROM monthly_payouts m JOIN creators cr ON cr.id = m.creator_id
        WHERE m.period = $1 ORDER BY m.amount_usd DESC`, [period]);
     const periods = (await db.all('SELECT DISTINCT period FROM monthly_payouts ORDER BY period DESC LIMIT 24')).map((p) => p.period);
     const sum = (st) => items.filter((i) => i.status === st).reduce((s, i) => s + Number(i.amount_usd), 0);
     const all = await db.query("SELECT COALESCE(SUM(amount_usd), 0)::float AS total FROM monthly_payouts WHERE status = 'credite'");
-    res.json({ period, periods, items, toCredit: Math.round(sum('propose') * 100) / 100, credited: Math.round(sum('credite') * 100) / 100, creditedAllTime: all.total });
+    res.json({ period, periods, items, toCredit: Math.round(sum('propose') * 100) / 100, credited: Math.round(sum('credite') * 100) / 100, creditedAllTime: all.total,
+      budget: await budgetOf(period) });
+  });
+
+  // Pourcentage des revenus d'Eaji consacré chaque mois à la rémunération des créateurs.
+  app.put('/api/admin/payouts/budget', requireAdminPrincipal, async (req, res) => {
+    const percent = Number(req.body.percent);
+    if (!Number.isFinite(percent) || percent < 0 || percent > 100) return res.status(400).json({ error: 'Le pourcentage doit être entre 0 et 100.' });
+    await db.query(
+      `INSERT INTO app_settings (key, value) VALUES ('payout_budget_percent', $1)
+       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()`, [String(Math.round(percent * 10) / 10)]);
+    res.json({ percent: await budgetPercent() });
   });
 
   // Recalcule (ajoute les nouveaux éligibles) pour une période donnée.
@@ -158,6 +216,7 @@ function register({ app, db, bcrypt, requireAuth, requireAdminPrincipal, require
       `UPDATE monthly_payouts SET status = 'credite', credited_at = now()
        WHERE period = $1 AND status = 'propose' RETURNING id, creator_id, amount_usd`, [period]);
     for (const c of credited) {
+      if (!(Number(c.amount_usd) > 0)) continue; // budget du mois épuisé : rien à ajouter
       await db.query(
         "INSERT INTO revenue_ledger (beneficiary, creator_id, source, amount_usd) VALUES ('createur', $1, 'remuneration', $2)",
         [c.creator_id, c.amount_usd]);
