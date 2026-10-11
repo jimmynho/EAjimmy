@@ -132,6 +132,8 @@ async function runStartupMigrations() {
      )`,
     // Sécurité : version de session et nombre d'essais par code.
     'ALTER TABLE creators ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0',
+    // Inscription possible avec le seul numéro de téléphone (l'email devient facultatif).
+    'ALTER TABLE creators ALTER COLUMN email DROP NOT NULL',
     'ALTER TABLE account_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
     // Tous les pays du monde : zones Afrique, Caraïbes, Amérique, Asie, Europe, Océanie.
     // L'ancienne zone « Europe centrale » est regroupée dans « Europe ».
@@ -322,12 +324,12 @@ function verifySessionToken(token) {
 // Inscription : crée le compte, déclenche l'envoi des deux codes de vérification.
 app.post('/api/auth/register', rateLimit('register', 60, 60 * 60 * 1000, "Trop d'inscriptions depuis ce réseau. Réessaie plus tard."), async (req, res) => {
   const { name, phone, password, countryCode, primaryContentType, language, currency } = req.body;
-  const email = String(req.body.email || '').trim().toLowerCase();
+  const email = String(req.body.email || '').trim().toLowerCase() || null; // facultatif
   // La zone est déduite du pays (tous les pays du monde sont acceptés).
   const zone = zoneOf(req.body.countryCode);
 
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Indique ton nom.' });
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Adresse email invalide (exemple : nom@gmail.com).' });
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Adresse email invalide (exemple : nom@gmail.com). Tu peux aussi laisser ce champ vide.' });
   if (!phone || String(phone).replace(/\D/g, '').length < 8) return res.status(400).json({ error: 'Numéro de téléphone invalide.' });
   if (!password || password.length < 8) return res.status(400).json({ error: 'Le mot de passe doit contenir au moins 8 caractères.' });
   if (!isKnownCountry(countryCode) || !VALID_ZONES.includes(zone)) return res.status(400).json({ error: 'Choisis ton pays.' });
@@ -389,10 +391,14 @@ app.post('/api/auth/verify', async (req, res) => {
 
 // Connexion étape 1 : mot de passe. Déclenche l'envoi d'un OTP (2ème facteur).
 app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('loginacct', 20, 15 * 60 * 1000, null,
-  (req) => String((req.body && (req.body.email || req.body.phone)) || '').trim().toLowerCase()), async (req, res) => {
+  (req) => String((req.body && (req.body.identifier || req.body.email || req.body.phone)) || '').replace(/[\s.()-]/g, '').toLowerCase()), async (req, res) => {
   const { deviceFingerprint } = req.body;
   const ipAddress = req.ip; // vraie adresse (jamais celle envoyée par le téléphone)
-  const creator = await db.query('SELECT * FROM creators WHERE lower(email) = lower($1)', [String(email0(req)).trim()]);
+  // Connexion avec l'email OU le numéro de téléphone.
+  const found = await extrasRoutes.findAccount(db, req.body.identifier || req.body.email || req.body.phone, req.body.countryCode);
+  if (found.ambiguous) return res.status(400).json({ error: "Plusieurs comptes ont ce numéro dans des pays différents : écris-le avec l'indicatif du pays (exemple : +243 812 345 678)." });
+  const creator = found.creator;
+  const via = found.via;
   // Trop d'essais ratés sur ce compte : pause de 15 minutes (protège contre le vol de mot de passe).
   if (creator) {
     const fails = await db.query(
@@ -410,16 +416,20 @@ app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('
     return res.status(403).json({ error: 'Ce compte est suspendu. Contacte l\'administrateur.' });
   }
 
-  const { code: devCode, channel } = await sendLoginOtp(creator);
+  const { code: devCode, channel } = await sendLoginOtp(creator, via);
+  // Connexion par téléphone : le code de confirmation est affiché à l'écran (pas d'envoi de SMS).
+  if (via === 'telephone') {
+    return res.json({ creatorId: creator.id, via, devCode, message: 'Ton code de confirmation est affiché ci-dessous.' });
+  }
   const channelLabel = { gmail: 'par email', sms: 'par SMS', demo: '(mode test)' }[channel];
   res.json({
     creatorId: creator.id,
+    via,
     message: `Code de vérification envoyé ${channelLabel}.`,
     ...(devCode ? { devCode, devWarning: "L'email n'a pas pu être envoyé : le code est affiché ici." } : {}),
   });
 });
 
-function email0(req) { return req.body.email || ''; }
 
 // Connexion étape 2 : validation de l'OTP → émission de la session.
 // Peu importe le canal utilisé (email ou SMS) — on prend le dernier code non vérifié.
@@ -552,9 +562,17 @@ async function trySendEmail(toEmail, subject, text) {
 // privilégiant toujours le gratuit (email) tant que Twilio n'est pas payé.
 // Écrit dans account_verifications avec le canal réellement utilisé, pour
 // que verify-2fa retrouve le bon enregistrement peu importe le canal.
-async function sendLoginOtp(creator) {
+async function sendLoginOtp(creator, via = 'email') {
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
+
+  // Connexion par numéro de téléphone (ou compte sans email) : code affiché à l'écran.
+  if (via === 'telephone' || !creator.email) {
+    await db.query(
+      `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at)
+       VALUES ($1, 'sms', $2, now() + interval '10 minutes')`, [creator.id, codeHash]);
+    return { code, channel: 'demo' };
+  }
 
   let channel = 'demo';
   if (EMAIL_PROVIDER_CONNECTED) channel = 'gmail';
@@ -678,6 +696,8 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
     publicProfile.premiumUntil = await money.premiumUntil(creator.id);
     publicProfile.monetized = isMonetizedCreator(creator.country_code, creator.phone);
     publicProfile.monetizationReason = monetizationReason(creator.country_code, creator.phone);
+    // Payé seulement avec le Premium (sinon : cadeaux des lives uniquement).
+    publicProfile.earns = publicProfile.monetized && Boolean(publicProfile.premiumUntil);
   }
 
   res.json(publicProfile);
@@ -722,9 +742,26 @@ async function monetizationOf(creatorId) {
   return { monetized: isMonetizedCreator(c.country_code, c.phone), reason: monetizationReason(c.country_code, c.phone) };
 }
 
+// Créateurs ayant un Premium actif parmi une liste (une seule requête pour tout le fil).
+async function premiumSet(ids) {
+  const uniq = [...new Set(ids.filter(Boolean))];
+  if (!uniq.length) return new Set();
+  const rows = await db.all('SELECT DISTINCT creator_id FROM premium_subscriptions WHERE ends_at > now() AND creator_id = ANY($1::uuid[])', [`{${uniq.join(',')}}`]);
+  return new Set(rows.map((r) => r.creator_id));
+}
+
+// Être payé (vidéos, ventes, cadeaux sur les publications, rémunération mensuelle) : pays éligible ET compte Premium.
+// Un compte gratuit reçoit seulement les cadeaux de ses lives.
+async function earningsOf(creatorId) {
+  const m = await monetizationOf(creatorId);
+  if (!m.monetized) return m;
+  if (!(await money.premiumUntil(creatorId))) return { monetized: false, reason: 'premium' };
+  return m;
+}
+
 app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
-  const m = await monetizationOf(req.params.id);
+  const m = await earningsOf(req.params.id);
   const result = calculateEligibility(subscribers, views);
   res.json({ ...result, eligible: m.monetized && result.eligible, monetized: m.monetized, monetizationReason: m.reason });
 });
@@ -732,7 +769,7 @@ app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const currency = isSupportedCurrency(req.query.currency) ? String(req.query.currency).toUpperCase() : 'USD';
-  const m = await monetizationOf(req.params.id);
+  const m = await earningsOf(req.params.id);
   const payout = payoutInCurrency({ subscribers, views, currency });
   if (!m.monetized) {
     return res.json({ subscribers, views, ...payout, eligible: false, amount: 0, monetized: false, monetizationReason: m.reason });
@@ -938,6 +975,8 @@ app.get('/api/feed', async (req, res) => {
     item.creator_monetized = isMonetizedCreator(item.creator_country, item.creator_phone);
     delete item.creator_phone;
   }
+  const premiumCreators = await premiumSet(items.map((i) => i.creator_id));
+  for (const item of items) item.creator_earns = item.creator_monetized && premiumCreators.has(item.creator_id);
   const access = await money.accessMap(viewerId, items);
   for (const item of items) {
     const a = access.get(item.id);
@@ -984,8 +1023,10 @@ app.get('/api/creators/:id/public', async (req, res) => {
      ORDER BY created_at DESC LIMIT 50`,
     [creator.id, isFollowing, viewerId, isMonetizedCreator(creator.country_code, creator.phone)]
   );
+  const creatorPremium = Boolean(await money.premiumUntil(creator.id));
   res.json({
     monetized: isMonetizedCreator(creator.country_code, creator.phone),
+    earns: isMonetizedCreator(creator.country_code, creator.phone) && creatorPremium,
     id: creator.id,
     name: creator.name,
     countryCode: creator.country_code,
@@ -995,7 +1036,7 @@ app.get('/api/creators/:id/public', async (req, res) => {
     subscriberCount: creator.subscriber_count_public || viewerId === creator.id ? followers.total : null,
     isFollowing,
     isMe: viewerId === creator.id,
-    premium: Boolean(await money.premiumUntil(creator.id)),
+    premium: creatorPremium,
     business: Boolean(await money.businessUntil(creator.id)),
     contents: await (async () => {
       // Les publications s'affichent comme dans le fil : photo, vidéo, musique ou document visibles
@@ -1007,6 +1048,7 @@ app.get('/api/creators/:id/public', async (req, res) => {
         out.push({ id: c.id, title: c.title, content_type: c.content_type, created_at: c.created_at, visibility_scope: c.visibility_scope,
                    duration_seconds: c.duration_seconds, price: a.price, for_sale: a.forSale, locked: a.locked,
                    like_count: c.like_count, comment_count: c.comment_count, creator_monetized: c.creator_monetized,
+                   creator_earns: Boolean(c.creator_monetized && creatorPremium),
                    fileUrl: a.locked ? null : await createDownloadUrl(c.storage_url).catch(() => null) });
       }
       return out;
