@@ -15,11 +15,49 @@
  *   1 000 abonnés  → 2 $ / 2 € / 5 000 FC
  *   2 000 abonnés  → 4 $ / 4 € / 10 000 FC
  *  10 000 abonnés  → 20 $ / 20 € / 50 000 FC
+ *
+ * Grands comptes (comme YouTube / TikTok, le taux baisse par paliers) :
+ *   jusqu'à 100 000 abonnés        → 2 $ pour 1 000
+ *   de 100 000 à 1 million         → 1 $ pour 1 000
+ *   au-delà de 1 million           → 0,50 $ pour 1 000
+ *   (100 000 → 200 $ ; 1 million → 1 100 $ ; 10 millions → 5 600 $)
+ *
+ * Contre les abonnés « dormants » ou faux : les vues du mois doivent atteindre 70 % des abonnés.
+ * Sinon, seuls (vues du mois ÷ 0,7) abonnés sont payés : 1 million d'abonnés et 350 000 vues
+ * → payé comme 500 000 abonnés. Au-delà de 70 %, aucune réduction.
+ * Le total versé chaque mois reste ensuite limité par le budget d'Eaji (voir extras-routes.js).
  */
 
 const SUBSCRIBER_THRESHOLD = 1000;
 const VIEW_THRESHOLD = 1000;
 const UNIT_SIZE = 1000; // taille du palier de référence
+// Paliers dégressifs : part du taux de base appliquée à chaque tranche d'abonnés.
+const TIERS = [
+  { upTo: 100000, factor: 1 },      // 2 $ / 1 000
+  { upTo: 1000000, factor: 0.5 },   // 1 $ / 1 000
+  { upTo: Infinity, factor: 0.25 }, // 0,50 $ / 1 000
+];
+const MONTHLY_VIEWS_RATIO = 0.7; // vues du mois exigées : 70 % des abonnés
+
+// « Milliers d'abonnés pondérés » selon les paliers.
+function weightedThousands(subscribers) {
+  let weighted = 0, prev = 0;
+  for (const t of TIERS) {
+    const n = Math.min(subscribers, t.upTo) - prev;
+    if (n <= 0) break;
+    weighted += n * t.factor;
+    prev = t.upTo;
+  }
+  return weighted / UNIT_SIZE;
+}
+
+// Abonnés réellement payés selon les vues du mois (règle des 70 %).
+function paidSubscribersFor(subscribers, monthlyViews) {
+  if (monthlyViews === undefined || monthlyViews === null) return subscribers;
+  const required = Math.ceil(subscribers * MONTHLY_VIEWS_RATIO);
+  if (monthlyViews >= required) return subscribers;
+  return Math.floor(Math.max(0, monthlyViews) / MONTHLY_VIEWS_RATIO);
+}
 
 // Montant versé par tranche de 1000 abonnés, selon la devise.
 const RATE_PER_UNIT = {
@@ -54,7 +92,7 @@ function calculateEligibility(subscribers, views) {
  * @param {string} params.currency - 'USD' | 'EUR' | 'CDF'
  * @returns {Object} détail du calcul
  */
-function calculateMonthlyPayout({ subscribers, views, currency }) {
+function calculateMonthlyPayout({ subscribers, views, monthlyViews, currency }) {
   const cur = (currency || '').toUpperCase();
   if (!VALID_CURRENCIES.includes(cur)) {
     throw new Error(`Devise inconnue : "${currency}". Devises valides : ${VALID_CURRENCIES.join(', ')}`);
@@ -73,7 +111,8 @@ function calculateMonthlyPayout({ subscribers, views, currency }) {
   }
 
   const rate = RATE_PER_UNIT[cur];
-  const amount = Math.round((subscribers / UNIT_SIZE) * rate * 100) / 100;
+  const paidSubscribers = paidSubscribersFor(subscribers, monthlyViews);
+  const amount = Math.round(weightedThousands(paidSubscribers) * rate * 100) / 100;
 
   return {
     eligible: true,
@@ -83,6 +122,12 @@ function calculateMonthlyPayout({ subscribers, views, currency }) {
     currency: cur,
     subscribers,
     views,
+    paidSubscribers,
+    ...(monthlyViews !== undefined && monthlyViews !== null ? {
+      monthlyViews,
+      requiredMonthlyViews: Math.ceil(subscribers * MONTHLY_VIEWS_RATIO),
+      viewsRuleMet: paidSubscribers === subscribers,
+    } : {}),
   };
 }
 
@@ -90,6 +135,10 @@ module.exports = {
   SUBSCRIBER_THRESHOLD,
   VIEW_THRESHOLD,
   RATE_PER_UNIT,
+  TIERS,
+  MONTHLY_VIEWS_RATIO,
+  weightedThousands,
+  paidSubscribersFor,
   calculateEligibility,
   calculateMonthlyPayout,
 };
