@@ -320,9 +320,12 @@ app.get('/api/health', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  // Vérification Google Search Console : Google cherche la balise sur cette page d'accueil.
-  // Seulement pour un navigateur ou Google (qui demandent une page HTML) ; l'appli reçoit toujours le JSON.
-  if (process.env.GOOGLE_SITE_VERIFICATION && /text\/html/.test(String(req.headers.accept || ''))) {
+  // Vérification Google Search Console : Google cherche la balise dans <head> de cette page d'accueil,
+  // quelle que soit la façon dont il la demande. Seule une demande qui veut explicitement du JSON reçoit le JSON
+  // (l'appli n'utilise pas cette adresse : elle vérifie le serveur avec /api/health).
+  const accept = String(req.headers.accept || '');
+  const wantsJson = /application\/json/.test(accept) && !/text\/html/.test(accept);
+  if (process.env.GOOGLE_SITE_VERIFICATION && !wantsJson) {
     const code = String(process.env.GOOGLE_SITE_VERIFICATION).replace(/[^\w-]/g, '');
     return res.type('html').send(`<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><title>Eaji</title>
 <meta name="google-site-verification" content="${code}"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
