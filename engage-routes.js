@@ -87,7 +87,7 @@ const MESSAGING_HOSTS = ['wa.me', 'whatsapp.com', 'whatsapp.net', 't.me', 'teleg
 function hostOfLink(link) {
   let s = String(link).trim().replace(/[),.;:!?»]+$/, '');
   if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
-  try { const u = new URL(s); return { host: u.hostname.toLowerCase().replace(/^www\./, ''), path: u.pathname || '/' }; } catch (e) { return null; }
+  try { const u = new URL(s); return { host: u.hostname.toLowerCase().replace(/^www\./, ''), path: u.pathname || '/', userinfo: Boolean(u.username || u.password) }; } catch (e) { return null; }
 }
 const hostIs = (host, list) => list.some((d) => host === d || host.endsWith('.' + d));
 function siteHosts() {
@@ -107,7 +107,8 @@ function isEajiLink(l) {
 }
 const isMessagingLink = (l) => hostIs(l.host, MESSAGING_HOSTS);
 function findLinks(text) {
-  const clean = String(text || '').replace(EMAIL_RE, ' ');
+  // Une adresse email est ignorée, sauf si elle suit « http:// » (adresse déguisée : https://eaji.com@arnaque.com).
+  const clean = String(text || '').replace(EMAIL_RE, (m) => (/:\/\//.test(m) ? m : ' '));
   const out = [];
   URL_RE.lastIndex = 0;
   let m;
@@ -131,20 +132,89 @@ function blockedLinks(text, isBusiness) {
 }
 const LINK_BLOCKED_MESSAGE = '🔒 Lien bloqué pour ta sécurité : les liens sont interdits sur Eaji (protection contre les virus et les arnaques). Seuls les comptes Entreprise peuvent publier leurs liens (WhatsApp, Telegram, site internet).';
 
+// ===================== ANTI-PHISHING (hameçonnage) =====================
+// Le phishing : un faux message ou un faux site qui imite Eaji pour voler un mot de passe, un code ou de l'argent.
+// 1) Liens dangereux refusés pour TOUS (même les comptes Entreprise et les publicités) : faux sites qui imitent
+//    Eaji, liens raccourcis qui cachent la vraie adresse, adresses en chiffres, adresses déguisées.
+const SHORTENERS = ['bit.ly', 'bitly.com', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'v.gd', 'cutt.ly', 'ow.ly', 'rebrand.ly', 'shorturl.at', 'tiny.cc',
+  'rb.gy', 's.id', 'buff.ly', 'bl.ink', 'short.io', 'shorte.st', 'adf.ly', 't.ly', 'lnkd.in', 'qr.ae', 'clck.ru', 'u.to', 'shrtco.de', 'tny.im',
+  'surl.li', 'urlz.fr', 'link.tl', 'x.gd', 'gg.gg', 'bitly.ws', 'snip.ly', 'kutt.it', 'tr.ee', 'shorturl.asia'];
+const OFFICIAL_HOSTS = ['eajimmy.onrender.com', 'eajimmy-production.up.railway.app'];
+function dangerReason(l) {
+  const host = l.host || '';
+  if (hostIs(host, OFFICIAL_HOSTS) || isEajiLink(l)) return null;
+  if (/^\[?[0-9a-f:.]+\]?$/i.test(host) && /\d/.test(host)) return 'adresse en chiffres';
+  if (/(^|\.)xn--/.test(host)) return 'adresse déguisée';
+  if (l.userinfo) return 'adresse déguisée';
+  if (hostIs(host, SHORTENERS)) return 'lien raccourci';
+  const labels = host.split(/[-_.]/).map((x) => x.replace(/[1l!|]/g, 'i').replace(/0/g, 'o'));
+  if (labels.some((x) => /^e[a4]i?ji/.test(x) || /eajimmy|eajmy/.test(x))) return 'faux site Eaji';
+  return null;
+}
+function dangerousLinks(text) {
+  return findLinks(text).filter((l) => dangerReason(l)).map((l) => ({ host: l.host, why: dangerReason(l) }));
+}
+const DANGER_LINK_MESSAGE = '🔒 Lien bloqué : il ressemble à une arnaque (faux site d\'Eaji, lien raccourci qui cache la vraie adresse, ou adresse déguisée). Même les comptes Entreprise et les publicités ne peuvent pas le publier.';
+
+// 2) Messages qui demandent un mot de passe, un code ou un code PIN, ou qui se font passer pour l'équipe Eaji.
+const deaccent = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[’`]/g, "'");
+const ASK = "(?:envoie|envoi|envoyer|envoyez|renvoie|donne|donner|donnez|communique|communiquez|partage|partagez|transmets|transmettez|ecris|ecrivez|dis[- ]moi|dites[- ]moi|tape|tapez|copie|copiez|colle|redonne|confirme|confirmez|saisis|saisissez|entre|entrez|mets|mettez|besoin de|il me faut|j'ai besoin|send|give|share|tell me|provide|forward|text me|need your|enter your|type your|confirm your|nitumie|tuma|nipe|niambie|nipatie|tinda|pesa ngai|yebisa ngai|envia|manda|passa|me da|dame|dime|pasame|enviame)";
+const SECRET = "(?:mot de passe|mots de passe|\\bmdp\\b|password|passcode|pass word|code (?:de |d')?(?:confirmation|verification|connexion|validation|securite|acces|retrait)|code secret|code pin|\\bpin\\b|\\botp\\b|code (?:que tu as|qu'on t'a|qui t'a ete|recu|envoye|a 6 chiffres|sms)|verification code|confirmation code|login code|security code|one[- ]time|nenosiri|neno la siri|senha|contrasena|codigo de (?:verificacao|verificacion|confirmacao|confirmacion|seguranca|seguridad)|code ya (?:confirmation|kokota)|mot ya passe)";
+const PHISH_ASK_RE = new RegExp(`\\b${ASK}\\b[^.!?\\n]{0,45}?(?<!\\b(?:mon|ma|mes|my|mi|meu|minha|yangu|na ngai) )${SECRET}`);
+const PHISH_TEAM_RE = /\b(?:je suis|j'suis|nous sommes|ici|c'est|this is|i am|i'm|we are|mimi ni|sisi ni|ngai nazali|biso tozali|sou|somos|soy)\b[^.!?\n]{0,25}\b(?:equipe|service|support|admin\w*|moderat\w*|agent|team|staff|securite|security|direction|directeur|fondateur|founder|responsable|technicien)\b[^.!?\n]{0,20}\beaji|\b(?:message|avis|alerte|notification|annonce|compte) officiel(?:le)? (?:d'|de |du )?eaji|\beaji (?:officiel|official|support|securite|security)\b/;
+function phishReason(text) {
+  const t = deaccent(text);
+  if (!t || t.length < 6) return null;
+  if (PHISH_ASK_RE.test(t)) return 'demande de mot de passe ou de code';
+  if (PHISH_TEAM_RE.test(t)) return 'se fait passer pour l\'équipe Eaji';
+  return null;
+}
+const PHISH_MESSAGE = '🔒 Message bloqué pour ta sécurité : sur Eaji, personne ne doit demander un mot de passe, un code de confirmation ou un code PIN, ni se faire passer pour l\'équipe Eaji. La vraie équipe Eaji t\'écrit seulement dans Profil → « Contacter l\'équipe Eaji ».';
+const PHISH_FIELDS = ['text', 'title', 'message', 'comment', 'caption', 'description', 'bio', 'note', 'reply', 'lyrics'];
+const PHISH_EXEMPT = ['/api/admin', '/api/auth', '/api/support', '/api/agent', '/api/payments', '/api/cinetpay', '/api/push', '/api/import', '/api/montage'];
+// onBlocked : prévient Eajimmy AI (journal de sécurité, suspension après plusieurs essais).
+function phishGuard({ db, verifySessionToken, onBlocked = async () => {} }) {
+  return async (req, res, next) => {
+    try {
+      const p = String(req.path || req.url || '').split('?')[0];
+      if (!['POST', 'PUT', 'PATCH'].includes(req.method) || !p.startsWith('/api/') || PHISH_EXEMPT.some((x) => p.startsWith(x))) return next();
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const text = PHISH_FIELDS.map((k) => body[k]).filter((v) => typeof v === 'string' && v.length > 5).join('\n');
+      const why = text && phishReason(text);
+      if (!why) return next();
+      let creatorId = null;
+      const token = String(req.headers.authorization || '').replace('Bearer ', '');
+      if (token) { try { creatorId = verifySessionToken(token); } catch (e) { /* non connecté */ } }
+      const base = typeof db === 'function' ? db() : db;
+      // Compte exempté par l'administrateur (exemple : le compte du fondateur) : pas de contrôle.
+      if (creatorId && await base.query('SELECT 1 FROM creators WHERE id = $1 AND agent_exempt', [creatorId]).catch(() => null)) return next();
+      Promise.resolve(onBlocked({ creatorId, ip: req.ip, device: req.deviceKey || null, reason: why, text: text.slice(0, 300), path: p })).catch(() => {});
+      return res.status(400).json({ code: 'hameconnage', error: PHISH_MESSAGE });
+    } catch (e) { return next(); }
+  };
+}
+
 // Vérifie tous les textes envoyés par les utilisateurs (publications, commentaires, messages, statuts,
 // groupes, publicités…). Placé avant toutes les routes.
 const LINK_FIELDS = ['text', 'title', 'message', 'comment', 'caption', 'description', 'bio', 'linkUrl', 'link', 'link_url', 'note', 'company', 'name', 'reply', 'lyrics'];
 // Les publicités ne sont pas bloquées : leur lien (site, WhatsApp, boutique…) fonctionne pour tout compte
 // qui paie sa publicité (elle n'est affichée qu'une fois réellement payée, et l'équipe peut la retirer).
 const LINK_EXEMPT = ['/api/admin', '/api/auth', '/api/import', '/api/payments', '/api/cinetpay', '/api/support', '/api/push', '/api/business-ads', '/api/advertise'];
+const AD_PATHS = ['/api/business-ads', '/api/advertise']; // publicités : seuls les liens dangereux sont refusés
 function linkGuard({ db, verifySessionToken }) {
   return async (req, res, next) => {
     try {
       const p = String(req.path || req.url || '').split('?')[0];
-      if (!['POST', 'PUT', 'PATCH'].includes(req.method) || !p.startsWith('/api/') || LINK_EXEMPT.some((x) => p.startsWith(x))) return next();
+      if (!['POST', 'PUT', 'PATCH'].includes(req.method) || !p.startsWith('/api/')) return next();
+      const isAd = AD_PATHS.some((x) => p.startsWith(x));
+      if (!isAd && LINK_EXEMPT.some((x) => p.startsWith(x))) return next();
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const texts = LINK_FIELDS.map((k) => body[k]).filter((v) => typeof v === 'string' && v.length > 3);
       if (!texts.length) return next();
+      // Liens d'arnaque (faux Eaji, liens raccourcis, adresses déguisées) : refusés pour tout le monde.
+      const danger = dangerousLinks(texts.join('\n'));
+      if (danger.length) return res.status(400).json({ code: 'lien_dangereux', blocked: [...new Set(danger.map((l) => l.host))].slice(0, 3), error: DANGER_LINK_MESSAGE });
+      if (isAd) return next();
       const found = findLinks(texts.join('\n')).filter((l) => !isEajiLink(l));
       if (!found.length) return next();
       let creatorId = null;
@@ -519,4 +589,4 @@ function register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerI
   return { repost, mergeRepostsIntoFeed, countRepostView, repostItems, importSiteOf };
 }
 
-module.exports = { MIGRATIONS, register, linkGuard, findLinks, blockedLinks, isEajiLink, importSiteOf, LINK_BLOCKED_MESSAGE };
+module.exports = { MIGRATIONS, register, linkGuard, phishGuard, phishReason, dangerousLinks, findLinks, blockedLinks, isEajiLink, importSiteOf, LINK_BLOCKED_MESSAGE, PHISH_MESSAGE };

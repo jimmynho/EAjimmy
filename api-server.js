@@ -57,10 +57,14 @@ const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(cors()); // Le site (GitHub Pages) et l'application appellent l'API depuis une autre adresse.
-app.use(express.json({ limit: '200kb' }));
+const jsonSmall = express.json({ limit: '200kb' });
+// Domaines experts d'Eajimmy AI : photos jointes, lues plus loin avec une limite plus grande.
+app.use((req, res, next) => (req.path === '/api/agent/expert' ? next() : jsonSmall(req, res, next)));
 // Liens inconnus bloqués dans tout ce que publient les utilisateurs (anti-virus, anti-arnaque) :
 // seuls les liens d'Eaji passent, et WhatsApp / Telegram pour les comptes Entreprise.
 app.use(engageRoutes.linkGuard({ db: () => db, verifySessionToken }));
+// Anti-phishing : messages qui demandent un mot de passe, un code ou un code PIN, ou qui imitent l'équipe Eaji.
+app.use(engageRoutes.phishGuard({ db: () => db, verifySessionToken, onBlocked: (info) => (agentRef ? agentRef.phishing(info) : null) }));
 // Appareil (identifiant aléatoire du téléphone) et réseau, chiffrés : servent à repérer les fausses vues.
 app.use(cyclesRoutes.deviceTracker({ db: () => db, verifySessionToken }));
 // Agent Eaji : bloque les sources de piratage (adresses / appareils) ; seul un administrateur peut débloquer.
@@ -783,6 +787,8 @@ checkSmtpReachable();
 setInterval(checkSmtpReachable, 10 * 60 * 1000).unref();
 
 async function sendEmailReal(toEmail, subject, text) {
+  // Rappel anti-phishing en bas de chaque email.
+  text = `${text}\n\n—\n🔒 L'équipe Eaji ne te demandera jamais ton mot de passe, ton code ou ton code PIN (ni par message, ni par WhatsApp, ni par téléphone). Ne les donne à personne.`;
   if (BREVO_CONNECTED) {
     const res = await fetch(process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -834,7 +840,7 @@ async function sendLoginOtp(creator, via = 'email') {
        VALUES ($1, 'sms', $2, now() + $3::interval)`, [creator.id, codeHash, minutes]);
     let smsSent = false;
     if (SMS_PROVIDER_CONNECTED && creator.phone) {
-      smsSent = await sendSmsReal(creator.phone, `Eaji — ton code de connexion : ${code}`).then(() => true, () => false);
+      smsSent = await sendSmsReal(creator.phone, `Eaji — ton code de connexion : ${code}. Ne le donne à personne.`).then(() => true, () => false);
     }
     return { code, channel: smsSent ? 'sms' : 'ecran', smsSent };
   }
@@ -857,7 +863,7 @@ async function sendLoginOtp(creator, via = 'email') {
     const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).`);
     return { code, channel: sent ? 'gmail' : 'ecran', emailed: !!sent };
   } else if (channel === 'sms') {
-    const sent = await sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code}`).then(() => true, (e) => { console.error('Échec envoi SMS Twilio :', e.message); return false; });
+    const sent = await sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code}. Ne le donne à personne.`).then(() => true, (e) => { console.error('Échec envoi SMS Twilio :', e.message); return false; });
     return { code, channel: sent ? 'sms' : 'ecran', smsSent: sent };
   }
 
@@ -886,7 +892,7 @@ async function sendVerificationCode(creatorId, channel, destination) {
 
   if (channel === 'sms' && SMS_PROVIDER_CONNECTED) {
     try {
-      await sendSmsReal(destination, `Eaji — ton code de vérification : ${code} (valable 10 minutes).`);
+      await sendSmsReal(destination, `Eaji — ton code de vérification : ${code} (valable 10 minutes). Ne le donne à personne.`);
     } catch (e) {
       console.error('Échec envoi SMS Twilio :', e.message);
       // On ne bloque pas l'inscription/connexion si Twilio échoue temporairement,
@@ -1444,6 +1450,27 @@ app.post('/api/content/:id/dims', rateLimit('dims', 300, 60 * 60 * 1000), async 
 // Fil de contenus publics (découverte) : les plus récents en premier,
 // avec le nom du créateur et les compteurs likes/commentaires.
 // Publications telles qu'affichées dans le fil (une seule si contentId est donné : publication partagée).
+// Publications visibles par la personne (pays choisi, publiques ou de ses abonnements, comptes non bloqués).
+const FEED_WHERE = `c.status = 'actif' AND cr.account_status = 'actif'
+       AND ($1::text IS NULL OR cr.country_code = $1)
+       AND (c.visibility_scope = 'public'
+            OR c.creator_id = $2
+            OR EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followed_id = c.creator_id))
+       AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = c.creator_id AND b.blocked_id = $2)
+                                                OR (b.blocker_id = $2 AND b.blocked_id = c.creator_id))`;
+// Le fil montre les 50 publications les plus récentes. Plus de visibilité pour les membres Premium : leurs publications
+// de la semaine restent dans le fil même au-delà de ces 50 (jusqu'à 20 de plus), toujours à leur place dans l'ordre des dates.
+async function feedIds(viewerId, country) {
+  const rows = await db.all(
+    `SELECT c.id, (c.created_at > now() - interval '7 days'
+                   AND EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = cr.id AND ps.ends_at > now())) AS boost
+     FROM content_items c JOIN creators cr ON cr.id = c.creator_id
+     WHERE ${FEED_WHERE}
+     ORDER BY c.created_at DESC LIMIT 300`, [country, viewerId]);
+  const ids = []; let extra = 0;
+  rows.forEach((r, i) => { if (i < 50) ids.push(r.id); else if (r.boost && extra < 20) { ids.push(r.id); extra++; } });
+  return ids;
+}
 async function feedItems(viewerId, country, contentId) {
   const items = await db.all(
     `SELECT c.id, c.title, c.content_type, c.created_at, c.visibility_scope,
@@ -1464,20 +1491,13 @@ async function feedItems(viewerId, country, contentId) {
             EXISTS (SELECT 1 FROM content_reposts rp WHERE rp.content_id = c.id AND rp.reposter_id = $2) AS reposted
      FROM content_items c
      JOIN creators cr ON cr.id = c.creator_id
-     WHERE c.status = 'actif' AND cr.account_status = 'actif'
-       AND ($1::text IS NULL OR cr.country_code = $1)
+     WHERE ${FEED_WHERE}
        AND ($3::uuid IS NULL OR c.id = $3)
-       AND (c.visibility_scope = 'public'
-            OR c.creator_id = $2
-            OR EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followed_id = c.creator_id))
-       AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = c.creator_id AND b.blocked_id = $2)
-                                                OR (b.blocker_id = $2 AND b.blocked_id = c.creator_id))
-     -- Les membres premium gagnent en visibilité : leurs publications de la semaine passent devant.
-     ORDER BY (EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = cr.id AND ps.ends_at > now())
-               AND c.created_at > now() - interval '7 days') DESC,
-              c.created_at DESC
-     LIMIT 50`,
-    [country, viewerId, contentId || null]
+       AND ($4::uuid[] IS NULL OR c.id = ANY($4::uuid[]))
+     -- Toujours dans l'ordre de publication : les plus récentes d'abord.
+     ORDER BY c.created_at DESC
+     LIMIT 70`,
+    [country, viewerId, contentId || null, contentId ? null : await feedIds(viewerId, country)]
   );
   for (const item of items) {
     // Le numéro n'est jamais envoyé : il sert seulement à savoir si le créateur est monétisé.
@@ -1772,7 +1792,7 @@ app.post('/api/auth/change-phone/request', requireAuth, async (req, res) => {
   );
   // Le code part par SMS vers le nouveau numéro si Twilio est actif, sinon par email au titulaire du compte.
   const me = await db.query('SELECT email FROM creators WHERE id = $1', [req.creatorId]);
-  const text = `Eaji — code pour confirmer ton nouveau numéro : ${code} (valable 10 minutes).`;
+  const text = `Eaji — code pour confirmer ton nouveau numéro : ${code} (valable 10 minutes). Ne le donne à personne.`;
   if (SMS_PROVIDER_CONNECTED) {
     sendSmsReal(newPhone, text).catch((e) => console.error('Échec SMS changement de numéro :', e.message));
     return res.status(201).json({ requestId: request.id, message: 'Code envoyé par SMS au nouveau numéro.' });
@@ -1873,7 +1893,7 @@ app.get('/api/apercu/status', (req, res) => res.json({ ffmpeg: thumbs.available(
 publicPages.register({ app, db, createDownloadUrl, rateLimit, accessMap: (v, items) => money.accessMap(v, items), thumbs });
 const agent = agentRoutes.register({ app, db, security, notify, notifyAdmins, requireAuth, requireAdmin, requireAdminPrincipal, optionalViewerId,
   decodeToken: decodeSessionToken, isLeader: leader.isLeader, rateLimit, createDownloadUrl, frames: videoThumbs.rawFrames,
-  businessUntil: (id) => money.businessUntil(id), MONTAGE_PLANS: require('./monetization').MONTAGE_PLANS });
+  businessUntil: (id) => money.businessUntil(id), MONTAGE_PLANS: require('./monetization').MONTAGE_PLANS, uploadThroughServer, buildStorageKey });
 agentRef = agent;
 agentGuard = agent.guard();
 backupRoutes.register({ app, db, pool, bcrypt, requireAdminPrincipal, rateLimit });
@@ -2038,6 +2058,9 @@ app.put('/api/creators/me/payout-account', requireAuth, async (req, res) => {
   if (!['mobile_money', 'virement'].includes(method)) return res.status(400).json({ error: 'Choisis un mode de retrait.' });
   if (!accountNumber || String(accountNumber).trim().length < 6) return res.status(400).json({ error: 'Numéro ou compte de retrait invalide.' });
   const provider = method === 'mobile_money' ? 'mobile_money' : 'manual_review';
+  // Sécurité : un changement de numéro de retrait est noté (retraits en attente 24 h, « Ce n'est pas moi » possible).
+  const before = await db.query('SELECT provider, aggregator, external_account_id FROM payout_accounts WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 1', [req.creatorId]);
+  const changed = Boolean(before && before.external_account_id !== String(accountNumber).trim());
   await db.query('DELETE FROM payout_accounts WHERE creator_id = $1', [req.creatorId]);
   await db.query(
     'INSERT INTO payout_accounts (creator_id, provider, aggregator, external_account_id) VALUES ($1, $2, $3, $4)',
@@ -2046,7 +2069,16 @@ app.put('/api/creators/me/payout-account', requireAuth, async (req, res) => {
   if (method === 'mobile_money') {
     await db.query('UPDATE creators SET withdrawal_phone = $1 WHERE id = $2', [String(accountNumber).trim(), req.creatorId]);
   }
-  res.json({ saved: true });
+  if (changed) {
+    // Plusieurs changements de suite : on garde le tout premier ancien numéro (celui qui reviendra en cas d'annulation).
+    await db.query(
+      `INSERT INTO payout_changes (creator_id, old_provider, old_aggregator, old_account, new_account, device_key, session_id) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [req.creatorId, before.provider, before.aggregator, before.external_account_id, String(accountNumber).trim(), req.deviceKey || null, req.sessionId || null]).catch(() => {});
+    const last4 = String(accountNumber).trim().slice(-4);
+    await notify(req.creatorId, 'securite', `🔐 Ton numéro de retrait vient d'être changé (nouveau : •••${last4}). Pour ta sécurité, les retraits sont mis en attente 24 h. Ce n'est pas toi ? Va dans Paiements et appuie sur « Ce n'est pas moi » : l'ancien numéro revient.`, 's-paiements',
+      { title: 'Sécurité Eaji : numéro de retrait changé', body: 'Ce n\'est pas toi ? Ouvre Paiements → « Ce n\'est pas moi ».' });
+  }
+  res.json({ saved: true, ...(changed ? { holdHours: Number(process.env.EAJI_RETRAIT_ATTENTE_HEURES) || 24 } : {}) });
 });
 
 // ==================== APPELS AUDIO / VIDÉO ====================

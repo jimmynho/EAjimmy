@@ -54,6 +54,17 @@ const MIGRATIONS = [
   'ALTER TABLE montage_uses ADD COLUMN IF NOT EXISTS subscription_id UUID',
   'ALTER TABLE montage_uses ADD COLUMN IF NOT EXISTS kind TEXT',
   'CREATE INDEX IF NOT EXISTS montage_uses_sub ON montage_uses (subscription_id)',
+  // Photo qui parle : « appli » = animation faite dans le téléphone ; « realiste » = lèvres synchronisées (service D-ID).
+  `CREATE TABLE IF NOT EXISTS talking_photos (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+     mode TEXT NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pret',
+     provider_id TEXT,
+     result_key TEXT,
+     error TEXT,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  'CREATE INDEX IF NOT EXISTS talking_photos_creator ON talking_photos (creator_id, created_at DESC)',
 ];
 
 const MONTAGE_FREE = 2; // compte gratuit, par semaine
@@ -70,13 +81,13 @@ const short = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim();
 
 // ---------- L'IA (Claude d'Anthropic), seulement si une clé est donnée au serveur ----------
 const aiReady = () => Boolean(process.env.ANTHROPIC_API_KEY);
-async function askClaude({ system, messages, maxTokens = 600, timeoutMs = 20000 }) {
+async function askClaude({ system, messages, maxTokens = 600, timeoutMs = 20000, model = null }) {
   if (!aiReady()) return null;
   const res = await fetch(process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': process.env.ANTHROPIC_VERSION || '2026-10-21', 'content-type': 'application/json',
       ...(process.env.ANTHROPIC_WORKSPACE_ID ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID } : {}) },
-    body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5', max_tokens: maxTokens, system, messages }),
+    body: JSON.stringify({ model: model || process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5', max_tokens: maxTokens, system, messages }),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`IA ${res.status} : ${(await res.text()).slice(0, 200)}`);
@@ -110,6 +121,12 @@ const KB = [
     a: `L'éditeur (filtres, musique, voix off, textes) est gratuit. Le « Montage IA » d'Eajimmy AI fait tout seul tous les montages : photos, vidéos, musique, voix off, texte en image, texte en vidéo avec voix off et musique. Compte gratuit : 2 montages par semaine ; Premium : 5 par semaine. Montages jusqu'à 1 min 30, ou jusqu'à 3 minutes avec l'abonnement Montage : 10 montages par jour, jusqu'à 50 au total pour 1 mois (10 $), 200 pour 3 mois (30 $) ou 1 000 pour un an (100 $). Pour toutes les autres questions (même hors de l'application), utilise « Discuter avec Eajimmy AI » dans l'Accueil. Ouvre l'onglet Accueil → « Eajimmy AI », ou Contenu → « 🤖 Montage IA ».` },
   { id: 'publicite', k: ['publicite', 'annonce', 'pub', 'sponsor', 'entreprise', 'advert'],
     a: "Pour faire de la publicité : Contenu → « Publicité pour entreprises ». Tu choisis où la montrer (une ville, un pays, un continent ou partout), la durée (7 jours 10 $, 30 jours 30 $, 90 jours 75 $), puis tu ajoutes ta bannière ou ta vidéo." },
+  { id: 'photo_parle', k: ['photo qui parle', 'photo parle', 'faire parler', 'parler ma photo', 'talking photo', 'avatar'],
+    a: "Dans l'Accueil → Eajimmy AI → « 🗣️ Photo qui parle » : choisis ta vraie photo (elle n'est pas retouchée), touche la bouche si besoin, choisis la langue et la voix (voix automatique, ta propre voix enregistrée — idéal pour le lingala — ou un fichier audio), écris le texte, puis « Créer la vidéo ». La tête et les lèvres bougent au rythme de la voix, avec des sous-titres. Gratuit : 2 par jour, 1 minute chacune. Avec l'abonnement Eajimmy AI : sans limite, jusqu'à 3 minutes, et la version réaliste aux lèvres synchronisées quand elle est activée. Utilise seulement ta photo ou celle d'une personne qui est d'accord. La vidéo publiée est marquée « créée par IA » et n'est pas rémunérée." },
+  { id: 'experts', k: ['domaine expert', 'domaines experts', 'sante', 'medecin', 'maladie', 'hydro', 'turbine', 'tours par minute', 'agriculture', 'agronom', 'recherche scientifique', 'technologie'],
+    a: "Dans l'Accueil → Eajimmy AI → « 🧠 Domaines experts », pose des questions complexes en santé, hydroélectricité, agriculture, technologie et recherche scientifique. Tu peux joindre des photos ou une vidéo (Eajimmy AI en regarde des images), et en hydroélectricité mesurer les tours par minute d'une machine avec une vidéo (un repère bien visible sur la partie qui tourne). Gratuit : 3 questions expertes par jour. Avec l'abonnement Eajimmy AI (10 $ / mois, 30 $ / 3 mois, 100 $ / an, qui donne aussi les montages) : IA avancée et questions sans limite. En santé, les réponses ne remplacent pas un médecin." },
+  { id: 'phishing', k: ['phishing', 'fishing', 'hameconn', 'arnaqueur', 'escroc', 'faux message', 'faux site', 'pirat', 'hack', 'scam', 'vole mon compte', 'compte vole', 'demande mon code', 'demande mon mot de passe', 'se fait passer'],
+    a: "Le phishing (hameçonnage), c'est un faux message ou un faux site qui imite Eaji pour voler ton mot de passe, ton code ou ton argent (exemple : « Je suis de l'équipe Eaji, envoie-moi le code reçu par SMS, sinon ton compte sera fermé »). Eaji bloque ces messages et les liens d'arnaque. Règles simples : ne donne jamais ton mot de passe, ton code de confirmation ou ton code PIN, à personne ; l'équipe Eaji ne te les demandera jamais et t'écrit seulement dans Profil → « Contacter l'équipe Eaji » ; ne tape ton mot de passe que dans l'application Eaji. Si tu as donné ton code ou ton mot de passe : change ton mot de passe tout de suite (Profil → Sécurité), puis « Déconnecter tous les autres appareils », et signale le compte qui t'a écrit." },
   { id: 'signaler', k: ['signal', 'choquant', 'nudite', 'nu ', 'porn', 'violence', 'arnaque', 'faux compte', 'harcel', 'report', 'fake'],
     a: "Sous chaque publication, appuie sur « Signaler ». Une publication signalée par plusieurs personnes est mise de côté automatiquement en attendant la vérification, et les faux comptes évidents sont suspendus. Tu peux aussi bloquer un compte depuis son profil." },
   { id: 'supprimer', k: ['supprimer mon compte', 'effacer mon compte', 'delete account', 'fermer mon compte', 'supprimer le compte'],
@@ -136,6 +153,7 @@ function withdrawalAnswer(c) {
   const w = c.withdrawals && c.withdrawals[0];
   if (!w) return "Tes gains se trouvent dans l'onglet Paiements (« Mes gains »). Tu peux y demander un retrait vers ton mobile money ; la demande est vérifiée puis envoyée.";
   const st = { en_attente: 'en cours de vérification', paye: 'payée', refuse: 'refusée' }[w.status] || w.status;
+  if (w.status === 'en_attente' && w.holdUntil) return `Ta dernière demande de retrait (${w.amount} $, le ${w.date}) est en attente de sécurité jusqu'au ${w.holdUntil} : ton numéro de retrait a été changé ou la demande vient d'un nouvel appareil. C'est une protection contre le piratage. Si ce n'est pas toi, va dans Paiements et appuie sur « Ce n'est pas moi » depuis ton téléphone habituel.`;
   return `Ta dernière demande de retrait (${w.amount} $, le ${w.date}) est ${st}.${w.status === 'refuse' ? ' Si tu ne comprends pas pourquoi, je transmets à l\'équipe.' : ''}`;
 }
 function detectTopic(text) {
@@ -150,7 +168,8 @@ function detectTopic(text) {
 }
 
 function register({ app, db, security, notify = async () => {}, notifyAdmins = async () => {}, requireAuth, requireAdmin, requireAdminPrincipal,
-  optionalViewerId, decodeToken, isLeader = () => true, rateLimit, createDownloadUrl, frames, businessUntil = async () => null, MONTAGE_PLANS = {} }) {
+  optionalViewerId, decodeToken, isLeader = () => true, rateLimit, createDownloadUrl, frames, businessUntil = async () => null, MONTAGE_PLANS = {},
+  uploadThroughServer = null, buildStorageKey = null }) {
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   // ---------- Réglages (l'administrateur principal peut couper un module) ----------
@@ -352,6 +371,14 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     notifyAdmins({ title: '🤖 Agent : compte suspendu', body: `${c.name} — ${short(reason, 100)}`, link: 'admin:v-agent', kind: 'securite', permission: 'gerer_comptes_utilisateurs' });
     return true;
   }
+  // Message de phishing bloqué (demande de mot de passe / code, ou faux membre de l'équipe) : noté dans la sécurité ;
+  // 3 essais en 24 heures → compte suspendu (réglage « Faux comptes », annulable).
+  async function phishing({ creatorId, ip, device, reason, text }) {
+    if (security) await security.log('hameconnage', 'alerte', { creatorId, ip, device, detail: short(`Message bloqué (${reason}) : « ${text} »`, 400) });
+    if (!creatorId || !(await settings()).faux_comptes) return;
+    const r = await db.query("SELECT COUNT(*)::int AS n FROM security_events WHERE kind = 'hameconnage' AND creator_id = $1 AND created_at > now() - interval '24 hours'", [creatorId]).catch(() => null);
+    if (r && r.n >= 3) await suspend(creatorId, `${r.n} messages de phishing bloqués en 24 heures (${reason})`);
+  }
   async function fakeAccounts() {
     // a) Beaucoup de nouveaux comptes sur le même téléphone en 2 jours : on garde le premier.
     const farms = await db.all(
@@ -408,7 +435,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     if (!me) return null;
     const pay = await db.all(
       `SELECT reference, purpose, description, amount_usd, status, created_at FROM payment_requests WHERE payer_id = $1 ORDER BY created_at DESC LIMIT 5`, [creatorId]).catch(() => []);
-    const wd = await db.all('SELECT amount_usd, status, created_at FROM withdrawal_requests WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 3', [creatorId]).catch(() => []);
+    const wd = await db.all('SELECT amount_usd, status, created_at, hold_until FROM withdrawal_requests WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 3', [creatorId]).catch(() => []);
     const prem = await db.query('SELECT MAX(ends_at) AS e FROM premium_subscriptions WHERE creator_id = $1 AND ends_at > now()', [creatorId]).catch(() => null);
     const day = (d) => new Date(d).toLocaleDateString('fr-FR');
     const b = await loadBlocks();
@@ -416,7 +443,8 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
       name: me.name, email: Boolean(me.email), country: me.country_code, premiumUntil: prem && prem.e ? day(prem.e) : null,
       blocked: Boolean((req && b.ips.get(req.ip) === 'total') || (req && req.deviceKey && b.devices.get(req.deviceKey))),
       payments: pay.map((p) => ({ reference: p.reference, label: p.description, amount: Number(p.amount_usd), status: p.status, date: day(p.created_at) })),
-      withdrawals: wd.map((w) => ({ amount: Number(w.amount_usd), status: w.status, date: day(w.created_at) })),
+      withdrawals: wd.map((w) => ({ amount: Number(w.amount_usd), status: w.status, date: day(w.created_at),
+        holdUntil: w.status === 'en_attente' && w.hold_until && new Date(w.hold_until) > new Date() ? new Date(w.hold_until).toLocaleString('fr-FR', { timeZone: 'Africa/Kinshasa', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }) : null })),
     };
   }
   const SYSTEM = (ctx) => `Tu es « Eajimmy AI », l'agent IA et assistant automatique de l'application Eaji (réseau social qui rémunère les créateurs de pays en développement). `
@@ -532,7 +560,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
       const fr = (d) => new Date(d).toLocaleDateString('fr-FR', { timeZone: 'Africa/Kinshasa' });
       let error;
       if (q.sub && q.sub.today >= q.sub.daily && q.sub.used < q.sub.total) error = `Tu as déjà fait tes ${q.sub.daily} montages d'aujourd'hui avec ton abonnement. Reviens demain !`;
-      else if (q.sub) error = `Les ${q.sub.total} montages de ton abonnement sont utilisés, et ceux de la semaine aussi. Tu peux reprendre un abonnement Montage.`;
+      else if (q.sub) error = `Les ${q.sub.total} montages de ton abonnement sont utilisés, et ceux de la semaine aussi. Tu peux reprendre un abonnement Eajimmy AI.`;
       else error = `Tes ${q.week.limit} montages de la semaine sont utilisés (compte ${q.tier === 'premium' ? 'Premium : 5' : 'gratuit : 2'} par semaine, de nouveau le ${fr(q.week.resetsAt)}). Pour en faire plus : abonnement Montage, 10 montages par jour.`;
       return res.status(402).json({ code: 'montage_abonnement', plans: plansOut(), error, quota: q });
     }
@@ -599,6 +627,219 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     res.json({ text, left: left - 1, daily: CHAT_DAILY });
   });
 
+  // ==================== 6. DOMAINES EXPERTS ====================
+  // Santé, hydroélectricité, agriculture, technologie, recherche scientifique : questions complexes, avec photos
+  // ou images tirées d'une vidéo (et la mesure des tours par minute faite par l'appli).
+  // Gratuit : quelques questions par jour (modèle économique). Abonnement Eajimmy AI : modèle avancé, sans limite
+  // (sauf la protection contre les robots).
+  const EXPERT_FREE = Number(process.env.EAJI_EXPERT_GRATUIT_PAR_JOUR) || 3;
+  const EXPERT_MODEL = process.env.ANTHROPIC_MODEL_EXPERT || 'claude-sonnet-5-5';
+  const EXPERT_COMMON = `Tu es « Eajimmy AI », l'assistant IA de l'application Eaji, en mode EXPERT. Réponds dans la langue de la personne `
+    + `(français, lingala, swahili, anglais…), avec des phrases claires, étape par étape, des titres courts et des listes si utile (pas de tableaux larges). `
+    + `Montre les calculs avec les formules et les unités. Si des photos ou des images tirées d'une vidéo sont jointes, décris ce que tu vois, appuie-toi dessus `
+    + `et dis ce qui manque pour être sûr. Dis franchement quand tu n'es pas certain ; n'invente jamais de chiffres, d'études ni de références. `
+    + `Les utilisateurs vivent surtout en Afrique (RD Congo et pays voisins) : propose des solutions réalistes avec les moyens disponibles sur place. `
+    + `Refuse ce qui est dangereux ou illégal. Ne demande jamais de mot de passe ni de code. `;
+  const EXPERTS = {
+    sante: { label: 'Santé', prompt: `Domaine : SANTÉ et médecine. Tu raisonnes comme un médecin expérimenté (généraliste et spécialistes) : causes possibles classées de la plus probable à la moins probable, `
+      + `questions utiles à poser, examens à faire, traitements habituels selon les recommandations médicales, prévention, et signes d'alerte. Tu ne remplaces pas une consultation : `
+      + `pas de diagnostic certain à distance ; pour un médicament sur ordonnance, donne les informations générales et dis de faire confirmer la dose par un médecin ou un pharmacien. `
+      + `URGENCE (douleur dans la poitrine, difficulté à respirer, perte de connaissance, convulsions, saignement important, signes d'AVC, forte fièvre ou déshydratation chez un bébé, `
+      + `grossesse avec saignement ou douleurs fortes, idées de suicide…) : dis tout de suite d'aller aux urgences ou d'appeler les secours. Photos médicales : décris avec prudence.` },
+    hydro: { label: 'Hydroélectricité', prompt: `Domaine : HYDROÉLECTRICITÉ. Tu raisonnes comme un ingénieur hydroélectricien (turbines Pelton, Francis, Kaplan, Banki, micro-centrales, `
+      + `alternateurs, régulation, conduites forcées, barrages, réseaux). Formules utiles : P = ρ·g·Q·H·η ; n (tr/min) = 120·f / p (f en Hz, p = nombre de pôles) ; `
+      + `vitesse spécifique ; pertes de charge (Darcy-Weisbach) ; débit d'une rivière ; rendement. Si l'application a mesuré des tours par minute sur une vidéo, `
+      + `utilise cette mesure, vérifie sa cohérence (fréquence 50 Hz, nombre de pôles, effet stroboscopique) et dis comment l'améliorer. Rappelle la sécurité électrique et hydraulique.` },
+    agriculture: { label: 'Agriculture', prompt: `Domaine : AGRICULTURE. Tu raisonnes comme un agronome (manioc, maïs, banane plantain, haricot, riz, arachide, café, cacao, palmier à huile, `
+      + `maraîchage, arbres fruitiers, élevage, pisciculture, sols, engrais, irrigation, stockage). Avec des photos ou une vidéo : identifie la maladie, le ravageur ou la carence la plus probable, `
+      + `avec ton niveau de confiance et les autres possibilités. Donne des solutions biologiques et chimiques (avec les précautions et les délais avant récolte), et la prévention pour la prochaine saison.` },
+    technologie: { label: 'Technologie', prompt: `Domaine : TECHNOLOGIE et innovation. Tu raisonnes comme un ingénieur et architecte de très haut niveau (logiciels, IA, électronique, `
+      + `énergie solaire et réseaux, télécoms, paiement mobile, objets connectés, robotique). Propose des idées et solutions avancées, complexes et innovantes, mais réalisables : `
+      + `principe, architecture, étapes, matériel ou outils, coût approximatif, risques et comment les réduire.` },
+    recherche: { label: 'Recherche scientifique', prompt: `Domaine : RECHERCHE SCIENTIFIQUE. Tu raisonnes comme un chercheur pluridisciplinaire : état des connaissances, hypothèses, `
+      + `protocole expérimental, variables et témoins, taille d'échantillon, statistiques, analyse et limites des résultats, pistes de solutions avancées. `
+      + `Distingue clairement les faits établis, les hypothèses et les idées spéculatives ; ne cite jamais de fausse référence.` },
+  };
+  async function expertLeft(creatorId) {
+    const r = await db.query(`SELECT COUNT(*)::int AS n FROM agent_chats WHERE creator_id = $1 AND source = 'expert' AND created_at >= ${DAY_START}`, [creatorId]).catch(() => ({ n: 0 }));
+    return Math.max(0, EXPERT_FREE - r.n);
+  }
+  app.get('/api/agent/expert/status', requireAuth, async (req, res) => {
+    const sub = Boolean(await montageUntil(req.creatorId));
+    res.json({ ai: aiReady(), sub, daily: EXPERT_FREE, left: sub ? null : await expertLeft(req.creatorId), paused: !(await settings()).aide,
+      domains: Object.entries(EXPERTS).map(([id, e]) => ({ id, label: e.label })) });
+  });
+  // Photos jointes (JPEG / PNG / WebP réduits par l'application) : grand corps de requête permis seulement ici.
+  app.post('/api/agent/expert', require('express').json({ limit: '12mb' }), requireAuth,
+    rateLimit('agentexpert', 30, 10 * 60 * 1000, 'Trop de questions envoyées. Réessaie dans quelques minutes.'), async (req, res) => {
+      const domain = String((req.body && req.body.domain) || '');
+      const ex = EXPERTS[domain];
+      if (!ex) return res.status(400).json({ error: 'Choisis un domaine.' });
+      const msgs = cleanMsgs(req.body.messages, 16, 6000);
+      if (!msgs.length || msgs[msgs.length - 1].role !== 'user') return res.status(400).json({ error: 'Écris ta question.' });
+      const imgs = (Array.isArray(req.body.images) ? req.body.images : []).slice(0, 6)
+        .filter((im) => im && /^image\/(jpeg|png|webp)$/.test(im.type) && typeof im.data === 'string' && im.data.length < 2800000 && /^[A-Za-z0-9+/=]+$/.test(im.data.slice(0, 200)));
+      if (!(await settings()).aide) return res.status(503).json({ code: 'ia_pause', error: 'Eajimmy AI est en pause pour le moment. Réessaie plus tard.' });
+      if (!aiReady()) return res.status(503).json({ code: 'ia_inactive', error: "Les domaines experts s'ouvriront bientôt : l'IA n'est pas encore activée par Eaji." });
+      const sub = Boolean(await montageUntil(req.creatorId));
+      const left = sub ? null : await expertLeft(req.creatorId);
+      if (!sub && left <= 0) {
+        return res.status(429).json({ code: 'expert_limite', daily: EXPERT_FREE,
+          error: `Tu as utilisé tes ${EXPERT_FREE} questions expertes gratuites d'aujourd'hui. Reviens demain, ou prends l'abonnement Eajimmy AI : IA avancée et questions sans limite.` });
+      }
+      // Mesure des tours par minute faite par l'application (vidéo) : ajoutée à la question.
+      const m = req.body.measure && typeof req.body.measure === 'object' ? req.body.measure : null;
+      const measure = m && Number.isFinite(Number(m.rpm))
+        ? `\n\n[Mesure faite par l'application sur la vidéo : environ ${Number(m.rpm).toFixed(1)} tr/min (${Number(m.hz || 0).toFixed(2)} passages du repère par seconde, ${Number(m.marks || 1)} repère(s), vidéo ${Number(m.fps || 0).toFixed(0)} images/s, ralenti ×${Number(m.slow || 1)}, fiabilité ${Math.round(Number(m.confidence || 0) * 100)} %, mesure possible jusqu'à environ ${Number(m.maxRpm || 0).toFixed(0)} tr/min avec cette vidéo).]`
+        : '';
+      // Messages alternés (question, réponse…) ; photos jointes à la dernière question.
+      const conv = [];
+      for (const x of msgs) { const last = conv[conv.length - 1]; if (last && last.role === x.role) last.text += '\n\n' + x.text; else conv.push({ ...x }); }
+      while (conv.length && conv[0].role !== 'user') conv.shift();
+      const apiMsgs = conv.map((x, i) => {
+        if (i < conv.length - 1) return { role: x.role, content: x.text };
+        return { role: 'user', content: [...imgs.map((im) => ({ type: 'image', source: { type: 'base64', media_type: im.type, data: im.data } })),
+          { type: 'text', text: x.text + measure + (imgs.length ? `\n\n(${imgs.length} image(s) jointe(s).)` : '') }] };
+      });
+      const me = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]).catch(() => null);
+      const first = me && me.name ? String(me.name).split(' ')[0] : '';
+      let text;
+      try {
+        text = await askClaude({ system: EXPERT_COMMON + ex.prompt + (first ? ` La personne s'appelle ${first}.` : ''), messages: apiMsgs,
+          model: sub ? EXPERT_MODEL : null, maxTokens: sub ? 3500 : 1500, timeoutMs: sub ? 120000 : 60000 });
+      } catch (e) {
+        console.warn('[Eaji] Eajimmy AI (expert) :', e.message);
+        return res.status(502).json({ error: "Eajimmy AI n'arrive pas à répondre pour le moment. Réessaie dans un instant." });
+      }
+      if (!text) return res.status(502).json({ error: "Eajimmy AI n'arrive pas à répondre pour le moment. Réessaie dans un instant." });
+      await db.query("INSERT INTO agent_chats (creator_id, question, answer, source) VALUES ($1, $2, $3, 'expert')",
+        [req.creatorId, short(`[${ex.label}${imgs.length ? ` · ${imgs.length} image(s)` : ''}] ${msgs[msgs.length - 1].text}`, 500), short(text, 1000)]);
+      res.json({ text, sub, model: sub ? 'avance' : 'standard', left: sub ? null : left - 1, daily: EXPERT_FREE });
+    });
+
+  // ==================== 7. PHOTO QUI PARLE ====================
+  // La vraie photo (sans changement) parle avec une voix, des mouvements de tête et des sous-titres.
+  // Gratuit : animation faite dans le téléphone (2 par jour, 1 minute). Abonnement Eajimmy AI : animation sans limite
+  // (3 minutes) et version « réaliste » aux lèvres synchronisées (service D-ID, quand sa clé est donnée), 5 par jour.
+  const TALK_FREE = Number(process.env.EAJI_PHOTO_PARLE_GRATUIT_PAR_JOUR) || 2;
+  const TALK_REAL = Number(process.env.EAJI_PHOTO_PARLE_REALISTE_PAR_JOUR) || 5;
+  const DID_URL = process.env.D_ID_API_URL || 'https://api.d-id.com';
+  const realReady = () => Boolean(process.env.D_ID_API_KEY);
+  const lingalaReady = () => Boolean(process.env.ELEVENLABS_API_KEY);
+  // Voix Microsoft proposées par D-ID pour la version réaliste (le lingala passe par ElevenLabs ou la voix de la personne).
+  const MS_VOICES = { fr: ['fr-FR-DeniseNeural', 'fr-FR-HenriNeural'], en: ['en-US-JennyNeural', 'en-US-GuyNeural'], sw: ['sw-KE-ZuriNeural', 'sw-KE-RafikiNeural'],
+    pt: ['pt-BR-FranciscaNeural', 'pt-BR-AntonioNeural'], es: ['es-ES-ElviraNeural', 'es-ES-AlvaroNeural'], ar: ['ar-EG-SalmaNeural', 'ar-EG-ShakirNeural'],
+    de: ['de-DE-KatjaNeural', 'de-DE-ConradNeural'], ru: ['ru-RU-SvetlanaNeural', 'ru-RU-DmitryNeural'], hi: ['hi-IN-SwaraNeural', 'hi-IN-MadhurNeural'], zh: ['zh-CN-XiaoxiaoNeural', 'zh-CN-YunxiNeural'] };
+  async function talkUsed(creatorId, mode) {
+    const r = await db.query(`SELECT COUNT(*)::int AS n FROM talking_photos WHERE creator_id = $1 AND mode = $2 AND status <> 'echec' AND created_at >= ${DAY_START}`, [creatorId, mode]).catch(() => ({ n: 0 }));
+    return r.n;
+  }
+  async function talkStatus(creatorId) {
+    const sub = Boolean(await montageUntil(creatorId));
+    return { sub, maxSeconds: sub ? 180 : 60,
+      free: { daily: TALK_FREE, left: sub ? null : Math.max(0, TALK_FREE - await talkUsed(creatorId, 'appli')) },
+      realistic: { available: realReady(), daily: TALK_REAL, left: sub && realReady() ? Math.max(0, TALK_REAL - await talkUsed(creatorId, 'realiste')) : 0 },
+      lingala: lingalaReady() };
+  }
+  app.get('/api/agent/talking/status', requireAuth, async (req, res) => res.json(await talkStatus(req.creatorId)));
+  // Animation dans le téléphone : on compte seulement l'utilisation.
+  app.post('/api/agent/talking/start', requireAuth, async (req, res) => {
+    const st = await talkStatus(req.creatorId);
+    if (!st.sub && st.free.left <= 0) {
+      return res.status(429).json({ code: 'photo_parle_limite', error: `Tu as utilisé tes ${TALK_FREE} photos qui parlent gratuites d'aujourd'hui. Reviens demain, ou prends l'abonnement Eajimmy AI : sans limite, jusqu'à 3 minutes, et la version réaliste.` });
+    }
+    await db.query("INSERT INTO talking_photos (creator_id, mode, status) VALUES ($1, 'appli', 'pret')", [req.creatorId]);
+    res.json({ ok: true, maxSeconds: st.maxSeconds, left: st.sub ? null : st.free.left - 1 });
+  });
+  const own = (creatorId, key) => typeof key === 'string' && key.startsWith(`${creatorId}/`) && !key.includes('..');
+  async function didFetch(path, opts = {}) {
+    const r = await fetch(DID_URL + path, { ...opts, headers: { Authorization: `Basic ${process.env.D_ID_API_KEY}`, 'Content-Type': 'application/json', accept: 'application/json', ...(opts.headers || {}) },
+      signal: AbortSignal.timeout(30000) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`D-ID ${r.status} : ${JSON.stringify(d).slice(0, 200)}`);
+    return d;
+  }
+  // Voix lingala (et autres langues) avec ElevenLabs : fichier MP3 gardé dans le stockage d'Eaji le temps de la création.
+  async function elevenVoice(creatorId, text, lang) {
+    const voice = process.env.ELEVENLABS_VOICE_ID || 'JBFqnCBsd6RMkjVDRZzb';
+    const r = await fetch(`${process.env.ELEVENLABS_API_URL || 'https://api.elevenlabs.io'}/v1/text-to-speech/${encodeURIComponent(voice)}?output_format=mp3_44100_128`, {
+      method: 'POST', headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json', accept: 'audio/mpeg' },
+      body: JSON.stringify({ text, model_id: process.env.ELEVENLABS_MODEL || 'eleven_v3', language_code: lang }), signal: AbortSignal.timeout(60000) });
+    if (!r.ok) throw new Error(`ElevenLabs ${r.status} : ${(await r.text()).slice(0, 200)}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const key = buildStorageKey(creatorId, 'voix-photo-parle.mp3');
+    await uploadThroughServer(key, 'audio/mpeg', buf, buf.length);
+    return createDownloadUrl(key);
+  }
+  app.post('/api/agent/talking/realistic', requireAuth, rateLimit('photoparle', 10, 10 * 60 * 1000, 'Trop de demandes. Réessaie dans quelques minutes.'), async (req, res) => {
+    const st = await talkStatus(req.creatorId);
+    if (!st.realistic.available) return res.status(503).json({ code: 'realiste_inactif', error: "La version réaliste n'est pas encore activée par Eaji. Utilise l'animation." });
+    if (!st.sub) return res.status(402).json({ code: 'abonnement', error: "La version réaliste (lèvres synchronisées) est réservée à l'abonnement Eajimmy AI." });
+    if (st.realistic.left <= 0) return res.status(429).json({ code: 'realiste_limite', error: `Tu as fait tes ${TALK_REAL} photos qui parlent réalistes d'aujourd'hui. Reviens demain ou utilise l'animation (sans limite).` });
+    const b = req.body || {};
+    if (b.consent !== true) return res.status(400).json({ error: "Confirme que c'est ta photo, ou que la personne a donné son accord." });
+    if (!own(req.creatorId, b.photoKey)) return res.status(403).json({ error: 'Photo non autorisée.' });
+    const lang = /^[a-z]{2}$/.test(String(b.lang || '')) ? b.lang : 'fr';
+    const text = String(b.text || '').trim().slice(0, 2500);
+    let script;
+    try {
+      if (b.audioKey) {
+        if (!own(req.creatorId, b.audioKey)) return res.status(403).json({ error: 'Fichier audio non autorisé.' });
+        script = { type: 'audio', audio_url: await createDownloadUrl(b.audioKey) };
+      } else if (!text) {
+        return res.status(400).json({ error: 'Écris ce que la photo doit dire, ou enregistre ta voix.' });
+      } else if (lang === 'ln' || (!MS_VOICES[lang] && lingalaReady())) {
+        if (!lingalaReady()) return res.status(400).json({ code: 'lingala', error: 'Pour le lingala, enregistre ta voix (la voix lingala automatique n\'est pas encore activée par Eaji).' });
+        script = { type: 'audio', audio_url: await elevenVoice(req.creatorId, text, lang) };
+      } else {
+        const v = MS_VOICES[lang] || MS_VOICES.fr;
+        script = { type: 'text', input: text, provider: { type: 'microsoft', voice_id: v[b.voice === 'homme' ? 1 : 0] } };
+      }
+      const d = await didFetch('/talks', { method: 'POST', body: JSON.stringify({ source_url: await createDownloadUrl(b.photoKey), script, config: { stitch: true } }) });
+      const row = await db.query("INSERT INTO talking_photos (creator_id, mode, status, provider_id) VALUES ($1, 'realiste', 'en_cours', $2) RETURNING id", [req.creatorId, String(d.id)]);
+      res.status(201).json({ id: row.id, status: 'en_cours' });
+    } catch (e) {
+      console.warn('[Eaji] Photo qui parle (réaliste) :', e.message);
+      res.status(502).json({ error: "La version réaliste n'a pas pu démarrer. Réessaie dans un instant, ou utilise l'animation." });
+    }
+  });
+  // Le fichier de la vidéo réaliste, relayé par le serveur (pour la publier depuis l'appli comme un montage).
+  app.get('/api/agent/talking/:id/video', requireAuth, async (req, res) => {
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Introuvable.' });
+    const t = await db.query("SELECT result_key FROM talking_photos WHERE id = $1 AND creator_id = $2 AND status = 'pret' AND result_key IS NOT NULL", [req.params.id, req.creatorId]);
+    if (!t) return res.status(404).json({ error: 'Introuvable.' });
+    const r = await fetch(await createDownloadUrl(t.result_key), { signal: AbortSignal.timeout(60000) }).catch(() => null);
+    if (!r || !r.ok) return res.status(502).json({ error: 'Vidéo indisponible pour le moment.' });
+    res.setHeader('Content-Type', 'video/mp4');
+    res.end(Buffer.from(await r.arrayBuffer()));
+  });
+  app.get('/api/agent/talking/:id', requireAuth, async (req, res) => {
+    if (!UUID_RE.test(req.params.id)) return res.status(404).json({ error: 'Introuvable.' });
+    const t = await db.query('SELECT * FROM talking_photos WHERE id = $1 AND creator_id = $2', [req.params.id, req.creatorId]);
+    if (!t) return res.status(404).json({ error: 'Introuvable.' });
+    if (t.status === 'pret' && t.result_key) return res.json({ status: 'pret', url: await createDownloadUrl(t.result_key) });
+    if (t.status === 'echec') return res.json({ status: 'echec', error: "La vidéo n'a pas pu être créée (photo sans visage bien visible ?). Essaie une autre photo." });
+    try {
+      const d = await didFetch(`/talks/${encodeURIComponent(t.provider_id)}`);
+      if (d.status === 'error' || d.status === 'rejected') {
+        await db.query("UPDATE talking_photos SET status = 'echec', error = $2 WHERE id = $1", [t.id, short(JSON.stringify(d.error || d.status), 300)]);
+        return res.json({ status: 'echec', error: "La vidéo n'a pas pu être créée (photo sans visage bien visible ?). Essaie une autre photo." });
+      }
+      if (d.status !== 'done' || !d.result_url) return res.json({ status: 'en_cours' });
+      // Vidéo prête : copiée dans le stockage d'Eaji (l'adresse du service expire).
+      const v = await fetch(d.result_url, { signal: AbortSignal.timeout(60000) });
+      if (!v.ok) throw new Error('vidéo ' + v.status);
+      const buf = Buffer.from(await v.arrayBuffer());
+      const key = buildStorageKey(req.creatorId, 'photo-qui-parle.mp4');
+      await uploadThroughServer(key, 'video/mp4', buf, buf.length);
+      await db.query("UPDATE talking_photos SET status = 'pret', result_key = $2 WHERE id = $1", [t.id, key]);
+      res.json({ status: 'pret', url: await createDownloadUrl(key) });
+    } catch (e) {
+      console.warn('[Eaji] Photo qui parle (suivi) :', e.message);
+      res.json({ status: 'en_cours' });
+    }
+  });
+
   // ==================== ADMINISTRATION ====================
   app.get('/api/admin/agent', requireAdmin, async (req, res) => {
     const k = await db.query(
@@ -643,7 +884,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     res.json({ undone: true });
   });
 
-  return { guard, replyInThread, tick, securityTick, moderationTick, montageUntil, blockSource, aiReady };
+  return { guard, replyInThread, tick, securityTick, moderationTick, montageUntil, blockSource, aiReady, phishing };
 }
 
 module.exports = { MIGRATIONS, register, MONTAGE_FREE, MONTAGE_WEEK, detectTopic, PROBE_RE, INJECT_RE };

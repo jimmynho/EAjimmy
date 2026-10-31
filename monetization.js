@@ -28,9 +28,9 @@ const PREMIUM_PLANS = {
 // L'éditeur (filtres, musique, voix off, textes) reste gratuit pour tous.
 // Chaque formule : 10 montages par jour au plus, un total pour toute la durée (50 / 200 / 1 000), montages jusqu'à 3 minutes.
 const MONTAGE_PLANS = {
-  montage_mois: { price: 10, months: 1, daily: 10, quota: 50, label: 'Montage IA 1 mois', conditions: '10 montages par jour, 50 au total, jusqu\'à 3 minutes chacun' },
-  montage_trimestre: { price: 30, months: 3, daily: 10, quota: 200, label: 'Montage IA 3 mois', conditions: '10 montages par jour, 200 au total, jusqu\'à 3 minutes chacun' },
-  montage_annee: { price: 100, months: 12, daily: 10, quota: 1000, label: 'Montage IA 1 an', conditions: '10 montages par jour, 1 000 au total, jusqu\'à 3 minutes chacun' },
+  montage_mois: { price: 10, months: 1, daily: 10, quota: 50, label: 'Abonnement Eajimmy AI 1 mois', conditions: '10 montages par jour, 50 au total, jusqu\'à 3 minutes chacun ; domaines experts avec l\'IA avancée et photos qui parlent sans limite' },
+  montage_trimestre: { price: 30, months: 3, daily: 10, quota: 200, label: 'Abonnement Eajimmy AI 3 mois', conditions: '10 montages par jour, 200 au total, jusqu\'à 3 minutes chacun ; domaines experts avec l\'IA avancée et photos qui parlent sans limite' },
+  montage_annee: { price: 100, months: 12, daily: 10, quota: 1000, label: 'Abonnement Eajimmy AI 1 an', conditions: '10 montages par jour, 1 000 au total, jusqu\'à 3 minutes chacun ; domaines experts avec l\'IA avancée et photos qui parlent sans limite' },
 };
 
 // Compte Entreprise : tout le premium + badge « Entreprise », statistiques détaillées,

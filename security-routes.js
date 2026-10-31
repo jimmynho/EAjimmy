@@ -29,6 +29,7 @@ const LABELS = {
   mot_de_passe_change: 'Mot de passe changé', mot_de_passe_oublie: 'Demande de nouveau mot de passe', deconnexion_forcee: 'Déconnecté de partout par l\'équipe',
   essais_repetes: 'Plusieurs mots de passe faux',
   agent_blocage: '🤖 Eajimmy AI : source bloquée automatiquement',
+  hameconnage: '🎣 Phishing bloqué (demande de mot de passe / code, faux membre de l\'équipe)',
 };
 
 function makeSecurity({ db, notify = async () => {}, notifyAdmins = async () => {} }) {

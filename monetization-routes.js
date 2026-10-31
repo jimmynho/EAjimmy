@@ -151,6 +151,18 @@ const MIGRATIONS = [
   // Retraits des créateurs envoyés automatiquement par pawaPay.
   'ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS gateway_id TEXT',
   'ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS gateway_status TEXT',
+  // Sécurité des retraits (anti-piratage) : retrait mis en attente 24 h après un changement de numéro de retrait
+  // ou depuis un appareil nouveau pour le compte ; le vrai propriétaire peut tout annuler.
+  'ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS hold_until TIMESTAMPTZ',
+  'ALTER TABLE withdrawal_requests ADD COLUMN IF NOT EXISTS hold_reason TEXT',
+  `CREATE TABLE IF NOT EXISTS payout_changes (
+     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+     creator_id UUID NOT NULL REFERENCES creators(id) ON DELETE CASCADE,
+     old_provider TEXT, old_aggregator TEXT, old_account TEXT, new_account TEXT,
+     device_key TEXT, session_id UUID,
+     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     cancelled_at TIMESTAMPTZ)`,
+  'CREATE INDEX IF NOT EXISTS payout_changes_creator ON payout_changes (creator_id, created_at DESC)',
   // CinetPay (mobile money RDC + cartes Visa/Mastercard) en plus de pawaPay et PayPal.
   'ALTER TABLE payment_attempts DROP CONSTRAINT IF EXISTS payment_attempts_gateway_check',
   "ALTER TABLE payment_attempts ADD CONSTRAINT payment_attempts_gateway_check CHECK (gateway IN ('pawapay', 'paypal', 'cinetpay'))",
@@ -613,7 +625,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
          VALUES ($1, $2, $3::timestamptz, $3::timestamptz + ($4 || ' months')::interval, $5)`,
         [p.payer_id, p.purpose, new Date(from).toISOString(), plan.months, p.id]);
       await ledger('eaji', null, 'montage', amount);
-      await notify(p.payer_id, 'paiement', `🎬 Abonnement Montage IA activé (${plan.label}) : ${plan.conditions}.`, 's-contenu').catch(() => {});
+      await notify(p.payer_id, 'paiement', `🤖 ${plan.label} activé : ${plan.conditions}.`, 's-contenu').catch(() => {});
     } else if (M.BUSINESS_PLANS[p.purpose]) {
       // Le compte Entreprise s'ajoute à la suite d'un éventuel abonnement Entreprise en cours.
       const plan = M.BUSINESS_PLANS[p.purpose];
@@ -776,7 +788,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       `SELECT source, amount_usd, created_at FROM revenue_ledger WHERE beneficiary = 'createur' AND creator_id = $1
        ORDER BY created_at DESC LIMIT 50`, [req.creatorId]);
     const withdrawals = await db.all(
-      `SELECT id, source, amount_usd, fee_usd, net_usd, net_local, currency, method, status, created_at
+      `SELECT id, source, amount_usd, fee_usd, net_usd, net_local, currency, method, status, created_at, hold_until, hold_reason
        FROM withdrawal_requests WHERE creator_id = $1 ORDER BY created_at DESC LIMIT 50`, [req.creatorId]);
     // Ce que les contenus rapportent jour après jour (fuseau du téléphone, par défaut Kinshasa).
     const tz = /^(UTC|[A-Za-z_]+\/[A-Za-z_\-]+(\/[A-Za-z_\-]+)?)$/.test(String(req.query.tz || '')) ? String(req.query.tz) : 'Africa/Kinshasa';
@@ -809,6 +821,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       pending: pending ? { ...pending, local: toLocal(pending.amount, me.gift_currency) } : null,
       warnings,
       history, withdrawals: withdrawals.map(({ fee_usd, ...w }) => w), payoutAccount: await payoutAccountOf(req.creatorId),
+      security: await securityAlert(req).catch(() => null),
     });
   });
 
@@ -867,6 +880,54 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     }
   }
 
+  // ==================== SÉCURITÉ DES RETRAITS ====================
+  const HOLD_HOURS = Number(process.env.EAJI_RETRAIT_ATTENTE_HEURES) || 24;
+  const fmtKin = (d) => new Date(d).toLocaleString('fr-FR', { timeZone: 'Africa/Kinshasa', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+  const agoText = (d) => { const h = Math.max(0, (Date.now() - new Date(d).getTime()) / 3600000); return h < 1 ? `${Math.max(1, Math.round(h * 60))} min` : `${Math.round(h)} h`; };
+  // Appareil nouveau pour ce compte : vu pour la première fois il y a moins de HOLD_HOURS heures, alors que le
+  // compte utilisait déjà un autre appareil avant (le tout premier téléphone d'un compte n'est jamais « nouveau »).
+  async function newDeviceSince(req) {
+    if (req.deviceKey) {
+      const d = await db.query(
+        `SELECT COALESCE((SELECT first_seen FROM device_links WHERE creator_id = $1 AND device_key = $2), now()) AS first_seen,
+                EXISTS (SELECT 1 FROM device_links o WHERE o.creator_id = $1 AND o.device_key <> $2
+                        AND o.first_seen < COALESCE((SELECT first_seen FROM device_links WHERE creator_id = $1 AND device_key = $2), now()) - interval '1 hour') AS others`,
+        [req.creatorId, req.deviceKey]).catch(() => null);
+      return d && d.others && new Date(d.first_seen) > new Date(Date.now() - HOLD_HOURS * 3600000) ? new Date(d.first_seen) : null;
+    }
+    if (req.sessionId) { // ancienne appli sans identifiant d'appareil : on regarde l'âge de la connexion
+      const d = await db.query(
+        `SELECT s.created_at, EXISTS (SELECT 1 FROM user_sessions o WHERE o.creator_id = s.creator_id AND o.id <> s.id AND o.created_at < s.created_at - interval '1 hour') AS others
+         FROM user_sessions s WHERE s.id = $1 AND s.creator_id = $2`, [req.sessionId, req.creatorId]).catch(() => null);
+      return d && d.others && new Date(d.created_at) > new Date(Date.now() - HOLD_HOURS * 3600000) ? new Date(d.created_at) : null;
+    }
+    return null;
+  }
+  async function securityHold(req) {
+    const reasons = []; let until = 0;
+    const ch = await db.query(
+      `SELECT created_at FROM payout_changes WHERE creator_id = $1 AND cancelled_at IS NULL AND created_at > now() - make_interval(hours => $2)
+       ORDER BY created_at DESC LIMIT 1`, [req.creatorId, HOLD_HOURS]).catch(() => null);
+    if (ch) { reasons.push(`numéro de retrait changé il y a ${agoText(ch.created_at)}`); until = Math.max(until, new Date(ch.created_at).getTime() + HOLD_HOURS * 3600000); }
+    const nd = await newDeviceSince(req);
+    if (nd) { reasons.push(`nouvel appareil, connecté il y a ${agoText(nd)}`); until = Math.max(until, nd.getTime() + HOLD_HOURS * 3600000); }
+    return until > Date.now() ? { until: new Date(until), reason: reasons.join(' ; ') } : null;
+  }
+  // Ce que voit la personne dans Paiements : alerte avec le bouton « Ce n'est pas moi ».
+  async function securityAlert(req) {
+    const ch = await db.query(
+      `SELECT created_at, new_account FROM payout_changes WHERE creator_id = $1 AND cancelled_at IS NULL AND created_at > now() - make_interval(hours => $2)
+       ORDER BY created_at DESC LIMIT 1`, [req.creatorId, HOLD_HOURS * 2]).catch(() => null);
+    const held = await db.all(
+      `SELECT id, net_usd, hold_until, hold_reason FROM withdrawal_requests WHERE creator_id = $1 AND status = 'en_attente' AND hold_until IS NOT NULL AND gateway_id IS NULL
+       ORDER BY created_at DESC`, [req.creatorId]).catch(() => []);
+    if (!ch && !held.length) return null;
+    const mask = (a) => (a ? '•••' + String(a).slice(-4) : '');
+    return { payoutChangedAt: ch ? ch.created_at : null, newAccount: ch ? mask(ch.new_account) : null,
+      held: held.map((w) => ({ id: w.id, netUsd: Number(w.net_usd), until: w.hold_until, reason: w.hold_reason })),
+      canCancel: !(await newDeviceSince(req)) };
+  }
+
   async function createWithdrawal(req, res, source) {
     const amountUsd = M.round2(req.body.amount);
     if (!(amountUsd >= M.WITHDRAWAL_MIN)) return res.status(400).json({ error: `Le retrait minimum est de ${M.WITHDRAWAL_MIN} $.` });
@@ -877,6 +938,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     const account = await payoutAccountOf(req.creatorId);
     if (!account) return res.status(400).json({ error: 'Enregistre d\'abord ton mode de retrait (Profil → Mode de retrait).' });
     const me = await db.query('SELECT gift_currency FROM creators WHERE id = $1', [req.creatorId]);
+    const hold = await securityHold(req);
     const outcome = await withAccountLock(req.creatorId, async () => {
       const available = source === 'gains' ? (await earningsOf(req.creatorId)).available : await walletBalance(req.creatorId);
       if (amountUsd > available) return { error: `Solde insuffisant (disponible : ${available} $).` };
@@ -884,9 +946,10 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       const local = toLocal(net, me.gift_currency);
       const method = account.provider === 'mobile_money' ? `Mobile money${account.aggregator ? ' (' + account.aggregator + ')' : ''}` : 'Virement bancaire';
       const w = await db.query(
-        `INSERT INTO withdrawal_requests (creator_id, source, amount_usd, fee_usd, net_usd, currency, net_local, method, account)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [req.creatorId, source, amountUsd, fee, net, local.currency, local.amount, method, account.external_account_id]);
+        `INSERT INTO withdrawal_requests (creator_id, source, amount_usd, fee_usd, net_usd, currency, net_local, method, account, hold_until, hold_reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+        [req.creatorId, source, amountUsd, fee, net, local.currency, local.amount, method, account.external_account_id,
+         hold ? hold.until : null, hold ? hold.reason : null]);
       if (source === 'portefeuille') {
         await db.query(
           "INSERT INTO wallet_entries (creator_id, amount_usd, kind, note) VALUES ($1, $2, 'retrait', $3)",
@@ -896,10 +959,18 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     });
     if (outcome.error) return res.status(400).json({ error: outcome.error });
     const w = outcome.withdrawal;
-    notifyAdmins({ title: '💸 Retrait à payer', body: `${Number(w.net_usd).toFixed(2)} $ à envoyer (${w.method}).`, link: 'admin:v-payments', kind: 'retrait' });
+    if (hold) {
+      notifyAdmins({ title: '⏳ Retrait en attente de sécurité', body: `${Number(w.net_usd).toFixed(2)} $ (${w.method}) — ${hold.reason}. À payer après le ${fmtKin(hold.until)} ; vérifie avec le créateur.`, link: 'admin:v-payments', kind: 'retrait' });
+      await notify(req.creatorId, 'securite', `⏳ Retrait de ${Number(w.net_usd).toFixed(2)} $ demandé (${hold.reason}). Pour ta sécurité, il sera envoyé après le ${fmtKin(hold.until)}. Ce n'est pas toi ? Paiements → « Ce n'est pas moi ».`, 's-paiements',
+        { title: 'Sécurité Eaji : retrait en attente', body: `Retrait de ${Number(w.net_usd).toFixed(2)} $ en attente 24 h. Ce n'est pas toi ? Ouvre Paiements.` });
+    } else {
+      notifyAdmins({ title: '💸 Retrait à payer', body: `${Number(w.net_usd).toFixed(2)} $ à envoyer (${w.method}).`, link: 'admin:v-payments', kind: 'retrait' });
+    }
     res.status(201).json({
       withdrawalId: w.id, amountUsd: Number(w.amount_usd), netUsd: Number(w.net_usd),
       netLocal: Number(w.net_local), currency: w.currency, status: w.status,
+      ...(hold ? { holdUntil: hold.until, holdReason: hold.reason,
+        message: `Pour ta sécurité (${hold.reason}), ce retrait sera envoyé après le ${fmtKin(hold.until)}.` } : {}),
     });
   }
 
@@ -935,6 +1006,8 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       [to, to.replace(/[\s.-]/g, '')]);
     if (!recipient) return res.status(404).json({ error: 'Aucun compte Eaji avec cet email ou ce numéro.' });
     if (recipient.id === req.creatorId) return res.status(400).json({ error: "Tu ne peux pas t'envoyer de l'argent." });
+    const sendHold = await securityHold(req);
+    if (sendHold) return res.status(403).json({ code: 'retrait_en_attente', error: `Pour ta sécurité (${sendHold.reason}), l'envoi d'argent sera possible après le ${fmtKin(sendHold.until)}.` });
     const outcome = await withAccountLock(req.creatorId, async () => {
       const balance = await walletBalance(req.creatorId);
       if (amountUsd > balance) return { error: `Solde insuffisant (disponible : ${balance} $).` };
@@ -951,6 +1024,46 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
   });
 
   app.post('/api/wallet/withdraw', requireAuth, requireTransfers, (req, res) => createWithdrawal(req, res, 'portefeuille'));
+
+  // « Ce n'est pas moi » : l'ancien numéro de retrait revient, les retraits en attente sont annulés (l'argent reste
+  // sur le compte) et les appareils connectés récemment sont déconnectés. Seulement depuis un appareil habituel.
+  app.post('/api/payouts/security-cancel', requireAuth, async (req, res) => {
+    if (await newDeviceSince(req)) {
+      return res.status(403).json({ error: "Pour ta sécurité, fais-le depuis ton téléphone habituel (celui que tu utilisais avant), ou écris à l'équipe Eaji." });
+    }
+    const out = await withAccountLock(req.creatorId, async () => {
+      const ch = await db.query(
+        `SELECT * FROM payout_changes WHERE creator_id = $1 AND cancelled_at IS NULL AND created_at > now() - make_interval(hours => $2)
+         ORDER BY created_at ASC LIMIT 1`, [req.creatorId, HOLD_HOURS * 3]);
+      if (ch) {
+        await db.query('DELETE FROM payout_accounts WHERE creator_id = $1', [req.creatorId]);
+        if (ch.old_account) {
+          await db.query('INSERT INTO payout_accounts (creator_id, provider, aggregator, external_account_id) VALUES ($1, $2, $3, $4)',
+            [req.creatorId, ch.old_provider, ch.old_aggregator, ch.old_account]);
+          if (ch.old_provider === 'mobile_money') await db.query('UPDATE creators SET withdrawal_phone = $1 WHERE id = $2', [ch.old_account, req.creatorId]);
+        }
+        await db.query('UPDATE payout_changes SET cancelled_at = now() WHERE creator_id = $1 AND cancelled_at IS NULL', [req.creatorId]);
+      }
+      const refused = await db.all(
+        `UPDATE withdrawal_requests SET status = 'refuse', processed_at = now(), admin_note = 'Annulé par le propriétaire du compte (sécurité)'
+         WHERE creator_id = $1 AND status = 'en_attente' AND hold_until IS NOT NULL AND gateway_id IS NULL RETURNING *`, [req.creatorId]);
+      for (const w of refused) {
+        if (w.source === 'portefeuille') {
+          await db.query("INSERT INTO wallet_entries (creator_id, amount_usd, kind, note) VALUES ($1, $2, 'remboursement', 'Retrait annulé (sécurité)')", [req.creatorId, w.amount_usd]);
+        }
+      }
+      return { ch, refused };
+    });
+    if (!out.ch && !out.refused.length) return res.status(404).json({ error: 'Rien à annuler : aucun changement de numéro ni retrait en attente.' });
+    const gone = await db.all(
+      `UPDATE user_sessions SET revoked_at = now() WHERE creator_id = $1 AND revoked_at IS NULL AND created_at > now() - make_interval(hours => $2)
+         AND id IS DISTINCT FROM $3::uuid RETURNING id`, [req.creatorId, HOLD_HOURS * 3, req.sessionId || null]).catch(() => []);
+    if (gone.length) await db.query('DELETE FROM push_subscriptions WHERE session_id = ANY($1::uuid[])', [gone.map((g) => g.id)]).catch(() => {});
+    notifyAdmins({ title: '🚨 Piratage évité : retrait annulé par le propriétaire', body: `${out.refused.length} retrait(s) annulé(s)${out.ch ? ', ancien numéro remis' : ''}, ${gone.length} appareil(s) déconnecté(s).`,
+      link: 'admin:v-payments', kind: 'securite', urgent: true });
+    res.json({ restored: Boolean(out.ch), refused: out.refused.length, disconnected: gone.length,
+      message: `C'est annulé${out.ch ? ' : ton ancien numéro de retrait est remis' : ''}${out.refused.length ? `, ${out.refused.length} retrait(s) bloqué(s) (l'argent reste sur ton compte)` : ''}${gone.length ? `, ${gone.length} appareil(s) déconnecté(s)` : ''}. Change ton mot de passe maintenant (Profil → Sécurité).` });
+  });
 
   // ---------- Publicité des entreprises ----------
   app.post('/api/business-ads', requireAuth, async (req, res) => {
@@ -1096,7 +1209,17 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     res.json({ withdrawals: rows });
   });
 
+  // Retrait en attente de sécurité : l'administrateur doit confirmer (« payer quand même ») avant la fin du délai.
+  async function heldCheck(req, res) {
+    if (req.body && req.body.force === true) return false;
+    const h = await db.query("SELECT hold_until, hold_reason FROM withdrawal_requests WHERE id::text = $1 AND status = 'en_attente' AND hold_until > now()", [String(req.params.id)]).catch(() => null);
+    if (!h) return false;
+    res.status(409).json({ code: 'retrait_en_attente', holdUntil: h.hold_until, reason: h.hold_reason,
+      error: `Retrait en attente de sécurité jusqu'au ${fmtKin(h.hold_until)} (${h.hold_reason}). Vérifie avec le créateur avant de payer.` });
+    return true;
+  }
   app.post('/api/admin/withdrawals/:id/paid', requireAdminPrincipal, async (req, res) => {
+    if (await heldCheck(req, res)) return;
     const w = await db.query(
       `UPDATE withdrawal_requests SET status = 'paye', processed_at = now(), admin_id = $2, admin_note = $3
        WHERE id = $1 AND status = 'en_attente' RETURNING *`,
@@ -1685,6 +1808,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
   app.post('/api/admin/withdrawals/:id/send-mobile', requireAdminPrincipal, async (req, res) => {
     if (!G.pawapayConfigured()) return res.status(503).json({ error: 'pawaPay n\'est pas configuré : paie à la main puis clique « Payé ».' });
     if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+    if (await heldCheck(req, res)) return;
     const w = await db.query(
       `SELECT w.*, cr.country_code FROM withdrawal_requests w JOIN creators cr ON cr.id = w.creator_id WHERE w.id = $1 AND w.status = 'en_attente'`, [req.params.id]);
     if (!w) return res.status(404).json({ error: 'Retrait introuvable ou déjà traité.' });
