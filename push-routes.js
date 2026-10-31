@@ -121,7 +121,7 @@ function create(db) {
     keys = JSON.parse(again.value);
     return keys;
   }
-  const subject = () => process.env.VAPID_SUBJECT || 'https://jimmynho.github.io/Eaji-site/';
+  const subject = () => process.env.VAPID_SUBJECT || 'https://eaji.org/';
 
   // Envoie un message chiffré à une liste d'appareils ; oublie ceux qui se sont désabonnés.
   async function deliver(subs, payload, table, urgent, ttl) {

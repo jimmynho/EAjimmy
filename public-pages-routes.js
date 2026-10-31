@@ -45,7 +45,7 @@ const TEXT_BG_CSS = {
 const shortText = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : t; };
 
 function register({ app, db, createDownloadUrl, rateLimit, accessMap, thumbs }) {
-  const site = () => (process.env.PUBLIC_SITE_URL || 'https://jimmynho.github.io/Eaji-site').replace(/\/$/, '');
+  const site = () => (process.env.PUBLIC_SITE_URL || 'https://eaji.org').replace(/\/$/, '');
   // Adresse du serveur (Railway la donne dans les en-têtes : https et le nom de domaine).
   const base = (req) => {
     if (process.env.PUBLIC_API_URL) return process.env.PUBLIC_API_URL.replace(/\/$/, '');

@@ -100,6 +100,7 @@ function siteHosts() {
 }
 // Liens toujours permis : ceux d'Eaji (publications partagées, profils).
 function isEajiLink(l) {
+  if (l.host === 'eaji.org' || l.host.endsWith('.eaji.org')) return true; // eaji.org et ses sous-domaines (api, secours, finance…)
   if (l.host === 'jimmynho.github.io') return /^\/eaji-site(\/|$)/i.test(l.path);
   if (/(^|\.)eajimmy-production\.up\.railway\.app$/.test(l.host)) return true;
   return hostIs(l.host, siteHosts().filter((h) => h !== 'jimmynho.github.io' && h !== '127.0.0.1' && h !== 'localhost'))
@@ -139,7 +140,7 @@ const LINK_BLOCKED_MESSAGE = '🔒 Lien bloqué pour ta sécurité : les liens s
 const SHORTENERS = ['bit.ly', 'bitly.com', 'tinyurl.com', 't.co', 'goo.gl', 'is.gd', 'v.gd', 'cutt.ly', 'ow.ly', 'rebrand.ly', 'shorturl.at', 'tiny.cc',
   'rb.gy', 's.id', 'buff.ly', 'bl.ink', 'short.io', 'shorte.st', 'adf.ly', 't.ly', 'lnkd.in', 'qr.ae', 'clck.ru', 'u.to', 'shrtco.de', 'tny.im',
   'surl.li', 'urlz.fr', 'link.tl', 'x.gd', 'gg.gg', 'bitly.ws', 'snip.ly', 'kutt.it', 'tr.ee', 'shorturl.asia'];
-const OFFICIAL_HOSTS = ['eajimmy.onrender.com', 'eajimmy-production.up.railway.app'];
+const OFFICIAL_HOSTS = ['eaji.org', 'eajimmy.onrender.com', 'eajimmy-production.up.railway.app'];
 function dangerReason(l) {
   const host = l.host || '';
   if (hostIs(host, OFFICIAL_HOSTS) || isEajiLink(l)) return null;

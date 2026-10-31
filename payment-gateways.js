@@ -17,8 +17,8 @@
 //   CINETPAY_APIKEY      clé d'API CinetPay (mobile money RDC + cartes Visa/Mastercard sur la page CinetPay)
 //   CINETPAY_SITE_ID     identifiant du site CinetPay
 //   CINETPAY_CURRENCY    devise demandée à CinetPay : CDF (par défaut) ou USD
-//   PUBLIC_SITE_URL      adresse du site, ex. https://jimmynho.github.io/Eaji-site
-//   PUBLIC_API_URL       adresse de l'API, ex. https://eajimmy-production.up.railway.app (avis de paiement CinetPay)
+//   PUBLIC_SITE_URL      adresse du site, ex. https://eaji.org
+//   PUBLIC_API_URL       adresse de l'API, ex. https://api.eaji.org (avis de paiement CinetPay)
 const crypto = require('crypto');
 
 // Opérateurs pawaPay par pays (documentation pawaPay v2, « Providers »).

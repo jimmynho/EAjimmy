@@ -1510,7 +1510,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
   app.post('/api/payments/:id/paypal', requireAuth, async (req, res) => {
     if (!G.paypalConfigured()) return res.status(503).json({ error: 'Le paiement par carte n\'est pas encore activé.' });
     const p = await ownPendingPayment(req, res); if (!p) return;
-    const site = (process.env.PUBLIC_SITE_URL || 'https://jimmynho.github.io/Eaji-site').replace(/\/$/, '');
+    const site = (process.env.PUBLIC_SITE_URL || 'https://eaji.org').replace(/\/$/, '');
     let order;
     try {
       order = await G.paypalCreateOrder({ amountUsd: p.amount_usd, reference: `${p.reference}-${Date.now()}`, description: `Eaji — ${p.description}`,
@@ -1529,7 +1529,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
     if (!G.cinetpayConfigured()) return res.status(503).json({ error: 'Le paiement CinetPay n\'est pas encore activé.' });
     const p = await ownPendingPayment(req, res); if (!p) return;
     const me = await db.query('SELECT name, phone, email, city, country_code, language FROM creators WHERE id = $1', [req.creatorId]);
-    const site = (process.env.PUBLIC_SITE_URL || 'https://jimmynho.github.io/Eaji-site').replace(/\/$/, '');
+    const site = (process.env.PUBLIC_SITE_URL || 'https://eaji.org').replace(/\/$/, '');
     const api = (process.env.PUBLIC_API_URL || `${req.protocol || 'https'}://${req.get('host')}`).replace(/\/$/, '');
     const amt = G.cinetpayAmount(p.amount_usd, convertFromUSD);
     const transactionId = 'EAJI' + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase();
@@ -1584,7 +1584,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       const a = await db.query("SELECT * FROM payment_attempts WHERE gateway_id = $1 AND gateway = 'cinetpay'", [id]).catch(() => null);
       if (a) await settleAttempt(a).catch(() => {});
     }
-    const site = (process.env.PUBLIC_SITE_URL || 'https://jimmynho.github.io/Eaji-site').replace(/\/$/, '');
+    const site = (process.env.PUBLIC_SITE_URL || 'https://eaji.org').replace(/\/$/, '');
     res.redirect(303, `${site}/paiement-termine.html?ok=1`);
   };
   app.post('/api/cinetpay/retour', cinetpayReturn);

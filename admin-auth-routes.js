@@ -82,7 +82,7 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
   // Adresses autorisées pour l'empreinte : le site (PUBLIC_SITE_URL) + WEBAUTHN_EXTRA_ORIGINS (séparées par des virgules).
   function allowedOrigins() {
     const list = [];
-    try { list.push(new URL(process.env.PUBLIC_SITE_URL || 'https://jimmynho.github.io/Eaji-site').origin); } catch (e) { /* adresse invalide */ }
+    try { list.push(new URL(process.env.PUBLIC_SITE_URL || 'https://eaji.org').origin); } catch (e) { /* adresse invalide */ }
     for (const o of String(process.env.WEBAUTHN_EXTRA_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean)) {
       try { list.push(new URL(o).origin); } catch (e) { /* ignorée */ }
     }
