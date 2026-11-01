@@ -245,11 +245,14 @@ function importSiteOf(url) {
   return hit ? { site: hit[1], url: u.toString() } : null;
 }
 const IMPORT_ERRORS = [
+  [/ffmpeg|ffprobe/i, "Cette vidéo demande un outil d'assemblage (ffmpeg) absent du serveur. Réessaie plus tard ou télécharge-la sur ton téléphone puis publie-la."],
   [/Unsupported URL|is not a valid URL|No video formats/i, "Ce lien ne contient pas de vidéo téléchargeable. Copie le lien de la vidéo elle-même (bouton « Partager » → « Copier le lien »)."],
   [/Private video|private|login required|log in|Sign in to confirm|cookies/i, "Cette vidéo est privée ou le site demande une connexion : elle ne peut pas être téléchargée. Essaie une vidéo publique."],
   [/unavailable|removed|deleted|not found|404/i, "Cette vidéo n'existe plus ou n'est pas disponible dans ce pays."],
   [/larger than max-filesize|File is larger/i, 'Vidéo trop lourde (300 Mo au maximum).'],
-  [/does not pass filter|duration/i, 'Vidéo trop longue : 60 minutes au maximum.'],
+  // Seulement le vrai refus pour la durée (avant : tout message contenant le mot « duration » donnait cette erreur).
+  [/does not pass filter/i, 'Vidéo trop longue : 60 minutes au maximum.'],
+  [/Requested format is not available/i, "Le site ne propose pas cette vidéo dans un format téléchargeable. Essaie le lien de la vidéo elle-même."],
   [/geo|country/i, "Cette vidéo est bloquée dans le pays du serveur d'Eaji."],
   [/429|Too Many Requests|rate/i, 'Le site refuse les téléchargements pour le moment. Réessaie dans quelques minutes.'],
 ];
@@ -259,28 +262,63 @@ function importErrorText(stderr) {
 }
 
 // Outil de téléchargement (yt-dlp) : variable YTDLP_PATH, sinon installé sur le serveur, sinon téléchargé
-// automatiquement une seule fois depuis la page officielle du projet (GitHub).
-let ytdlpPromise = null;
+// automatiquement depuis la page officielle du projet (GitHub). Les sites (Facebook, TikTok…) changent souvent :
+// la copie téléchargée est renouvelée tous les 3 jours (l'ancienne reste utilisée si le renouvellement échoue).
+const YTDLP_REFRESH_MS = 3 * 24 * 3600 * 1000;
+let ytdlpPromise = null, ytdlpAt = 0;
 function ensureYtdlp() {
-  if (ytdlpPromise) return ytdlpPromise;
+  if (ytdlpPromise && Date.now() - ytdlpAt < YTDLP_REFRESH_MS) return ytdlpPromise;
+  ytdlpAt = Date.now();
   ytdlpPromise = (async () => {
     if (process.env.YTDLP_PATH) return process.env.YTDLP_PATH;
     try { if (spawnSync('yt-dlp', ['--version'], { timeout: 15000 }).status === 0) return 'yt-dlp'; } catch (e) { /* pas installé */ }
     const dir = path.join(require('os').tmpdir(), 'eaji-bin');
     const bin = path.join(dir, 'yt-dlp');
-    if (fs.existsSync(bin)) return bin;
+    const fresh = fs.existsSync(bin) && Date.now() - fs.statSync(bin).mtimeMs < YTDLP_REFRESH_MS;
+    if (fresh) return bin;
     fs.mkdirSync(dir, { recursive: true });
-    const name = process.arch === 'arm64' ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux';
-    const r = await fetch(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${name}`, { redirect: 'follow' });
-    if (!r.ok) throw new Error('outil de téléchargement indisponible');
-    const tmp = bin + '.part';
-    fs.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()));
-    fs.chmodSync(tmp, 0o755);
-    fs.renameSync(tmp, bin);
+    try {
+      const name = process.arch === 'arm64' ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux';
+      const r = await fetch(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${name}`, { redirect: 'follow' });
+      if (!r.ok) throw new Error('outil de téléchargement indisponible');
+      const tmp = bin + '.part';
+      fs.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()));
+      fs.chmodSync(tmp, 0o755);
+      fs.renameSync(tmp, bin);
+    } catch (e) {
+      if (!fs.existsSync(bin)) throw e; // pas d'ancienne copie : vraiment indisponible
+    }
     return bin;
   })();
   ytdlpPromise.catch(() => { ytdlpPromise = null; });
   return ytdlpPromise;
+}
+// ffmpeg (paquet ffmpeg-static ou commande du serveur) : permet d'assembler image + son quand un site
+// (Facebook, Instagram, YouTube…) ne donne pas la vidéo en un seul fichier.
+function importFfmpeg() {
+  let ff = null;
+  try { ff = require('./video-thumbs').ffmpegPath(); } catch (e) { return null; }
+  if (!ff || ff.includes('/') || ff.includes('\\')) return ff;
+  // commande du serveur (« ffmpeg ») : l'outil a besoin du chemin complet
+  try { const w = spawnSync('which', [ff], { encoding: 'utf8', timeout: 5000 }); const p = String(w.stdout || '').trim(); return p || null; } catch (e) { return null; }
+}
+// Liens « Partager » de Facebook (facebook.com/share/r/…, /share/v/…) : on suit le lien jusqu'à la vraie
+// adresse de la vidéo (reel, watch, videos), que l'outil sait lire.
+async function resolveShareLink(url) {
+  let u; try { u = new URL(url); } catch (e) { return url; }
+  const host = u.hostname.toLowerCase();
+  const fbShare = /(^|\.)(facebook\.com|fb\.com)$/.test(host) && /^\/share\//.test(u.pathname);
+  if (!fbShare && !/(^|\.)fb\.watch$/.test(host)) return url;
+  try {
+    const r = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(12000),
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36', 'Accept-Language': 'fr-FR,fr;q=0.9' } });
+    const isVideo = (s) => /facebook\.com\/(reel|watch|[^/]+\/videos|videos|story\.php)/.test(s || '');
+    if (isVideo(r.url)) return r.url;
+    const html = (await r.text()).slice(0, 400000);
+    const m = /<meta[^>]+property="og:url"[^>]+content="([^"]+)"/i.exec(html) || /<link[^>]+rel="canonical"[^>]+href="([^"]+)"/i.exec(html);
+    const found = m ? m[1].replace(/&amp;/g, '&') : '';
+    return isVideo(found) ? found : url;
+  } catch (e) { return url; }
 }
 
 function register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerId, verifySessionToken, signSessionToken, notify, feedItems, security, createSession = async () => null }) {
@@ -496,19 +534,28 @@ function register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerI
       return;
     }
     const base = path.join(IMPORT_DIR, job.id);
-    const args = ['--no-playlist', '--no-warnings', '--newline', '--restrict-filenames', '--no-part', '--no-mtime',
-      '--max-filesize', String(IMPORT_MAX_BYTES), '--match-filter', `!duration | duration <= ${IMPORT_MAX_SECONDS}`,
-      '-f', 'b[ext=mp4][height<=720]/b[height<=720]/b[ext=mp4]/b',
-      '-o', `${base}.%(ext)s`, '--print', 'after_move:EAJIJSON %(.{title,duration,ext,filepath})j', job.url];
+    const url = await resolveShareLink(job.url);
+    const ff = importFfmpeg();
+    // Durée : « <=? » laisse passer les vidéos dont le site ne donne pas la durée (l'ancien filtre
+    // « !duration | duration <= … » était refusé par l'outil, et chaque lien échouait).
+    // Format : d'abord un seul fichier (image + son) ; sinon, avec ffmpeg, image et son assemblés en mp4.
+    // « --no-quiet » : sans lui, « --print » rend l'outil muet (plus de pourcentage ni de message de refus).
+    const args = ['--no-playlist', '--no-warnings', '--no-quiet', '--newline', '--restrict-filenames', '--no-part', '--no-mtime',
+      '--retries', '3', '--socket-timeout', '30',
+      '--max-filesize', String(IMPORT_MAX_BYTES), '--match-filter', `duration <=? ${IMPORT_MAX_SECONDS}`,
+      '-f', ff ? 'b[ext=mp4][height<=720]/b[height<=720]/bv*[height<=720]+ba/b[ext=mp4]/b/bv*+ba' : 'b[ext=mp4][height<=720]/b[height<=720]/b[ext=mp4]/b',
+      ...(ff ? ['--ffmpeg-location', ff, '--merge-output-format', 'mp4'] : []),
+      '-o', `${base}.%(ext)s`, '--print', 'after_move:EAJIJSON %(.{title,duration,ext,filepath})j', url];
     await new Promise((resolve) => {
       const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-      let info = null, err = '';
+      let info = null, err = '', outTail = '';
       const timer = setTimeout(() => { err += ' timeout'; child.kill('SIGKILL'); }, 15 * 60 * 1000);
       let buf = '';
       child.stdout.on('data', (d) => {
         buf += d.toString();
         const lines = buf.split('\n'); buf = lines.pop();
         for (const line of lines) {
+          if (/does not pass filter|skipping/i.test(line)) outTail = (outTail + '\n' + line).slice(-1000);
           const pm = /\[download\]\s+([\d.]+)%/.exec(line);
           if (pm) progressOf.set(job.id, Math.min(99, Number(pm[1])));
           if (line.startsWith('EAJIJSON ')) { try { info = JSON.parse(line.slice(9)); } catch (e) { /* ligne coupée */ } }
@@ -521,9 +568,10 @@ function register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerI
         if (buf.startsWith('EAJIJSON ')) { try { info = JSON.parse(buf.slice(9)); } catch (e) { /* rien */ } }
         try {
           const file = info && info.filepath && fs.existsSync(info.filepath) ? info.filepath
-            : (fs.readdirSync(IMPORT_DIR).filter((f) => f.startsWith(job.id + '.')).map((f) => path.join(IMPORT_DIR, f))[0] || null);
+            : (fs.readdirSync(IMPORT_DIR).filter((f) => f.startsWith(job.id + '.') && !/\.f\d+\./.test(f)).map((f) => path.join(IMPORT_DIR, f))[0] || null);
           if (code !== 0 || !file) {
-            await db.query("UPDATE import_jobs SET status = 'echec', error = $2, finished_at = now() WHERE id = $1", [job.id, importErrorText(err)]);
+            if (err.trim() || outTail) console.warn('[Eaji] Import par lien échoué :', (err + ' ' + outTail).trim().slice(-300));
+            await db.query("UPDATE import_jobs SET status = 'echec', error = $2, finished_at = now() WHERE id = $1", [job.id, importErrorText(err + '\n' + outTail)]);
           } else {
             const size = fs.statSync(file).size;
             const ext = path.extname(file).slice(1).toLowerCase() || (info && info.ext) || 'mp4';
@@ -590,4 +638,4 @@ function register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerI
   return { repost, mergeRepostsIntoFeed, countRepostView, repostItems, importSiteOf };
 }
 
-module.exports = { MIGRATIONS, register, linkGuard, phishGuard, phishReason, dangerousLinks, findLinks, blockedLinks, isEajiLink, importSiteOf, LINK_BLOCKED_MESSAGE, PHISH_MESSAGE };
+module.exports = { MIGRATIONS, register, linkGuard, phishGuard, phishReason, dangerousLinks, findLinks, blockedLinks, isEajiLink, importSiteOf, resolveShareLink, importErrorText, LINK_BLOCKED_MESSAGE, PHISH_MESSAGE };
