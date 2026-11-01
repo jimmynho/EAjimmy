@@ -35,7 +35,10 @@ const LANGUES = { fr: 'français', en: 'anglais', ln: 'lingala', sw: 'swahili', 
 class ErrUtil extends Error {}
 
 module.exports = function monterOngd(app, options = {}) {
-  const pool = options.pool || new Pool({ connectionString: process.env.DATABASE_URL });
+  const pool = options.pool || new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false, // comme Eaji
+  });
   const q = (sql, params) => pool.query(sql, params);
   const r = express.Router();
 
@@ -63,7 +66,8 @@ module.exports = function monterOngd(app, options = {}) {
     const y = crypto.createHash('sha256').update(String(b)).digest();
     return crypto.timingSafeEqual(x, y);
   };
-  const ipDe = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  // Vraie adresse du visiteur (server.js règle « trust proxy » comme Eaji : impossible de la falsifier)
+  const ipDe = req => String(req.ip || req.socket.remoteAddress || '');
   const nouvelleRef = prefixe => prefixe + Date.now().toString(36).toUpperCase() + crypto.randomBytes(3).toString('hex').toUpperCase();
   const cinetpay = () => ({
     apikey: process.env.CINETPAY_APIKEY || process.env.CINETPAY_API_KEY,
