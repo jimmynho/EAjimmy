@@ -104,8 +104,10 @@ module.exports = function monterOngd(app, options = {}) {
   }, 10 * 60000).unref();
 
   /* ---------- Journal de sécurité ---------- */
-  const journal = (type, req, detail) =>
-    q('INSERT INTO ongd_journal(type, ip, detail) VALUES($1,$2,$3)', [type, req ? ipDe(req) : null, txt(detail, 500) || null]).catch(() => {});
+  const journal = (type, req, detail) => {
+    const qui = req && req.ongd && req.ongd.admin ? ` (par ${req.ongd.admin.nom})` : '';
+    return q('INSERT INTO ongd_journal(type, ip, detail) VALUES($1,$2,$3)', [type, req ? ipDe(req) : null, txt((detail || '') + qui, 500) || null]).catch(() => {});
+  };
 
   /* ---------- Réglages modifiables par l'admin ---------- */
   const REGLAGES_DEFAUT = {
@@ -118,6 +120,8 @@ module.exports = function monterOngd(app, options = {}) {
     prix_video_usd: 20,                               // vidéos (prix par défaut)
     cotisation_honneur_usd: 100,                      // membre d'honneur, par trimestre
     cotisation_vip_usd: 200,                          // membre VIP, par trimestre
+    absence: { actif: false, jusqu: '', message: '' }, // l'équipe est absente : l'assistant IA répond à tout
+    jours_feries_supp: [],                            // jours fériés en plus (AAAA-MM-JJ)
   };
   async function reglage(cle) {
     const { rows } = await q('SELECT valeur FROM ongd_reglages WHERE cle = $1', [cle]);
@@ -156,11 +160,24 @@ module.exports = function monterOngd(app, options = {}) {
     } catch (e) { derniereErreurIa = 'Anthropic injoignable : ' + e.message; console.error('[ONGD] IA', derniereErreurIa); return null; }
     finally { clearTimeout(minuterie); }
   }
+  /* ---------- Équipe présente ou absente (congés, jours fériés) ---------- */
+  const FERIES_RDC = { '01-01': 'Nouvel An', '01-04': 'Martyrs de l\'indépendance', '01-16': 'Mzee Laurent-Désiré Kabila', '01-17': 'Patrice Emery Lumumba',
+    '04-06': 'Simon Kimbangu', '05-01': 'Fête du Travail', '05-17': 'Révolution et libération', '06-30': 'Indépendance', '08-01': 'Fête des parents',
+    '08-02': 'Génocide congolais (Genocost)', '12-25': 'Noël' };
+  const aujourdhui = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Kinshasa', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+  async function equipeAbsente() {
+    const jour = aujourdhui(), a = await reglage('absence') || {};
+    if (a.actif && (!a.jusqu || jour <= a.jusqu)) return { absent: true, raison: 'l\'équipe est en congé', retour: a.jusqu || null, message: a.message || '' };
+    if (FERIES_RDC[jour.slice(5)]) return { absent: true, raison: 'jour férié : ' + FERIES_RDC[jour.slice(5)], retour: null, message: a.message || '' };
+    if ((await reglage('jours_feries_supp') || []).includes(jour)) return { absent: true, raison: 'jour férié', retour: null, message: a.message || '' };
+    return { absent: false };
+  }
   async function presentationIa() {
     const infos = await reglage('infos_ia');
     return `Tu es l'assistant officiel de l'ONGD Les Volontaires, organisation non gouvernementale de développement reconnue en RD Congo, siège avenue Mobutu à Mbandaka (province de l'Équateur). Site : ${SITE_URL}. WhatsApp : +243 850 171 480 et +243 823 239 572. E-mail : lesvolontaires13@gmail.com.\nVision : former, autonomiser et inspirer à travers l'éducation et l'électricité pour un avenir durable et équitable. L'ONGD intervient dans 12 domaines, avec l'électricité au centre : village des volontaires pour la jeunesse technologique, création d'entreprises locales, festivals d'innovation, mobilisation de financements, plaidoyer pour les démunis, solutions sociales concrètes et construction (école, centre de formation), interpellation des autorités, valorisation des talents et paysages, promotion de l'épargne, eau et électricité (solaire, hydro, éolien), coopération internationale, santé et éducation.
 Sur le site on peut : voir les activités des volontaires, faire un don (Mobile Money ou carte), proposer un partenariat, devenir volontaire, s'inscrire aux formations et réserver une place aux événements, acheter dans la boutique, télécharger les documents et vidéos de l'ONGD, devenir membre d'honneur ou VIP, publier une annonce payante, discuter dans l'espace dialogue, suivre les lives et rejoindre les réunions virtuelles.
-${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : réponds avec chaleur, en phrases courtes, dans la langue de ton interlocuteur. N'invente jamais de chiffres, de dates, de prix ni de promesses : si tu ne sais pas, invite à écrire sur WhatsApp. Ne demande jamais de mot de passe, de code PIN ni de code de carte.`;
+${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (async () => { const e = await equipeAbsente();
+  return e.absent ? `AUJOURD'HUI L'ÉQUIPE EST ABSENTE (${e.raison}${e.retour ? ', retour après le ' + e.retour.split('-').reverse().join('/') : ''}). Tu la remplaces : réponds complètement à chaque demande, explique la marche à suivre sur le site, et précise que l'équipe confirmera à son retour.${e.message ? ' Message de l\'équipe : ' + e.message : ''}\n` : ''; })()}Règles : réponds avec chaleur, en phrases courtes, dans la langue de ton interlocuteur. N'invente jamais de chiffres, de dates, de prix ni de promesses : si tu ne sais pas, invite à écrire sur WhatsApp. Ne demande jamais de mot de passe, de code PIN ni de code de carte.`;
   }
 
   /* ---------- Paiements communs (dons, inscriptions, commandes, annonces) ---------- */
@@ -241,14 +258,40 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
       [token, role, volontaireId, heures]);
     return token;
   }
+  // Parties de l'administration qu'un administrateur secondaire peut recevoir
+  const SECTIONS = { activites: 'Activités (validation et publication)', volontaires: 'Volontaires, emploi et recrutements', dons: 'Dons',
+    messages: 'Messages : contacts et partenariats', formations: 'Formations et événements', boutique: 'Boutique et commandes', annonces: 'Annonces payantes',
+    dialogue: 'Espace de dialogue', direct: 'Lives et réunions', fichiers: 'Documents et vidéos', membres: 'Membres et consultations' };
+  const PREFIXES = [['/admin/activites', 'activites'], ['/admin/volontaires', 'volontaires'], ['/admin/dons', 'dons'], ['/admin/messages', 'messages'],
+    ['/admin/programmes', 'formations'], ['/admin/inscriptions', 'formations'], ['/admin/produits', 'boutique'], ['/admin/commandes', 'boutique'],
+    ['/admin/annonces', 'annonces'], ['/admin/sujets', 'dialogue'], ['/admin/reponses', 'dialogue'], ['/admin/directs', 'direct'],
+    ['/admin/fichiers', 'fichiers'], ['/admin/achats', 'fichiers'], ['/admin/membres', 'membres'], ['/admin/cotisations', 'membres'], ['/admin/consultations', 'membres']];
+  const PAIEMENT_SECTION = { DON: 'dons', INS: 'formations', CMD: 'boutique', PUB: 'annonces', TEL: 'fichiers', COT: 'membres' };
+  function sectionDe(chemin) {
+    if (/^\/admin\/(deconnexion|moi|resume)$/.test(chemin)) return null; // commun à tous les administrateurs
+    const m = /^\/admin\/paiements\/([A-Z]{3})/.exec(chemin);
+    if (m) return PAIEMENT_SECTION[m[1]] || 'principal';
+    for (const [p, sec] of PREFIXES) if (chemin === p || chemin.startsWith(p + '/') || chemin.startsWith(p + '.')) return sec;
+    return 'principal'; // réglages, sécurité, diagnostic, administrateurs…
+  }
   const exige = role => async (req, res, next) => {
     try {
       const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
       if (!token) return res.status(401).json({ erreur: 'Connectez-vous.' });
-      const { rows } = await q(`SELECT s.role, s.volontaire_id, v.statut, v.nom FROM ongd_sessions s
+      const { rows } = await q(`SELECT s.role, s.volontaire_id, s.admin_id, v.statut, v.nom FROM ongd_sessions s
         LEFT JOIN ongd_volontaires v ON v.id = s.volontaire_id WHERE s.token = $1 AND s.expire_le > now()`, [token]);
       const s = rows[0];
+      if (role === 'admin' && s && s.role === 'admin2') { // administrateur secondaire : seulement ses charges
+        const a = (await q('SELECT id, nom, telephone, charge, permissions, statut FROM ongd_admins WHERE id = $1', [s.admin_id])).rows[0];
+        if (!a || a.statut !== 'actif') return res.status(401).json({ erreur: 'Session expirée, reconnectez-vous.' });
+        const sec = sectionDe(req.path);
+        if (sec === 'principal') return res.status(403).json({ erreur: 'Réservé à l\'administrateur principal.' });
+        if (sec && !a.permissions.includes(sec)) return res.status(403).json({ erreur: 'Cette partie ne fait pas partie de vos charges.' });
+        req.ongd = { ...s, token, principal: false, admin: a };
+        return next();
+      }
       if (!s || s.role !== role) return res.status(401).json({ erreur: 'Session expirée, reconnectez-vous.' });
+      if (role === 'admin') s.principal = true;
       if (role === 'volontaire' && s.statut !== 'actif') return res.status(403).json({ erreur: "Votre compte volontaire n'est pas actif." });
       req.ongd = { ...s, token };
       next();
@@ -330,6 +373,11 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
   /* ================= PUBLIC ================= */
 
   r.get('/sante', (req, res) => res.json({ ok: true, paiement_en_ligne: cinetpayPret(), ia: iaPrete() }));
+  r.get('/equipe', wrap(async (req, res) => {
+    const e = await equipeAbsente();
+    res.set('Cache-Control', 'no-cache');
+    res.json({ absent: e.absent, raison: e.raison || null, retour: e.retour || null, message: e.message || null, ia: iaPrete() });
+  }));
 
   r.get('/stats', wrap(async (req, res) => {
     const [a, v, d] = await Promise.all([
@@ -433,7 +481,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     const modele = type === 'partenariat'
       ? `Bonjour ${b.nom},\n\nMerci pour votre proposition de partenariat${b.organisation ? ' au nom de ' + b.organisation : ''}. Notre équipe l'étudie et vous recontacte rapidement. Vous pouvez aussi nous écrire sur WhatsApp au +243 850 171 480.\n\nL'équipe de l'ONGD Les Volontaires`
       : `Bonjour ${b.nom},\n\nMerci pour votre message, il est bien arrivé. Notre équipe vous répond dès que possible. Pour une réponse plus rapide, écrivez-nous sur WhatsApp au +243 850 171 480.\n\nL'équipe de l'ONGD Les Volontaires`;
-    if (!(await reglage('reponses_auto'))) return modele;
+    if (!(await reglage('reponses_auto')) && !(await equipeAbsente()).absent) return modele;
     const texte = await ia(await presentationIa() + `\nTâche : écrire la réponse automatique immédiate à un message reçu sur le site (${type}). Remercie, réponds à ce que tu peux à partir des informations connues, dis que l'équipe reviendra vers la personne, sans rien promettre de précis. 90 mots maximum, signe "L'équipe de l'ONGD Les Volontaires".`,
       [{ role: 'user', content: `Message de ${b.nom}${b.organisation ? ' (' + b.organisation + ')' : ''}${b.sujet ? ', sujet : ' + b.sujet : ''} :\n${b.message}` }], 400, 9000);
     return texte || modele;
@@ -468,36 +516,45 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
   }));
 
   /* ----- Traduction automatique (mise en cache : chaque texte n'est traduit qu'une fois) ----- */
+  // Traduit par petits lots (15 textes), 4 lots en même temps ; si la réponse de l'IA est incomplète,
+  // le lot est coupé en deux et réessayé, au lieu d'être perdu.
+  const CONSIGNE_TRAD = langue => `Tu traduis le site web d'une ONGD congolaise du français vers le ${LANGUES[langue]}. Garde le sens, le ton chaleureux et la ponctuation ; ne traduis pas les noms propres (Les Volontaires, Mbandaka, Eaji, M-Pesa, Orange Money, Airtel Money, WhatsApp, CinetPay, RAWBANK), les montants, les adresses e-mail ni les numéros. Chaque élément est traduit seul, même s'il est court ou incomplet. Réponds UNIQUEMENT par un tableau JSON de chaînes, dans le même ordre et de même longueur que le tableau reçu, sans aucun autre texte.`;
+  async function traduireLot(langue, lot, profondeur = 0) {
+    const sortie = await ia(CONSIGNE_TRAD(langue), [{ role: 'user', content: JSON.stringify(lot) }], 6000, 60000);
+    let tab = null;
+    try { tab = JSON.parse(String(sortie || '').replace(/^[^[]*/, '').replace(/[^\]]*$/, '')); } catch {}
+    if (Array.isArray(tab) && tab.length === lot.length) return tab;
+    if (sortie == null || lot.length === 1 || profondeur > 3) return lot.map(() => null); // IA indisponible ou texte impossible
+    const m = Math.ceil(lot.length / 2);
+    return [...await traduireLot(langue, lot.slice(0, m), profondeur + 1), ...await traduireLot(langue, lot.slice(m), profondeur + 1)];
+  }
   let traduitsAujourdhui = 0, jourTrad = new Date().toDateString();
-  r.post('/traduire', anti(60, 60, 'traduire'), wrap(async (req, res) => {
+  r.post('/traduire', anti(400, 60, 'traduire'), wrap(async (req, res) => {
     const langue = String(req.body?.langue || '');
     if (!LANGUES[langue] || langue === 'fr') throw new ErrUtil('Langue non disponible.');
     const textes = [...new Set((Array.isArray(req.body?.textes) ? req.body.textes : []).map(s => txt(s, 2000)).filter(Boolean))].slice(0, 120);
     const h = s => crypto.createHash('sha1').update(s).digest('hex');
     const resultat = {};
-    if (!textes.length) return res.json({ traductions: resultat });
+    if (!textes.length) return res.json({ traductions: resultat, complet: true });
     const { rows } = await q('SELECT hash, texte FROM ongd_traductions WHERE langue = $1 AND hash = ANY($2)', [langue, textes.map(h)]);
     const connus = new Map(rows.map(x => [x.hash, x.texte]));
     const manquants = textes.filter(s => { const t = connus.get(h(s)); if (t) resultat[s] = t; return !t; });
     if (jourTrad !== new Date().toDateString()) { jourTrad = new Date().toDateString(); traduitsAujourdhui = 0; }
-    if (manquants.length && iaPrete() && traduitsAujourdhui < 4000) {
-      for (let i = 0; i < manquants.length; i += 40) {
-        const lot = manquants.slice(i, i + 40);
-        const sortie = await ia(`Tu traduis le site web d'une ONGD congolaise du français vers le ${LANGUES[langue]}. Garde le sens, le ton chaleureux et la ponctuation ; ne traduis pas les noms propres (Les Volontaires, Mbandaka, Eaji, M-Pesa, WhatsApp, CinetPay), les montants, ni les numéros. Réponds UNIQUEMENT par un tableau JSON de chaînes, dans le même ordre et de même longueur que le tableau reçu.`,
-          [{ role: 'user', content: JSON.stringify(lot) }], 4000, 40000);
-        let tab = null;
-        try { tab = JSON.parse(String(sortie || '').replace(/^[^[]*/, '').replace(/[^\]]*$/, '')); } catch {}
-        if (!Array.isArray(tab) || tab.length !== lot.length) continue;
-        traduitsAujourdhui += lot.length;
-        for (const [j, s] of lot.entries()) {
-          const t = txt(tab[j], 4000); if (!t) continue;
-          resultat[s] = t;
-          await q('INSERT INTO ongd_traductions(hash, langue, texte) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [h(s), langue, t]);
-        }
+    if (manquants.length && iaPrete() && traduitsAujourdhui < 20000) {
+      const lots = []; for (let i = 0; i < manquants.length; i += 15) lots.push(manquants.slice(i, i + 15));
+      for (let i = 0; i < lots.length; i += 4) {
+        await Promise.all(lots.slice(i, i + 4).map(async lot => {
+          const tab = await traduireLot(langue, lot);
+          for (const [j, s] of lot.entries()) {
+            const t = txt(tab[j], 4000); if (!t) continue;
+            resultat[s] = t; traduitsAujourdhui++;
+            await q('INSERT INTO ongd_traductions(hash, langue, texte) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [h(s), langue, t]);
+          }
+        }));
       }
     }
     const complet = Object.keys(resultat).length === textes.length;
-    res.json({ traductions: resultat, complet, raison: complet ? undefined : (!iaPrete() ? 'clé IA absente du serveur' : derniereErreurIa || undefined) });
+    res.json({ traductions: resultat, complet, raison: complet ? undefined : (!iaPrete() ? 'clé IA absente du serveur' : derniereErreurIa || 'réessayez dans un instant') });
   }));
 
   /* ================= VOLONTAIRES ================= */
@@ -571,7 +628,19 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     if (echecs.rows[0].n_ip >= 5 || echecs.rows[0].n_total >= 20)
       return res.status(429).json({ erreur: 'Trop de tentatives : accès bloqué 30 minutes par sécurité.' });
     const t = tel(req.body?.telephone);
-    if (!ADMIN_PHONES.includes(t) || !egal(String(req.body?.mot_de_passe || ''), attendu)) {
+    if (!ADMIN_PHONES.includes(t)) { // administrateur secondaire
+      const a = (await q('SELECT * FROM ongd_admins WHERE telephone = $1', [t])).rows[0];
+      if (!a || !verifierMdp(String(req.body?.mot_de_passe || ''), a.mdp_hash)) {
+        journal('echec_connexion_admin', req, t ? '+' + t : 'numéro vide');
+        return res.status(401).json({ erreur: 'Numéro ou mot de passe incorrect.' });
+      }
+      if (a.statut !== 'actif') return res.status(403).json({ erreur: 'Ce compte administrateur est suspendu. Contactez l\'administrateur principal.' });
+      journal('connexion_admin_secondaire', req, `${a.nom} (+${t})`);
+      const token = crypto.randomBytes(32).toString('hex');
+      await q("INSERT INTO ongd_sessions(token, role, admin_id, expire_le) VALUES($1, 'admin2', $2, now() + interval '12 hours')", [token, a.id]);
+      return res.json({ token });
+    }
+    if (!egal(String(req.body?.mot_de_passe || ''), attendu)) {
       journal('echec_connexion_admin', req, t ? '+' + t : 'numéro vide');
       return res.status(401).json({ erreur: 'Numéro ou mot de passe incorrect.' });
     }
@@ -588,6 +657,59 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
   }));
 
   const admin = exige('admin');
+
+  r.get('/admin/moi', admin, wrap(async (req, res) => {
+    if (req.ongd.principal) return res.json({ principal: true, nom: 'Administrateur principal', permissions: Object.keys(SECTIONS), sections: SECTIONS });
+    const a = req.ongd.admin;
+    res.json({ principal: false, nom: a.nom, charge: a.charge, permissions: a.permissions, sections: SECTIONS });
+  }));
+
+  /* ----- Administrateurs secondaires (gérés par l'administrateur principal seulement) ----- */
+  const permissionsValides = p => { const l = (Array.isArray(p) ? p : []).filter(x => SECTIONS[x]); if (!l.length) throw new ErrUtil('Cochez au moins une charge.'); return [...new Set(l)]; };
+  r.get('/admin/admins', admin, wrap(async (req, res) => {
+    const { rows } = await q(`SELECT a.id, a.nom, a.telephone, a.charge, a.permissions, a.statut, a.cree_le,
+      (SELECT max(j.cree_le) FROM ongd_journal j WHERE j.type = 'connexion_admin_secondaire' AND j.detail LIKE '%(+' || a.telephone || ')%') AS derniere_connexion
+      FROM ongd_admins a ORDER BY a.id`);
+    res.json({ admins: rows, sections: SECTIONS });
+  }));
+  r.post('/admin/admins', admin, wrap(async (req, res) => {
+    const b = req.body || {}, nom = txt(b.nom, 120), telephone = tel(b.telephone), charge = txt(b.charge, 120);
+    if (nom.length < 2) throw new ErrUtil('Indiquez le nom.');
+    if (telephone.length < 10 || telephone.length > 15) throw new ErrUtil('Numéro de téléphone invalide.');
+    if (ADMIN_PHONES.includes(telephone)) throw new ErrUtil('Ce numéro est celui de l\'administrateur principal.');
+    if (String(b.mot_de_passe || '').length < 8) throw new ErrUtil('Le mot de passe doit avoir au moins 8 caractères.');
+    const { rowCount } = await q('INSERT INTO ongd_admins(nom, telephone, charge, permissions, mdp_hash) VALUES($1,$2,$3,$4,$5) ON CONFLICT (telephone) DO NOTHING',
+      [nom, telephone, charge || null, JSON.stringify(permissionsValides(b.permissions)), hacher(String(b.mot_de_passe))]);
+    if (!rowCount) throw new ErrUtil('Ce numéro a déjà un compte administrateur.');
+    journal('admin_secondaire_cree', req, `${nom} (+${telephone}) : ${charge}`);
+    res.status(201).json({ ok: true, message: 'Administrateur ajouté. Donnez-lui son numéro et son mot de passe pour se connecter sur admin.html.' });
+  }));
+  r.patch('/admin/admins/:id', admin, wrap(async (req, res) => {
+    const id = parseInt(req.params.id, 10), b = req.body || {};
+    const a = (await q('SELECT * FROM ongd_admins WHERE id = $1', [id])).rows[0];
+    if (!a) throw new ErrUtil('Administrateur introuvable.');
+    if (b.permissions !== undefined || b.charge !== undefined || b.nom !== undefined)
+      await q('UPDATE ongd_admins SET nom = $2, charge = $3, permissions = $4 WHERE id = $1', [id, txt(b.nom ?? a.nom, 120), txt(b.charge ?? a.charge, 120) || null,
+        JSON.stringify(b.permissions !== undefined ? permissionsValides(b.permissions) : a.permissions)]);
+    if (b.mot_de_passe !== undefined) {
+      if (String(b.mot_de_passe).length < 8) throw new ErrUtil('Le mot de passe doit avoir au moins 8 caractères.');
+      await q('UPDATE ongd_admins SET mdp_hash = $2 WHERE id = $1', [id, hacher(String(b.mot_de_passe))]);
+    }
+    if (b.statut !== undefined) {
+      if (!['actif', 'suspendu'].includes(b.statut)) throw new ErrUtil('Statut inconnu.');
+      await q('UPDATE ongd_admins SET statut = $2 WHERE id = $1', [id, b.statut]);
+    }
+    // Mot de passe changé, suspension ou nouvelles charges : ses sessions ouvertes sont fermées
+    await q('DELETE FROM ongd_sessions WHERE admin_id = $1', [id]);
+    journal('admin_secondaire_modifie', req, `${a.nom} : ${Object.keys(b).join(', ')}`);
+    res.json({ ok: true, message: 'Modifications enregistrées. L\'administrateur devra se reconnecter.' });
+  }));
+  r.delete('/admin/admins/:id', admin, wrap(async (req, res) => {
+    const a = (await q('DELETE FROM ongd_admins WHERE id = $1 RETURNING nom', [parseInt(req.params.id, 10)])).rows[0];
+    if (!a) throw new ErrUtil('Administrateur introuvable.');
+    journal('admin_secondaire_supprime', req, a.nom);
+    res.json({ ok: true, message: 'Administrateur supprimé.' });
+  }));
 
   r.post('/admin/deconnexion', admin, wrap(async (req, res) => {
     await q('DELETE FROM ongd_sessions WHERE token = $1', [req.ongd.token]);
@@ -725,6 +847,10 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     if (b.reponses_auto !== undefined) await ecrireReglage('reponses_auto', !!b.reponses_auto);
     if (b.mots_interdits !== undefined) await ecrireReglage('mots_interdits',
       String(b.mots_interdits).split(/[,\n]/).map(s => s.trim().toLowerCase()).filter(Boolean).slice(0, 300));
+    if (b.absence !== undefined) await ecrireReglage('absence', { actif: !!b.absence.actif,
+      jusqu: /^\d{4}-\d{2}-\d{2}$/.test(b.absence.jusqu || '') ? b.absence.jusqu : '', message: txt(b.absence.message, 500) });
+    if (b.jours_feries_supp !== undefined) await ecrireReglage('jours_feries_supp',
+      String(b.jours_feries_supp).split(/[\s,]+/).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).slice(0, 60));
     for (const cle of ['prix_document_usd', 'prix_video_usd', 'cotisation_honneur_usd', 'cotisation_vip_usd']) if (b[cle] !== undefined) {
       const v = Number(b[cle]); if (!(Number.isInteger(v) && v >= 0 && v <= 100000)) throw new ErrUtil('Prix invalide (nombre entier de dollars).');
       await ecrireReglage(cle, v);
@@ -779,7 +905,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
   /* ---------- Fonctions supplémentaires (formations, boutique, annonces, dialogue, direct) ---------- */
   const ctx = { r, pool, q, wrap, anti, antiRobot, exige, admin, txt, tel, ErrUtil, imagesValides, nouvelleRef, initierPaiement,
     verifierCinetpay, marquerPaye, typeDe, surPaiement, journal, reglage, prixEn, ia, iaPrete, presentationIa, creerSession, ipDe, envoyerCsv, DEVISES,
-    stockage: options.stockage, detailsPaiement: {} };
+    stockage: options.stockage, detailsPaiement: {}, equipeAbsente };
   const extensions = require('./ongd-extensions')(ctx);
   const membres = require('./ongd-membres')(ctx);
   options.contexteIa = async () => [await extensions.contexteIa(), await membres.contexteIa()].join('\n');
@@ -819,6 +945,10 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     CREATE TABLE IF NOT EXISTS ongd_journal (
       id SERIAL PRIMARY KEY, cree_le TIMESTAMPTZ NOT NULL DEFAULT now(), type TEXT NOT NULL, ip TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS ongd_traductions (hash TEXT NOT NULL, langue TEXT NOT NULL, texte TEXT NOT NULL, PRIMARY KEY (hash, langue));
+    CREATE TABLE IF NOT EXISTS ongd_admins (
+      id SERIAL PRIMARY KEY, nom TEXT NOT NULL, telephone TEXT UNIQUE NOT NULL, charge TEXT, permissions JSONB NOT NULL DEFAULT '[]',
+      mdp_hash TEXT NOT NULL, statut TEXT NOT NULL DEFAULT 'actif', cree_le TIMESTAMPTZ NOT NULL DEFAULT now());
+    ALTER TABLE ongd_sessions ADD COLUMN IF NOT EXISTS admin_id INT REFERENCES ongd_admins(id) ON DELETE CASCADE;
   `).then(() => extensions.creerTables()).then(() => membres.creerTables())
     .then(() => console.log('[ONGD] Les Volontaires : tables prêtes'))
     .catch(e => console.error('[ONGD] création des tables', e.message));

@@ -38,7 +38,7 @@ module.exports = function (ctx) {
     if (!x || !x.image) return res.sendStatus(404);
     if (table === 'ongd_annonces' && x.statut !== 'active') {
       const t = String(req.query.t || '');
-      if (!t || !(await q("SELECT 1 FROM ongd_sessions WHERE token = $1 AND role = 'admin' AND expire_le > now()", [t])).rowCount) return res.sendStatus(404);
+      if (!t || !(await q("SELECT 1 FROM ongd_sessions WHERE token = $1 AND role IN ('admin', 'admin2') AND expire_le > now()", [t])).rowCount) return res.sendStatus(404);
       res.set('Cache-Control', 'private, no-store');
     } else res.set('Cache-Control', 'public, max-age=3600');
     res.type(x.image_type).send(x.image);
@@ -318,7 +318,7 @@ module.exports = function (ctx) {
   /* ================= ESPACE DE DIALOGUE ================= */
   const CATEGORIES = ['Questions', 'Idées', 'Témoignages', 'Volontariat', 'Autre'];
   async function repondreAuto(sujetId, titre, message) {
-    if (!iaPrete() || !(await reglage('reponses_auto'))) return;
+    if (!iaPrete() || !((await reglage('reponses_auto')) || (await ctx.equipeAbsente()).absent)) return;
     const texte = await ia(await presentationIa() + '\nTâche : tu réponds publiquement à un nouveau sujet de l\'espace de dialogue du site. Réponse utile et bienveillante, 120 mots maximum. Si la question demande une décision de l\'équipe, dis que l\'équipe va compléter.',
       [{ role: 'user', content: `Sujet : ${titre}\n\n${message}` }], 500, 20000);
     if (texte) await q("INSERT INTO ongd_reponses(sujet_id, nom, message, auto) VALUES($1, 'Assistant de l''ONGD', $2, true)", [sujetId, texte]);
