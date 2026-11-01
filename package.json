@@ -17,7 +17,7 @@
     "@aws-sdk/s3-request-presigner": "^3.600.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   },
   "optionalDependencies": {
     "ffmpeg-static": "^5.2.0"
