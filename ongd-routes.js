@@ -1,10 +1,11 @@
 'use strict';
 /*
- * ONGD Les Volontaires — module serveur (site lesvolontaires.eaji.org)
+ * ONGD Les Volontaires — module serveur (site ongdlesvolontaires.eaji.org)
  * ---------------------------------------------------------------------
  * Ces deux fichiers s'ajoutent au serveur Eaji (dépôt EAjimmy, sur Railway) :
  *     ongd-routes.js      (ce fichier : dons, activités, volontaires, sécurité, IA, traduction)
  *     ongd-extensions.js  (formations, réservations, boutique, annonces, dialogue, réunions et lives)
+ *     ongd-membres.js     (fichiers payants, membres d'honneur et VIP, consultations)
  * Dans server.js, juste APRÈS la ligne `const app = express();`, ajoutez :
  *
  *     require('./ongd-routes')(app);
@@ -17,7 +18,7 @@
  *   ONGD_ADMIN_PASSWORD   mot de passe du panneau admin de l'ONGD (10 caractères minimum)
  *   ANTHROPIC_API_KEY     clé de l'assistant IA, de la traduction et des réponses automatiques
  *   ONGD_IA_MODELE        (facultative) modèle IA, par défaut claude-haiku-5-5
- *   ONGD_SITE_URL         (facultative) par défaut https://lesvolontaires.eaji.org
+ *   ONGD_SITE_URL         (facultative) par défaut https://ongdlesvolontaires.eaji.org
  *   ONGD_ADMIN_PHONES     (facultative) par défaut les deux numéros de l'administrateur principal
  *   ONGD_2FA_SECOURS      (facultative) mettre 1 UNIQUEMENT si vous perdez votre téléphone d'authentification
  */
@@ -27,7 +28,7 @@ const { Pool } = require('pg');
 
 const ADMIN_PHONES = (process.env.ONGD_ADMIN_PHONES || '243823239572,243850171480')
   .split(',').map(s => s.replace(/\D/g, '')).filter(Boolean);
-const SITE_URL = (process.env.ONGD_SITE_URL || 'https://lesvolontaires.eaji.org').replace(/\/$/, '');
+const SITE_URL = (process.env.ONGD_SITE_URL || 'https://ongdlesvolontaires.eaji.org').replace(/\/$/, '');
 const CINETPAY_URL = 'https://api-checkout.cinetpay.com/v2/payment';
 const DEVISES = ['USD', 'CDF'];
 const LANGUES = { fr: 'français', en: 'anglais', ln: 'lingala', sw: 'swahili', kg: 'kikongo', lua: 'tshiluba', pt: 'portugais', es: 'espagnol', ar: 'arabe' };
@@ -113,6 +114,10 @@ module.exports = function monterOngd(app, options = {}) {
     infos_ia: '',                                     // informations supplémentaires pour l'assistant
     reponses_auto: true,                              // réponses automatiques aux messages et au dialogue
     mots_interdits: [],
+    prix_document_usd: 10,                            // PDF, PowerPoint, photos… (prix par défaut)
+    prix_video_usd: 20,                               // vidéos (prix par défaut)
+    cotisation_honneur_usd: 100,                      // membre d'honneur, par trimestre
+    cotisation_vip_usd: 200,                          // membre VIP, par trimestre
   };
   async function reglage(cle) {
     const { rows } = await q('SELECT valeur FROM ongd_reglages WHERE cle = $1', [cle]);
@@ -145,7 +150,7 @@ module.exports = function monterOngd(app, options = {}) {
   async function presentationIa() {
     const infos = await reglage('infos_ia');
     return `Tu es l'assistant officiel de l'ONGD Les Volontaires, organisation non gouvernementale de développement reconnue en RD Congo, siège avenue Mobutu à Mbandaka (province de l'Équateur). Site : ${SITE_URL}. WhatsApp : +243 850 171 480.
-Sur le site on peut : voir les activités des volontaires, faire un don (Mobile Money ou carte), proposer un partenariat, devenir volontaire, s'inscrire aux formations et réserver une place aux événements, acheter dans la boutique, publier une annonce payante, discuter dans l'espace dialogue, suivre les lives et rejoindre les réunions virtuelles.
+Sur le site on peut : voir les activités des volontaires, faire un don (Mobile Money ou carte), proposer un partenariat, devenir volontaire, s'inscrire aux formations et réserver une place aux événements, acheter dans la boutique, télécharger les documents et vidéos de l'ONGD, devenir membre d'honneur ou VIP, publier une annonce payante, discuter dans l'espace dialogue, suivre les lives et rejoindre les réunions virtuelles.
 ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : réponds avec chaleur, en phrases courtes, dans la langue de ton interlocuteur. N'invente jamais de chiffres, de dates, de prix ni de promesses : si tu ne sais pas, invite à écrire sur WhatsApp. Ne demande jamais de mot de passe, de code PIN ni de code de carte.`;
   }
 
@@ -155,6 +160,8 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     INS: { table: 'ongd_inscriptions', paye: 'confirme', annule: 'annule', retour: ref => `${SITE_URL}/paiement.html?ref=${ref}` },
     CMD: { table: 'ongd_commandes', paye: 'payee', annule: 'annulee', retour: ref => `${SITE_URL}/paiement.html?ref=${ref}` },
     PUB: { table: 'ongd_annonces', paye: 'payee', annule: 'refusee', retour: ref => `${SITE_URL}/paiement.html?ref=${ref}` },
+    TEL: { table: 'ongd_achats', paye: 'paye', annule: 'annule', retour: ref => `${SITE_URL}/paiement.html?ref=${ref}` },
+    COT: { table: 'ongd_cotisations', paye: 'paye', annule: 'annule', retour: ref => `${SITE_URL}/paiement.html?ref=${ref}` },
   };
   const typeDe = ref => TYPES_PAIEMENT[String(ref || '').slice(0, 3)];
   const surPaiement = {}; // actions déclenchées quand un paiement est confirmé (ex. stock de la boutique)
@@ -585,7 +592,9 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
       (SELECT count(*)::int FROM ongd_messages WHERE NOT traite) messages,
       (SELECT count(*)::int FROM ongd_inscriptions WHERE statut = 'declare') inscriptions,
       (SELECT count(*)::int FROM ongd_commandes WHERE statut IN ('declare', 'payee')) commandes,
-      (SELECT count(*)::int FROM ongd_annonces WHERE statut IN ('declare', 'payee')) annonces`);
+      (SELECT count(*)::int FROM ongd_annonces WHERE statut IN ('declare', 'payee')) annonces,
+      (SELECT count(*)::int FROM ongd_achats WHERE statut = 'declare') achats,
+      (SELECT count(*)::int FROM ongd_cotisations WHERE statut = 'declare') + (SELECT count(*)::int FROM ongd_consultations WHERE statut = 'proposee') membres`);
     const dons = await q("SELECT devise, sum(montant)::float total, count(*)::int nombre FROM ongd_dons WHERE statut = 'paye' GROUP BY devise");
     res.json({ en_attente: rows[0], dons_recus: dons.rows, paiement_en_ligne: cinetpayPret(), ia: iaPrete() });
   }));
@@ -706,6 +715,10 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     if (b.reponses_auto !== undefined) await ecrireReglage('reponses_auto', !!b.reponses_auto);
     if (b.mots_interdits !== undefined) await ecrireReglage('mots_interdits',
       String(b.mots_interdits).split(/[,\n]/).map(s => s.trim().toLowerCase()).filter(Boolean).slice(0, 300));
+    for (const cle of ['prix_document_usd', 'prix_video_usd', 'cotisation_honneur_usd', 'cotisation_vip_usd']) if (b[cle] !== undefined) {
+      const v = Number(b[cle]); if (!(Number.isInteger(v) && v >= 0 && v <= 100000)) throw new ErrUtil('Prix invalide (nombre entier de dollars).');
+      await ecrireReglage(cle, v);
+    }
     journal('reglages_modifies', req, Object.keys(b).join(', '));
     res.json({ ok: true, message: 'Réglages enregistrés.' });
   }));
@@ -746,9 +759,11 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
 
   /* ---------- Fonctions supplémentaires (formations, boutique, annonces, dialogue, direct) ---------- */
   const ctx = { r, pool, q, wrap, anti, antiRobot, exige, admin, txt, tel, ErrUtil, imagesValides, nouvelleRef, initierPaiement,
-    verifierCinetpay, marquerPaye, typeDe, surPaiement, journal, reglage, prixEn, ia, iaPrete, presentationIa, creerSession, ipDe, envoyerCsv, DEVISES };
+    verifierCinetpay, marquerPaye, typeDe, surPaiement, journal, reglage, prixEn, ia, iaPrete, presentationIa, creerSession, ipDe, envoyerCsv, DEVISES,
+    stockage: options.stockage, detailsPaiement: {} };
   const extensions = require('./ongd-extensions')(ctx);
-  options.contexteIa = extensions.contexteIa;
+  const membres = require('./ongd-membres')(ctx);
+  options.contexteIa = async () => [await extensions.contexteIa(), await membres.contexteIa()].join('\n');
 
   app.use('/api/ongd', r);
 
@@ -785,7 +800,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     CREATE TABLE IF NOT EXISTS ongd_journal (
       id SERIAL PRIMARY KEY, cree_le TIMESTAMPTZ NOT NULL DEFAULT now(), type TEXT NOT NULL, ip TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS ongd_traductions (hash TEXT NOT NULL, langue TEXT NOT NULL, texte TEXT NOT NULL, PRIMARY KEY (hash, langue));
-  `).then(() => extensions.creerTables())
+  `).then(() => extensions.creerTables()).then(() => membres.creerTables())
     .then(() => console.log('[ONGD] Les Volontaires : tables prêtes'))
     .catch(e => console.error('[ONGD] création des tables', e.message));
 

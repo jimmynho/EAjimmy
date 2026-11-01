@@ -483,6 +483,7 @@ module.exports = function (ctx) {
     }
     if (out.type === 'CMD') Object.assign(out, { articles: x.articles, livraison: x.livraison });
     if (out.type === 'PUB') Object.assign(out, { titre: x.titre, jours: x.jours, fin: x.fin });
+    if (ctx.detailsPaiement && ctx.detailsPaiement[out.type]) await ctx.detailsPaiement[out.type](x, out);
     res.json(out);
   }));
 
