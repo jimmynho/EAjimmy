@@ -133,23 +133,32 @@ module.exports = function monterOngd(app, options = {}) {
 
   /* ---------- Intelligence artificielle (Claude) ---------- */
   const iaPrete = () => !!process.env.ANTHROPIC_API_KEY;
+  // Mêmes réglages qu'Eajimmy AI (ANTHROPIC_API_URL, ANTHROPIC_VERSION, ANTHROPIC_MODEL, ANTHROPIC_WORKSPACE_ID)
+  let derniereErreurIa = null;
   async function ia(system, messages, maxTokens = 700, delaiMs = 25000) {
-    if (!iaPrete()) return null;
+    if (!iaPrete()) { derniereErreurIa = 'ANTHROPIC_API_KEY absente du serveur'; return null; }
     const ctrl = new AbortController(), minuterie = setTimeout(() => ctrl.abort(), delaiMs);
     try {
-      const rep = await fetch('https://api.anthropic.com/v1/messages', {
+      const r0 = await fetch(process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages', {
         method: 'POST', signal: ctrl.signal,
-        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-        body: JSON.stringify({ model: process.env.ONGD_IA_MODELE || 'claude-haiku-5-5', max_tokens: maxTokens, system, messages }),
-      }).then(x => x.json());
-      if (rep.error) { console.error('[ONGD] IA', rep.error.message); return null; }
+        headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': process.env.ANTHROPIC_VERSION || '2023-06-01', 'content-type': 'application/json',
+          ...(process.env.ANTHROPIC_WORKSPACE_ID ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID } : {}) },
+        body: JSON.stringify({ model: process.env.ONGD_IA_MODELE || process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5', max_tokens: maxTokens, system, messages }),
+      });
+      const rep = await r0.json().catch(() => ({}));
+      if (!r0.ok || rep.error) {
+        derniereErreurIa = `Anthropic a répondu ${r0.status} : ${rep.error?.message || 'erreur inconnue'}`
+          + (r0.status === 401 ? ' (clé refusée : mal copiée ou supprimée)' : r0.status === 402 || /credit/i.test(rep.error?.message || '') ? ' (crédits épuisés)' : '');
+        console.error('[ONGD] IA', derniereErreurIa); return null;
+      }
+      derniereErreurIa = null;
       return (rep.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim() || null;
-    } catch (e) { console.error('[ONGD] IA injoignable', e.message); return null; }
+    } catch (e) { derniereErreurIa = 'Anthropic injoignable : ' + e.message; console.error('[ONGD] IA', derniereErreurIa); return null; }
     finally { clearTimeout(minuterie); }
   }
   async function presentationIa() {
     const infos = await reglage('infos_ia');
-    return `Tu es l'assistant officiel de l'ONGD Les Volontaires, organisation non gouvernementale de développement reconnue en RD Congo, siège avenue Mobutu à Mbandaka (province de l'Équateur). Site : ${SITE_URL}. WhatsApp : +243 850 171 480.
+    return `Tu es l'assistant officiel de l'ONGD Les Volontaires, organisation non gouvernementale de développement reconnue en RD Congo, siège avenue Mobutu à Mbandaka (province de l'Équateur). Site : ${SITE_URL}. WhatsApp : +243 850 171 480 et +243 823 239 572. E-mail : lesvolontaires13@gmail.com.\nVision : former, autonomiser et inspirer à travers l'éducation et l'électricité pour un avenir durable et équitable. L'ONGD intervient dans 12 domaines, avec l'électricité au centre : village des volontaires pour la jeunesse technologique, création d'entreprises locales, festivals d'innovation, mobilisation de financements, plaidoyer pour les démunis, solutions sociales concrètes et construction (école, centre de formation), interpellation des autorités, valorisation des talents et paysages, promotion de l'épargne, eau et électricité (solaire, hydro, éolien), coopération internationale, santé et éducation.
 Sur le site on peut : voir les activités des volontaires, faire un don (Mobile Money ou carte), proposer un partenariat, devenir volontaire, s'inscrire aux formations et réserver une place aux événements, acheter dans la boutique, télécharger les documents et vidéos de l'ONGD, devenir membre d'honneur ou VIP, publier une annonce payante, discuter dans l'espace dialogue, suivre les lives et rejoindre les réunions virtuelles.
 ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : réponds avec chaleur, en phrases courtes, dans la langue de ton interlocuteur. N'invente jamais de chiffres, de dates, de prix ni de promesses : si tu ne sais pas, invite à écrire sur WhatsApp. Ne demande jamais de mot de passe, de code PIN ni de code de carte.`;
   }
@@ -487,7 +496,8 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
         }
       }
     }
-    res.json({ traductions: resultat, complet: Object.keys(resultat).length === textes.length });
+    const complet = Object.keys(resultat).length === textes.length;
+    res.json({ traductions: resultat, complet, raison: complet ? undefined : (!iaPrete() ? 'clé IA absente du serveur' : derniereErreurIa || undefined) });
   }));
 
   /* ================= VOLONTAIRES ================= */
@@ -721,6 +731,15 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}Règles : 
     }
     journal('reglages_modifies', req, Object.keys(b).join(', '));
     res.json({ ok: true, message: 'Réglages enregistrés.' });
+  }));
+
+  /* ----- Diagnostic : vérifie l'IA, le stockage et le paiement ----- */
+  r.get('/admin/diagnostic', admin, wrap(async (req, res) => {
+    const out = { paiement: cinetpayPret() ? { ok: true, detail: 'CinetPay configuré' } : { ok: false, detail: 'CINETPAY_APIKEY / CINETPAY_SITE_ID absents : paiement manuel par Mobile Money' } };
+    const t = await ia('Réponds seulement : OK', [{ role: 'user', content: 'Test' }], 5, 15000);
+    out.ia = t ? { ok: true, detail: 'Assistant, traduction et réponses automatiques actifs (' + (process.env.ONGD_IA_MODELE || process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5') + ')' } : { ok: false, detail: derniereErreurIa };
+    out.stockage = ctx.testStockage ? await ctx.testStockage() : { ok: false, detail: 'module fichiers absent' };
+    res.json(out);
   }));
 
   /* ----- Sécurité ----- */

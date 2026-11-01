@@ -53,6 +53,18 @@ module.exports = function (ctx) {
   }
   const stoOuErreur = () => { const s = sto(); if (!s) throw new ErrUtil('Le stockage des fichiers n\'est pas configuré sur le serveur (variables B2_*).'); return s; };
 
+  // Test du stockage pour le diagnostic de l'administration
+  ctx.testStockage = async () => {
+    const s = sto();
+    if (!s) return { ok: false, detail: 'Variables B2_KEY_ID, B2_APP_KEY, B2_BUCKET, B2_ENDPOINT, B2_REGION absentes du serveur' };
+    try { await s.infos('ongd/test-' + Date.now()); return { ok: true, detail: 'Backblaze B2 joignable' }; }
+    catch (e) {
+      const code = e?.$metadata?.httpStatusCode;
+      if (code === 404 || e.name === 'NotFound') return { ok: true, detail: 'Backblaze B2 joignable (dossier ongd/)' };
+      return { ok: false, detail: 'Backblaze B2 refuse l\'accès : ' + (e.name || '') + ' ' + (code || e.message) };
+    }
+  };
+
   /* ---------- Prix ---------- */
   async function prixFichierUsd(f) {
     if (f.prix_usd != null) return Number(f.prix_usd);
