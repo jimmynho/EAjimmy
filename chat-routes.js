@@ -79,7 +79,7 @@ const MIGRATIONS = [
   'ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS shared_content_id UUID REFERENCES content_items(id) ON DELETE SET NULL',
 ];
 
-function register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, notify }) {
+function register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, notify, groupsOpen = async () => true }) {
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const checkId = (req, res, next) => (UUID_RE.test(req.params.id) ? next() : res.status(400).json({ error: 'Identifiant invalide.' }));
   const uuids = (list) => [...new Set((Array.isArray(list) ? list : []).map(String).filter((x) => UUID_RE.test(x)))];
@@ -169,7 +169,10 @@ function register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, n
        LEFT JOIN LATERAL (SELECT text, created_at, file_name, audio_key IS NOT NULL AS audio FROM group_messages
                           WHERE group_id = g.id ORDER BY id DESC LIMIT 1) lm ON TRUE
        ORDER BY COALESCE(lm.created_at, g.created_at) DESC`, [req.creatorId]);
-    res.json({ groups });
+    // Groupes protégés par le code secret : pas d'aperçu des messages tant qu'ils ne sont pas ouverts.
+    const open = await groupsOpen(req);
+    if (!open) for (const g of groups) { if (g.last_text || g.last_file || g.last_audio) g.last_text = '🔒'; g.last_file = null; g.last_audio = false; }
+    res.json({ groups, locked: !open });
   });
 
   app.get('/api/groups/:id', requireAuth, checkId, async (req, res) => {

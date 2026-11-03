@@ -47,6 +47,8 @@ const backupRoutes = require('./backup-routes');
 const adminAuth = require('./admin-auth-routes');
 // Agent Eaji : sécurité, aide aux utilisateurs, modération, montage IA (agent-routes.js).
 const agentRoutes = require('./agent-routes');
+// Code secret (portefeuille, groupes protégés) et contacts du téléphone (pin-routes.js).
+const pinRoutes = require('./pin-routes');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -245,6 +247,11 @@ async function runStartupMigrations() {
     'ALTER TABLE direct_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ',
     'ALTER TABLE calls ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ',
     'ALTER TABLE calls ADD COLUMN IF NOT EXISTS callee_seen BOOLEAN NOT NULL DEFAULT FALSE',
+    // Journal des appels (durée) et échange des chemins réseau pendant l'appel (son dans les deux sens).
+    'ALTER TABLE calls ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ',
+    'ALTER TABLE calls ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ',
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS caller_ice JSONB NOT NULL DEFAULT '[]'::jsonb",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS callee_ice JSONB NOT NULL DEFAULT '[]'::jsonb",
     // Arrière-plans virtuels (nature, maison, voitures, bureau…) ajoutés par l'administrateur principal.
     `CREATE TABLE IF NOT EXISTS backgrounds (
        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -280,6 +287,8 @@ async function runStartupMigrations() {
     ...watchRoutes.MIGRATIONS,
     // Agent Eaji (agent-routes.js).
     ...agentRoutes.MIGRATIONS,
+    // Code secret, groupes protégés, contacts du téléphone (pin-routes.js).
+    ...pinRoutes.MIGRATIONS,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -329,6 +338,10 @@ const notifyAdmins = (opts) => push.sendToAdmins(opts).catch(() => 0);
 const security = securityRoutes.makeSecurity({ db, notify, notifyAdmins });
 // « Mes connexions » : chaque connexion (appareil) a son identifiant, qu'on peut couper à distance.
 const sessions = accessRoutes.create({ db });
+
+// Code secret de 5 chiffres : protège le portefeuille et les groupes (contrôles placés avant toutes les routes).
+const pin = pinRoutes.register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken, notify, security,
+  normalizePhone: extrasRoutes.normalizePhone, phoneTail: extrasRoutes.phoneTail, createDownloadUrl, isBlockedBetween });
 
 // Route de test simple : permet de vérifier que l'API répond, en ouvrant
 // simplement ton domaine dans un navigateur.
@@ -963,9 +976,12 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
   if (isOwner) {
     const balance = await db.query('SELECT * FROM creator_balances WHERE creator_id = $1', [creator.id]);
     // Un compte neuf n'a pas encore de ligne de solde : on renvoie 0 au lieu de planter.
-    publicProfile.balance = balance ? balance.balance : 0;
+    // Solde et numéro de retrait : seulement avec le code secret (s'il en a un).
+    const walletOpen = await pin.unlocked(req);
+    publicProfile.balance = walletOpen ? (balance ? balance.balance : 0) : undefined;
     publicProfile.currency = balance ? balance.currency : 'USD';
-    publicProfile.withdrawalPhone = creator.withdrawal_phone;
+    publicProfile.withdrawalPhone = walletOpen ? creator.withdrawal_phone : undefined;
+    publicProfile.walletLocked = !walletOpen;
     publicProfile.countryCode = creator.country_code;
     publicProfile.city = creator.city;
     publicProfile.primaryContentType = creator.primary_content_type;
@@ -1865,7 +1881,7 @@ const kyc = kycRoutes.register({ app, db, requireAuth, requireAdminPermission, c
 const cycles = cyclesRoutes.register({ app, db, requireAuth, requireAdminPrincipal, notify, notifyAdmins, isMonetizedCreator, calculateMonthlyPayout });
 const money = moneyRoutes.register({
   app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify,
-  isIdentityVerified: kyc.isVerified, bcrypt, notifyAdmins, cycles,
+  isIdentityVerified: kyc.isVerified, bcrypt, notifyAdmins, cycles, walletOpen: (req) => pin.unlocked(req),
 });
 supportRoutes.register({ app, db, requireAuth, requireAdminPermission, notify, notifyAdmins,
   agentReply: (threadId, creatorId) => (agentRef ? agentRef.replyInThread(threadId, creatorId) : Promise.resolve()) });
@@ -1874,7 +1890,7 @@ advertiseRoutes.register({ app, db, requireAdminPrincipal, optionalViewerId, rat
 // Lecteur de musique : paroles des chansons (écrites par le créateur ou automatiques).
 const music = musicRoutes.register({ app, db, requireAuth, optionalViewerId });
 securityRoutes.register({ app, db, requireAdminPermission, security, notify });
-const chat = chatRoutes.register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, notify });
+const chat = chatRoutes.register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, notify, groupsOpen: (req) => pin.groupsOpen(req) });
 const watch = watchRoutes.register({ app, db, requireAdminPermission, requireAdminPrincipal, createDownloadUrl, STORAGE_CONNECTED });
 statusRoutes.register({ app, db, requireAuth, createDownloadUrl, isBlockedBetween, notify, STORAGE_CONNECTED, watch });
 const engage = engageRoutes.register({ app, db, requireAuth, requireAdminPrincipal, optionalViewerId, verifySessionToken, signSessionToken, notify, feedItems, security,
@@ -2157,14 +2173,14 @@ app.post('/api/calls', requireAuth, async (req, res) => {
   if (await isBlockedBetween(req.creatorId, calleeId)) return res.status(403).json({ error: 'Tu ne peux pas appeler ce compte.' });
   // Un ancien appel resté « en sonnerie » est considéré comme manqué.
   await db.query(
-    "UPDATE calls SET status = 'missed', updated_at = now() WHERE status = 'ringing' AND created_at < now() - interval '45 seconds'"
+    "UPDATE calls SET status = 'missed', updated_at = now() WHERE status = 'ringing' AND created_at < now() - interval '60 seconds'"
   );
   const call = await db.query(
     'INSERT INTO calls (caller_id, callee_id, kind, offer_sdp) VALUES ($1, $2, $3, $4) RETURNING id',
     [req.creatorId, calleeId, kind, String(offer)]
   );
   const caller = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
-  push.sendTo(calleeId, { kind: 'appel', urgent: true, ttl: 45, tag: `call:${call.id}`, link: `dm:${req.creatorId}`,
+  push.sendTo(calleeId, { kind: 'appel', urgent: true, ttl: 60, tag: `call:${call.id}`, link: `dm:${req.creatorId}`,
     title: kind === 'video' ? '🎥 Appel vidéo entrant' : '📞 Appel entrant', body: `${caller ? caller.name : 'Quelqu\'un'} t'appelle sur Eaji. Touche pour répondre.` });
   const ce = await db.query('SELECT last_seen_at FROM creators WHERE id = $1', [calleeId]);
   res.status(201).json({ callId: call.id, calleeOnline: isOnline(ce && ce.last_seen_at) });
@@ -2175,7 +2191,7 @@ app.get('/api/calls/incoming', requireAuth, async (req, res) => {
   const call = await db.query(
     `SELECT c.id, c.kind, c.offer_sdp, cr.name AS caller_name, c.caller_id
      FROM calls c JOIN creators cr ON cr.id = c.caller_id
-     WHERE c.callee_id = $1 AND c.status = 'ringing' AND c.created_at > now() - interval '45 seconds'
+     WHERE c.callee_id = $1 AND c.status = 'ringing' AND c.created_at > now() - interval '60 seconds'
      ORDER BY c.created_at DESC LIMIT 1`,
     [req.creatorId]
   );
@@ -2184,13 +2200,35 @@ app.get('/api/calls/incoming', requireAuth, async (req, res) => {
   res.json({ call: call || null });
 });
 
+// Journal des appels : entrants, sortants, manqués, refusés, avec leur durée.
+app.get('/api/calls/history', requireAuth, async (req, res) => {
+  const rows = await db.all(
+    `SELECT c.id, c.kind, c.status, c.created_at, c.answered_at, c.ended_at, c.caller_id = $1 AS outgoing,
+            o.id AS other_id, o.name AS other_name, o.photo_url AS other_photo
+     FROM calls c JOIN creators o ON o.id = CASE WHEN c.caller_id = $1 THEN c.callee_id ELSE c.caller_id END
+     WHERE (c.caller_id = $1 OR c.callee_id = $1) AND c.created_at > now() - interval '90 days'
+     ORDER BY c.created_at DESC LIMIT 100`, [req.creatorId]);
+  const calls = [];
+  for (const r of rows) {
+    const ringingOld = r.status === 'ringing' && Date.now() - new Date(r.created_at).getTime() > 60000;
+    const status = ringingOld ? 'missed' : r.status;
+    const end = r.ended_at ? new Date(r.ended_at) : (status === 'accepted' ? new Date() : null);
+    calls.push({ id: r.id, kind: r.kind, outgoing: r.outgoing, at: r.created_at, otherId: r.other_id, otherName: r.other_name,
+      otherPhotoUrl: await createDownloadUrl(r.other_photo).catch(() => null),
+      // manque = appel entrant sans réponse ; sans_reponse = appel sortant sans réponse
+      result: r.answered_at ? (status === 'accepted' ? 'en_cours' : 'repondu') : status === 'rejected' ? 'refuse' : status === 'ringing' ? 'sonne' : (r.outgoing ? 'sans_reponse' : 'manque'),
+      durationSeconds: r.answered_at && end ? Math.max(0, Math.round((end - new Date(r.answered_at)) / 1000)) : 0 });
+  }
+  res.json({ calls });
+});
 app.get('/api/calls/:id', requireAuth, async (req, res) => {
   const call = await db.query(
-    'SELECT id, status, kind, answer_sdp, caller_id, callee_id, created_at, delivered_at IS NOT NULL AS delivered FROM calls WHERE id = $1 AND (caller_id = $2 OR callee_id = $2)',
+    `SELECT id, status, kind, answer_sdp, caller_id, callee_id, created_at, answered_at, delivered_at IS NOT NULL AS delivered,
+            CASE WHEN caller_id = $2 THEN callee_ice ELSE caller_ice END AS ice FROM calls WHERE id = $1 AND (caller_id = $2 OR callee_id = $2)`,
     [req.params.id, req.creatorId]
   );
   if (!call) return res.status(404).json({ error: 'Appel introuvable.' });
-  if (call.status === 'ringing' && Date.now() - new Date(call.created_at).getTime() > 45000) {
+  if (call.status === 'ringing' && Date.now() - new Date(call.created_at).getTime() > 60000) {
     await db.query("UPDATE calls SET status = 'missed', updated_at = now() WHERE id = $1", [call.id]);
     call.status = 'missed';
   }
@@ -2199,16 +2237,30 @@ app.get('/api/calls/:id', requireAuth, async (req, res) => {
 
 app.post('/api/calls/:id/answer', requireAuth, async (req, res) => {
   const updated = await db.query(
-    "UPDATE calls SET answer_sdp = $1, status = 'accepted', updated_at = now() WHERE id = $2 AND callee_id = $3 AND status = 'ringing' RETURNING id",
+    "UPDATE calls SET answer_sdp = $1, status = 'accepted', answered_at = now(), updated_at = now() WHERE id = $2 AND callee_id = $3 AND status = 'ringing' RETURNING id",
     [String(req.body.answer || ''), req.params.id, req.creatorId]
   );
-  if (!updated) return res.status(409).json({ error: 'Cet appel n\'est plus disponible.' });
+  if (!updated) return res.status(409).json({ error: 'L\'appelant a raccroché : cet appel n\'est plus disponible.' });
   res.json({ accepted: true });
+});
+// Chemins réseau trouvés après le début de l'appel (envoyés au fur et à mesure) : l'autre téléphone les essaie aussi.
+// Sans cela, sur les réseaux mobiles, la connexion se fait mal ou le son ne passe que dans un sens.
+app.post('/api/calls/:id/ice', requireAuth, async (req, res) => {
+  const list = (Array.isArray(req.body.candidates) ? req.body.candidates : []).slice(0, 30)
+    .filter((c) => c && typeof c.candidate === 'string' && c.candidate.length < 600)
+    .map((c) => ({ candidate: c.candidate, sdpMid: c.sdpMid == null ? null : String(c.sdpMid).slice(0, 20), sdpMLineIndex: Number.isInteger(c.sdpMLineIndex) ? c.sdpMLineIndex : null }));
+  if (!list.length) return res.json({ added: 0 });
+  const r = await db.query(
+    `UPDATE calls SET caller_ice = CASE WHEN caller_id = $2 AND jsonb_array_length(caller_ice) < 80 THEN caller_ice || $3::jsonb ELSE caller_ice END,
+                      callee_ice = CASE WHEN callee_id = $2 AND jsonb_array_length(callee_ice) < 80 THEN callee_ice || $3::jsonb ELSE callee_ice END
+     WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted') RETURNING id`,
+    [req.params.id, req.creatorId, JSON.stringify(list)]);
+  res.json({ added: r ? list.length : 0 });
 });
 
 app.post('/api/calls/:id/reject', requireAuth, async (req, res) => {
   await db.query(
-    "UPDATE calls SET status = 'rejected', updated_at = now() WHERE id = $1 AND callee_id = $2 AND status = 'ringing'",
+    "UPDATE calls SET status = 'rejected', ended_at = now(), updated_at = now() WHERE id = $1 AND callee_id = $2 AND status = 'ringing'",
     [req.params.id, req.creatorId]
   );
   res.json({ rejected: true });
@@ -2216,7 +2268,7 @@ app.post('/api/calls/:id/reject', requireAuth, async (req, res) => {
 
 app.post('/api/calls/:id/end', requireAuth, async (req, res) => {
   await db.query(
-    "UPDATE calls SET status = CASE WHEN status = 'ringing' THEN 'missed' ELSE 'ended' END, updated_at = now() WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted')",
+    "UPDATE calls SET status = CASE WHEN status = 'ringing' THEN 'missed' ELSE 'ended' END, ended_at = now(), updated_at = now() WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted')",
     [req.params.id, req.creatorId]
   );
   res.json({ ended: true });
@@ -2224,12 +2276,12 @@ app.post('/api/calls/:id/end', requireAuth, async (req, res) => {
 
 // Appels manqués (affichés sur l'onglet Messages jusqu'à ce qu'on les ait vus).
 const MISSED_SQL = `c.callee_id = $1 AND NOT c.callee_seen AND (c.status = 'missed'
-  OR (c.status = 'ringing' AND c.created_at < now() - interval '45 seconds'))`;
+  OR (c.status = 'ringing' AND c.created_at < now() - interval '60 seconds'))`;
 app.get('/api/calls-missed', requireAuth, async (req, res) => {
   const calls = await db.all(
     `SELECT c.id, c.kind, c.created_at, c.caller_id, cr.name AS caller_name FROM calls c JOIN creators cr ON cr.id = c.caller_id
      WHERE c.callee_id = $1 AND c.status IN ('missed', 'ringing') AND c.created_at > now() - interval '30 days'
-       AND (c.status = 'missed' OR c.created_at < now() - interval '45 seconds')
+       AND (c.status = 'missed' OR c.created_at < now() - interval '60 seconds')
      ORDER BY c.created_at DESC LIMIT 20`, [req.creatorId]);
   const unseen = await db.query(`SELECT COUNT(*)::int AS n FROM calls c WHERE ${MISSED_SQL}`, [req.creatorId]);
   res.json({ calls, unseen: unseen.n });
@@ -2258,7 +2310,14 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
   conversations.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   const unread = await db.all('SELECT sender_id, COUNT(*)::int AS n FROM direct_messages WHERE recipient_id = $1 AND read_at IS NULL GROUP BY sender_id', [req.creatorId]);
   const unreadBy = new Map(unread.map((u) => [u.sender_id, u.n]));
-  for (const c of conversations) { c.online = isOnline(c.other_seen); c.unread = unreadBy.get(c.other_id) || 0; c.otherPhotoUrl = await createDownloadUrl(c.other_photo).catch(() => null); delete c.other_photo; }
+  // Conversations avec les contacts du téléphone : rangées dans « Groupes » (aperçu caché si les groupes sont protégés).
+  const contactIds = new Set((await db.all('SELECT contact_id FROM phone_contacts WHERE owner_id = $1', [req.creatorId])).map((r) => r.contact_id));
+  const groupsOpen = contactIds.size ? await pin.groupsOpen(req) : true;
+  for (const c of conversations) {
+    c.online = isOnline(c.other_seen); c.unread = unreadBy.get(c.other_id) || 0; c.otherPhotoUrl = await createDownloadUrl(c.other_photo).catch(() => null); delete c.other_photo;
+    c.isContact = contactIds.has(c.other_id);
+    if (c.isContact && !groupsOpen) c.last_text = '🔒';
+  }
   res.json({ conversations });
 });
 

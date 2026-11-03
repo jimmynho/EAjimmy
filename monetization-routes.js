@@ -244,7 +244,7 @@ function newReference() {
   return ref;
 }
 
-function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify = async () => {}, isIdentityVerified = async () => true, bcrypt = null, notifyAdmins = async () => {}, cycles = null }) {
+function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify = async () => {}, isIdentityVerified = async () => true, bcrypt = null, notifyAdmins = async () => {}, cycles = null, walletOpen = async () => true }) {
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   // Montant en devise locale (repli en dollars si le taux manque).
@@ -455,7 +455,7 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       `INSERT INTO payment_requests (reference, payer_id, purpose, target_id, amount_usd, amount_local, currency, description, payer_phone, via_repost_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
       [newReference(), req.creatorId, purpose, targetId, amountUsd, local.amount, local.currency, description, me.phone, viaRepost]);
-    res.status(existing ? 200 : 201).json({ payment: publicPayment(payment), paymentNumbers: null, methods: await methodsFor(req.creatorId) });
+    res.status(existing ? 200 : 201).json({ payment: publicPayment(payment), paymentNumbers: null, methods: await methodsFor(req.creatorId, req) });
   });
 
   function publicPayment(p) {
@@ -1368,7 +1368,9 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
   const onlinePayments = () => G.pawapayConfigured() || G.paypalConfigured() || G.cinetpayConfigured();
   const PENDING = ['INITIE', 'ACCEPTED', 'PROCESSING', 'IN_RECONCILIATION', 'ENQUEUED', 'CREATED', 'APPROVED', 'UNKNOWN'];
 
-  async function methodsFor(creatorId) {
+  async function methodsFor(creatorId, req) {
+    // Montant des gains : seulement si le portefeuille est ouvert avec le code secret (s'il y en a un).
+    const open = req ? await walletOpen(req) : true;
     const me = await db.query('SELECT country_code, phone FROM creators WHERE id = $1', [creatorId]);
     const cc = me ? me.country_code : null;
     const providers = G.pawapayConfigured() ? G.providersFor(cc) : [];
@@ -1377,12 +1379,13 @@ function register({ app, db, pool, requireAuth, requireAdminPrincipal, optionalV
       mobileMoney: providers.length ? { providers: providers.map((p) => ({ code: p.code, name: p.name })), dial: G.DIAL[cc], phone: msisdn ? msisdn.slice(G.DIAL[cc].length) : '', suggested: G.guessProvider(cc, msisdn) } : null,
       card: G.paypalConfigured(),
       cinetpay: G.cinetpayConfigured(),
-      earnings: (await earningsOf(creatorId)).available,
+      earnings: open ? (await earningsOf(creatorId)).available : undefined,
+      walletLocked: !open,
       manual: false,
       online: onlinePayments(),
     };
   }
-  app.get('/api/payments/methods', requireAuth, async (req, res) => res.json(await methodsFor(req.creatorId)));
+  app.get('/api/payments/methods', requireAuth, async (req, res) => res.json(await methodsFor(req.creatorId, req)));
 
   const FAILURES = {
     PAYER_NOT_FOUND: 'Ce numéro n\'a pas de compte mobile money chez cet opérateur.',
