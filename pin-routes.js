@@ -206,7 +206,7 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken,
     }
     res.json({ found, checked: wanted.size });
   });
-  // Mes contacts sur Eaji, avec le dernier message (caché si les groupes sont protégés et pas encore ouverts).
+  // Mes contacts sur Eaji (ordre alphabétique, avec leur photo), avec le dernier message (caché si les groupes sont protégés et pas encore ouverts).
   app.get('/api/phone-contacts', requireAuth, async (req, res) => {
     const r = await pinRow(req.creatorId);
     const open = !r.groups_locked || await unlocked(req, r);
@@ -220,7 +220,7 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken,
                           ORDER BY created_at DESC LIMIT 1) lm ON TRUE
        WHERE pc.owner_id = $1
          AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = cr.id AND b.blocked_id = $1) OR (b.blocker_id = $1 AND b.blocked_id = cr.id))
-       ORDER BY lm.created_at DESC NULLS LAST, cr.name LIMIT 500`, [req.creatorId]);
+       ORDER BY lower(cr.name), cr.name LIMIT 500`, [req.creatorId]); // ordre alphabétique
     const contacts = [];
     for (const c of rows) {
       contacts.push({ id: c.id, name: c.name, photoUrl: await createDownloadUrl(c.photo_url).catch(() => null),

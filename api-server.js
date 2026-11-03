@@ -332,7 +332,24 @@ const db = {
 // Notifications dans l'application (nouvel abonné, message, cadeau, paiement, live...).
 // Chaque notification part aussi sur le téléphone (Web Push), même écran verrouillé.
 const push = pushRoutes.create(db);
-const notify = extrasRoutes.makeNotifier(db, push.sendTo);
+const baseNotify = extrasRoutes.makeNotifier(db, push.sendTo);
+// Ce qui se passe dans « 👥 Groupes » (groupes et conversations avec les contacts du téléphone) reste dans Groupes :
+// les notifications (cloche et téléphone) ne montrent ni le texte, ni le vocal, ni le fichier, ni qui l'a envoyé.
+async function notify(creatorId, kind, text, link = null, opts = {}) {
+  try {
+    const l = String(link || '');
+    if (kind === 'message' && l.startsWith('dm:')
+      && await db.query('SELECT 1 FROM phone_contacts WHERE owner_id = $1 AND contact_id::text = $2', [creatorId, l.slice(3)])) {
+      return baseNotify(creatorId, kind, '👥 Nouveau message dans tes Groupes.', link, { ...opts, title: '👥 Eaji · Groupes', body: 'Nouveau message dans tes Groupes' });
+    }
+    if (l.startsWith('group:') && (kind === 'message' || kind === 'appel')) {
+      const call = kind === 'appel';
+      return baseNotify(creatorId, kind, call ? '📞 Appel vocal en cours dans un de tes groupes. Touche pour rejoindre.' : '👥 Nouveau message dans un de tes groupes.', link,
+        { ...opts, title: '👥 Eaji · Groupes', body: call ? 'Appel vocal de groupe en cours' : 'Nouveau message dans un de tes groupes' });
+    }
+  } catch (e) { /* notification normale */ }
+  return baseNotify(creatorId, kind, text, link, opts);
+}
 // Alertes sur le téléphone de l'administrateur (application Eaji Admin).
 const notifyAdmins = (opts) => push.sendToAdmins(opts).catch(() => 0);
 const security = securityRoutes.makeSecurity({ db, notify, notifyAdmins });
@@ -2201,13 +2218,20 @@ app.get('/api/calls/incoming', requireAuth, async (req, res) => {
 });
 
 // Journal des appels : entrants, sortants, manqués, refusés, avec leur durée.
+// ?space=groups : seulement les appels avec les contacts du téléphone (affichés dans « 👥 Groupes », code secret si protégés) ;
+// sinon : tous les autres appels (partie « 📞 Appels »). Les appels avec les contacts ne sortent jamais de Groupes.
 app.get('/api/calls/history', requireAuth, async (req, res) => {
+  const groupsSpace = req.query.space === 'groups';
+  if (groupsSpace && !(await pin.groupsOpen(req))) {
+    return res.status(423).json({ code: 'pin_requis', what: 'groupes', error: 'Tes groupes sont protégés : entre ton code secret.' });
+  }
   const rows = await db.all(
     `SELECT c.id, c.kind, c.status, c.created_at, c.answered_at, c.ended_at, c.caller_id = $1 AS outgoing,
             o.id AS other_id, o.name AS other_name, o.photo_url AS other_photo
      FROM calls c JOIN creators o ON o.id = CASE WHEN c.caller_id = $1 THEN c.callee_id ELSE c.caller_id END
      WHERE (c.caller_id = $1 OR c.callee_id = $1) AND c.created_at > now() - interval '90 days'
-     ORDER BY c.created_at DESC LIMIT 100`, [req.creatorId]);
+       AND EXISTS (SELECT 1 FROM phone_contacts pc WHERE pc.owner_id = $1 AND pc.contact_id = o.id) = $2
+     ORDER BY c.created_at DESC LIMIT 100`, [req.creatorId, groupsSpace]);
   const calls = [];
   for (const r of rows) {
     const ringingOld = r.status === 'ringing' && Date.now() - new Date(r.created_at).getTime() > 60000;
@@ -2277,17 +2301,23 @@ app.post('/api/calls/:id/end', requireAuth, async (req, res) => {
 // Appels manqués (affichés sur l'onglet Messages jusqu'à ce qu'on les ait vus).
 const MISSED_SQL = `c.callee_id = $1 AND NOT c.callee_seen AND (c.status = 'missed'
   OR (c.status = 'ringing' AND c.created_at < now() - interval '60 seconds'))`;
+// Appel d'un contact du téléphone : compté dans « 👥 Groupes », pas dans « 📞 Appels ».
+const CONTACT_CALL_SQL = 'EXISTS (SELECT 1 FROM phone_contacts pc WHERE pc.owner_id = c.callee_id AND pc.contact_id = c.caller_id)';
 app.get('/api/calls-missed', requireAuth, async (req, res) => {
   const calls = await db.all(
     `SELECT c.id, c.kind, c.created_at, c.caller_id, cr.name AS caller_name FROM calls c JOIN creators cr ON cr.id = c.caller_id
      WHERE c.callee_id = $1 AND c.status IN ('missed', 'ringing') AND c.created_at > now() - interval '30 days'
        AND (c.status = 'missed' OR c.created_at < now() - interval '60 seconds')
      ORDER BY c.created_at DESC LIMIT 20`, [req.creatorId]);
-  const unseen = await db.query(`SELECT COUNT(*)::int AS n FROM calls c WHERE ${MISSED_SQL}`, [req.creatorId]);
-  res.json({ calls, unseen: unseen.n });
+  const unseen = await db.query(`SELECT COUNT(*)::int AS n FROM calls c WHERE ${MISSED_SQL} AND NOT ${CONTACT_CALL_SQL}`, [req.creatorId]);
+  const unseenGroups = await db.query(`SELECT COUNT(*)::int AS n FROM calls c WHERE ${MISSED_SQL} AND ${CONTACT_CALL_SQL}`, [req.creatorId]);
+  const contactIds = new Set((await db.all('SELECT contact_id FROM phone_contacts WHERE owner_id = $1', [req.creatorId])).map((r) => r.contact_id));
+  res.json({ calls: calls.filter((c) => !contactIds.has(c.caller_id)), unseen: unseen.n, unseenGroups: unseenGroups.n });
 });
+// { space: 'groups' } : appels manqués des contacts vus (dans Groupes) ; sinon ceux de la partie « Appels ».
 app.post('/api/calls-missed/seen', requireAuth, async (req, res) => {
-  await db.query(`UPDATE calls c SET callee_seen = TRUE WHERE ${MISSED_SQL}`, [req.creatorId]);
+  const groups = req.body && req.body.space === 'groups';
+  await db.query(`UPDATE calls c SET callee_seen = TRUE WHERE ${MISSED_SQL} AND ${groups ? '' : 'NOT '}${CONTACT_CALL_SQL}`, [req.creatorId]);
   res.json({ ok: true });
 });
 
@@ -2316,7 +2346,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
   for (const c of conversations) {
     c.online = isOnline(c.other_seen); c.unread = unreadBy.get(c.other_id) || 0; c.otherPhotoUrl = await createDownloadUrl(c.other_photo).catch(() => null); delete c.other_photo;
     c.isContact = contactIds.has(c.other_id);
-    if (c.isContact && !groupsOpen) c.last_text = '🔒';
+    if (c.isContact) c.last_text = groupsOpen ? '' : '🔒'; // l'aperçu ne sort pas de « Groupes »
   }
   res.json({ conversations });
 });
