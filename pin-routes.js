@@ -189,20 +189,31 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken,
     const list = Array.isArray(req.body.phones) ? req.body.phones.slice(0, MAX_PHONES) : [];
     const me = await db.query('SELECT country_code FROM creators WHERE id = $1', [req.creatorId]);
     const wanted = new Map(); // numéro international → positions dans la liste envoyée
-    list.forEach((raw, i) => { const n = normalizePhone(raw, me && me.country_code); if (n) { if (!wanted.has(n)) wanted.set(n, []); wanted.get(n).push(i); } });
+    const intl = new Set();   // numéros écrits avec leur indicatif (+243…, 00243…) : le pays est sûr
+    list.forEach((raw, i) => {
+      const n = normalizePhone(raw, me && me.country_code); if (!n) return;
+      if (!wanted.has(n)) wanted.set(n, []); wanted.get(n).push(i);
+      if (/^\s*(\+|00)/.test(String(raw))) intl.add(n);
+    });
     if (!wanted.size) return res.json({ found: [] });
     const tails = [...new Set([...wanted.keys()].map(phoneTail).filter(Boolean))];
     const rows = await db.all(
       `SELECT id, name, photo_url, phone, country_code FROM creators
        WHERE account_status = 'actif' AND findable_by_phone AND id <> $1 AND phone IS NOT NULL
          AND RIGHT(regexp_replace(phone, '[^0-9]', '', 'g'), 9) = ANY($2::text[]) LIMIT 1000`, [req.creatorId, tails]);
+    // Même numéro écrit de deux façons (0812…, +243 812…, 243812…), même si le pays de mon compte n'est pas le bon :
+    // on compare les 9 derniers chiffres ; si le numéro du carnet est écrit avec son indicatif, il doit être le même.
+    const byTail = new Map();
+    for (const n of wanted.keys()) { const t = phoneTail(n); if (t) { if (!byTail.has(t)) byTail.set(t, []); byTail.get(t).push(n); } }
     const found = [];
     for (const r of rows) {
-      const n = normalizePhone(r.phone, r.country_code);
-      if (!n || !wanted.has(n)) continue;
+      const rn = normalizePhone(r.phone, r.country_code || (me && me.country_code));
+      const cands = rn ? byTail.get(phoneTail(rn)) || [] : [];
+      const same = cands.filter((w) => w === rn || !intl.has(w) || !w.startsWith('+') || !rn.startsWith('+'));
+      if (!same.length) continue;
       if (isBlockedBetween && await isBlockedBetween(req.creatorId, r.id)) continue;
       await db.query('INSERT INTO phone_contacts (owner_id, contact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [req.creatorId, r.id]);
-      found.push({ id: r.id, name: r.name, photoUrl: await createDownloadUrl(r.photo_url).catch(() => null), indexes: wanted.get(n) });
+      found.push({ id: r.id, name: r.name, photoUrl: await createDownloadUrl(r.photo_url).catch(() => null), indexes: [...new Set(same.flatMap((w) => wanted.get(w)))] });
     }
     res.json({ found, checked: wanted.size });
   });

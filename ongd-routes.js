@@ -373,6 +373,46 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   /* ================= PUBLIC ================= */
 
   r.get('/sante', (req, res) => res.json({ ok: true, paiement_en_ligne: cinetpayPret(), ia: iaPrete() }));
+  /* ----- Compteur de visites (anonyme : ni cookie ni adresse IP gardée) ----- */
+  const ZONES = { 'Africa/Kinshasa': 'RD Congo (Ouest)', 'Africa/Lubumbashi': 'RD Congo (Est)', 'Africa/Brazzaville': 'Congo-Brazzaville', 'Africa/Luanda': 'Angola',
+    'Africa/Kigali': 'Rwanda', 'Africa/Bujumbura': 'Burundi', 'Africa/Kampala': 'Ouganda', 'Africa/Nairobi': 'Kenya', 'Africa/Dar_es_Salaam': 'Tanzanie',
+    'Africa/Johannesburg': 'Afrique du Sud', 'Africa/Lagos': 'Nigeria', 'Africa/Douala': 'Cameroun', 'Africa/Libreville': 'Gabon', 'Africa/Bangui': 'Centrafrique',
+    'Africa/Abidjan': "Côte d'Ivoire", 'Africa/Dakar': 'Sénégal', 'Africa/Accra': 'Ghana', 'Africa/Casablanca': 'Maroc', 'Africa/Cairo': 'Égypte', 'Africa/Lusaka': 'Zambie',
+    'Europe/Paris': 'France', 'Europe/Brussels': 'Belgique', 'Europe/London': 'Royaume-Uni', 'Europe/Berlin': 'Allemagne', 'Europe/Zurich': 'Suisse',
+    'Europe/Amsterdam': 'Pays-Bas', 'Europe/Rome': 'Italie', 'Europe/Madrid': 'Espagne', 'Europe/Lisbon': 'Portugal', 'America/Toronto': 'Canada', 'America/Montreal': 'Canada',
+    'America/New_York': 'États-Unis', 'America/Chicago': 'États-Unis', 'America/Denver': 'États-Unis', 'America/Los_Angeles': 'États-Unis',
+    'Asia/Shanghai': 'Chine', 'Asia/Dubai': 'Émirats arabes unis', 'Asia/Kolkata': 'Inde', 'Asia/Tokyo': 'Japon' };
+  function sourceDe(ref, utm) {
+    if (utm) return txt(utm, 40).toLowerCase();
+    let h = ''; try { h = new URL(ref).hostname.replace(/^www\.|^m\.|^l\./, ''); } catch { return 'Direct'; }
+    if (!h || /ongdlesvolontaires\.eaji\.org|localhost/.test(h)) return 'Direct';
+    const R = [[/google\./, 'Google'], [/facebook|fb\.com|fb\.me/, 'Facebook'], [/whatsapp|wa\.me/, 'WhatsApp'], [/tiktok/, 'TikTok'], [/youtube|youtu\.be/, 'YouTube'],
+      [/instagram/, 'Instagram'], [/^t\.co$|twitter|x\.com/, 'X (Twitter)'], [/linkedin/, 'LinkedIn'], [/bing\./, 'Bing'], [/eaji\.org/, 'Eaji']];
+    for (const [re, nom] of R) if (re.test(h)) return nom;
+    return h.slice(0, 60);
+  }
+  let selVisites = null;
+  r.post('/visite', anti(200, 10, 'visite'), wrap(async (req, res) => {
+    const ua = String(req.headers['user-agent'] || '');
+    if (/bot|crawl|spider|slurp|lighthouse|headless|preview/i.test(ua)) return res.sendStatus(204);
+    const b = req.body || {};
+    const page = txt(b.page, 80).replace(/[^\w\-./#]/g, '') || '/';
+    if (/admin\.html/.test(page)) return res.sendStatus(204);
+    if (!selVisites) {
+      selVisites = await reglage('sel_visites');
+      if (!selVisites) { selVisites = crypto.randomBytes(16).toString('hex'); await ecrireReglage('sel_visites', selVisites); }
+    }
+    const jour = aujourdhui();
+    // Visiteur du jour : empreinte non réversible (adresse + navigateur + date), l'adresse IP n'est jamais enregistrée
+    const visiteur = crypto.createHash('sha256').update(selVisites + jour + ipDe(req) + ua).digest('hex').slice(0, 16);
+    const zone = txt(b.zone, 60);
+    const appareil = /tablet|ipad/i.test(ua) ? 'Tablette' : /mobi|android|iphone/i.test(ua) ? 'Téléphone' : 'Ordinateur';
+    await q('INSERT INTO ongd_visites(jour, page, visiteur, source, region, appareil, langue) VALUES($1,$2,$3,$4,$5,$6,$7)',
+      [jour, page, visiteur, sourceDe(b.ref, b.utm), ZONES[zone] || (zone ? zone.split('/').pop().replace(/_/g, ' ') : 'Inconnue'), appareil, txt(b.langue, 10) || null]);
+    res.sendStatus(204);
+  }));
+  setInterval(() => q("DELETE FROM ongd_visites WHERE jour < now() - interval '400 days'").catch(() => {}), 24 * 3600000).unref();
+
   r.get('/equipe', wrap(async (req, res) => {
     const e = await equipeAbsente();
     res.set('Cache-Control', 'no-cache');
@@ -859,6 +899,27 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
     res.json({ ok: true, message: 'Réglages enregistrés.' });
   }));
 
+  /* ----- Statistiques de visites (administrateur principal) ----- */
+  r.get('/admin/visites', admin, wrap(async (req, res) => {
+    const jours = Math.min(365, Math.max(7, parseInt(req.query.jours, 10) || 30));
+    const per = `jour > (now() AT TIME ZONE 'Africa/Kinshasa')::date - ${jours}`;
+    const tops = (col, n = 10) => q(`SELECT ${col} AS nom, count(*)::int vues, count(DISTINCT visiteur || jour)::int visiteurs FROM ongd_visites WHERE ${per} GROUP BY 1 ORDER BY 2 DESC LIMIT ${n}`);
+    const [totaux, parJour, pages, sources, regions, appareils, maintenant] = await Promise.all([
+      q(`SELECT
+          count(*) FILTER (WHERE jour = (now() AT TIME ZONE 'Africa/Kinshasa')::date)::int vues_jour,
+          count(DISTINCT visiteur) FILTER (WHERE jour = (now() AT TIME ZONE 'Africa/Kinshasa')::date)::int visiteurs_jour,
+          count(*) FILTER (WHERE jour > (now() AT TIME ZONE 'Africa/Kinshasa')::date - 7)::int vues_7j,
+          count(DISTINCT visiteur || jour) FILTER (WHERE jour > (now() AT TIME ZONE 'Africa/Kinshasa')::date - 7)::int visiteurs_7j,
+          count(*) FILTER (WHERE ${per})::int vues_periode,
+          count(DISTINCT visiteur || jour) FILTER (WHERE ${per})::int visiteurs_periode,
+          count(*)::int vues_total FROM ongd_visites`),
+      q(`SELECT to_char(jour, 'YYYY-MM-DD') jour, count(*)::int vues, count(DISTINCT visiteur)::int visiteurs FROM ongd_visites WHERE ${per} GROUP BY jour ORDER BY jour`),
+      tops('page'), tops('source'), tops('region'), tops('appareil', 3),
+      q("SELECT count(DISTINCT visiteur)::int n FROM ongd_visites WHERE le > now() - interval '5 minutes'"),
+    ]);
+    res.json({ jours, totaux: totaux.rows[0], par_jour: parJour.rows, pages: pages.rows, sources: sources.rows, regions: regions.rows, appareils: appareils.rows, en_ligne: maintenant.rows[0].n });
+  }));
+
   /* ----- Diagnostic : vérifie l'IA, le stockage et le paiement ----- */
   r.get('/admin/diagnostic', admin, wrap(async (req, res) => {
     const out = { paiement: cinetpayPret() ? { ok: true, detail: 'CinetPay configuré' } : { ok: false, detail: 'CINETPAY_APIKEY / CINETPAY_SITE_ID absents : paiement manuel par Mobile Money' } };
@@ -945,6 +1006,10 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
     CREATE TABLE IF NOT EXISTS ongd_journal (
       id SERIAL PRIMARY KEY, cree_le TIMESTAMPTZ NOT NULL DEFAULT now(), type TEXT NOT NULL, ip TEXT, detail TEXT);
     CREATE TABLE IF NOT EXISTS ongd_traductions (hash TEXT NOT NULL, langue TEXT NOT NULL, texte TEXT NOT NULL, PRIMARY KEY (hash, langue));
+    CREATE TABLE IF NOT EXISTS ongd_visites (
+      id BIGSERIAL PRIMARY KEY, le TIMESTAMPTZ NOT NULL DEFAULT now(), jour DATE NOT NULL, page TEXT NOT NULL, visiteur TEXT NOT NULL,
+      source TEXT, region TEXT, appareil TEXT, langue TEXT);
+    CREATE INDEX IF NOT EXISTS ongd_visites_jour ON ongd_visites(jour);
     CREATE TABLE IF NOT EXISTS ongd_admins (
       id SERIAL PRIMARY KEY, nom TEXT NOT NULL, telephone TEXT UNIQUE NOT NULL, charge TEXT, permissions JSONB NOT NULL DEFAULT '[]',
       mdp_hash TEXT NOT NULL, statut TEXT NOT NULL DEFAULT 'actif', cree_le TIMESTAMPTZ NOT NULL DEFAULT now());
