@@ -1014,6 +1014,7 @@ app.get('/api/creators/:id', requireAuth, async (req, res) => {
     publicProfile.monetizationReason = monetizationReason(creator.country_code, creator.phone);
     // Payé seulement avec le Premium (sinon : cadeaux des lives uniquement).
     publicProfile.earns = publicProfile.monetized && Boolean(publicProfile.premiumUntil);
+    publicProfile.likesReceived = await likesReceived(creator.id);
   }
 
   res.json(publicProfile);
@@ -1705,6 +1706,28 @@ app.post('/api/content/:id/view', async (req, res) => {
     [req.params.id, viewerKey, viewerId, req.deviceKey || null, req.netKey || null]);
   if (fresh) await db.query('UPDATE content_items SET view_count = view_count + 1 WHERE id = $1', [req.params.id]);
   res.json({ counted: Boolean(fresh) });
+});
+
+// J'aime reçus : chaque j'aime enregistré sur mes publications encore en ligne (une personne = un j'aime par publication).
+async function likesReceived(creatorId) {
+  const r = await db.query(
+    `SELECT COUNT(*)::int AS n FROM content_likes l JOIN content_items c ON c.id = l.content_id
+     WHERE c.creator_id = $1 AND c.status = 'actif'`, [creatorId]);
+  return r ? r.n : 0;
+}
+// Qui a aimé mes publications (seulement moi le vois) : du plus récent au plus ancien, 50 par page (?before=date).
+app.get('/api/creators/me/likes', requireAuth, async (req, res) => {
+  const before = req.query.before && !Number.isNaN(Date.parse(req.query.before)) ? new Date(req.query.before) : null;
+  const rows = await db.all(
+    `SELECT l.created_at, l.creator_id, p.name, p.photo_url, c.id AS content_id, c.title, c.content_type
+     FROM content_likes l JOIN content_items c ON c.id = l.content_id JOIN creators p ON p.id = l.creator_id
+     WHERE c.creator_id = $1 AND c.status = 'actif' AND ($2::timestamptz IS NULL OR l.created_at < $2)
+     ORDER BY l.created_at DESC LIMIT 51`, [req.creatorId, before]);
+  const likes = await Promise.all(rows.slice(0, 50).map(async (r) => ({
+    creatorId: r.creator_id, name: r.name, photoUrl: await createDownloadUrl(r.photo_url).catch(() => null),
+    contentId: r.content_id, title: r.title, contentType: r.content_type, at: r.created_at,
+  })));
+  res.json({ total: await likesReceived(req.creatorId), likes, more: rows.length > 50 });
 });
 
 app.post('/api/content/:id/like', requireAuth, async (req, res) => {
