@@ -49,6 +49,7 @@ const adminAuth = require('./admin-auth-routes');
 const agentRoutes = require('./agent-routes');
 // Code secret (portefeuille, groupes protégés) et contacts du téléphone (pin-routes.js).
 const pinRoutes = require('./pin-routes');
+const firebaseRoutes = require('./firebase-routes');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -305,6 +306,7 @@ async function runStartupMigrations() {
     ...agentRoutes.MIGRATIONS,
     // Code secret, groupes protégés, contacts du téléphone (pin-routes.js).
     ...pinRoutes.MIGRATIONS,
+    ...firebaseRoutes.MIGRATIONS,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -725,7 +727,7 @@ app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('
     return res.status(403).json({ error: 'Ce compte est suspendu. Contacte l\'administrateur.' });
   }
 
-  const { code, channel, emailed, smsSent, device, emailTried } = await sendLoginOtp(creator, via, req);
+  const { code, channel, emailed, smsSent, device, emailTried, firebasePhone } = await sendLoginOtp(creator, via, req, { skipFirebase: req.body.skipFirebase === true });
   // Un nouveau code à CHAQUE connexion. Il ne s'affiche à l'écran QUE sur un appareil déjà connecté à ce compte
   // (ou, en tout dernier recours, pour un compte sans email, sans SMS et sans aucun autre appareil connecté).
   // Sinon il part par email, par SMS, ou en notification sur l'autre téléphone où le compte est ouvert :
@@ -739,10 +741,12 @@ app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('
     emailed: !!emailed,
     smsSent: !!smsSent,
     device: device || null,
+    ...(firebasePhone ? { firebasePhone } : {}),
     firstLogin: !creator.first_login_at,
     expiresInMinutes: LOGIN_CODE_MINUTES,
     message: showOnScreen ? 'Ton code de confirmation est affiché ci-dessous.'
       : channel === 'appareil' ? `Code envoyé en notification sur ton autre appareil connecté à Eaji (${device}).`
+      : channel === 'firebase' ? 'Code envoyé par SMS.'
       : (emailed ? 'Code envoyé par email.' : 'Code envoyé par SMS.'),
     emailTo: emailed ? maskEmail(creator.email) : null,
     emailFailed,
@@ -774,14 +778,19 @@ app.post('/api/auth/login/verify-2fa', rateLimit('otp', 300, 15 * 60 * 1000), as
       ? { code: 'code_faux', attemptsLeft: left, error: `Ce code ne correspond pas. Vérifie les 6 chiffres (essais restants : ${left}).` }
       : { code: 'code_expire', error: 'Trop d\'essais avec ce code : un nouveau code arrive.' });
   }
-  await db.query('UPDATE account_verifications SET verified = TRUE WHERE id = $1', [record.id]);
+  res.json(await finishLogin(creatorId, record.id, req));
+});
+// Code accepté (le nôtre, ou celui du SMS Firebase) : la connexion est ouverte.
+async function finishLogin(creatorId, recordId, req) {
+  await db.query('UPDATE account_verifications SET verified = TRUE WHERE id = $1', [recordId]);
   await db.query('UPDATE creators SET first_login_at = COALESCE(first_login_at, now()) WHERE id = $1', [creatorId]);
   const c = await db.query('SELECT session_version, must_change_password FROM creators WHERE id = $1', [creatorId]);
   const sid = await sessions.createSession(creatorId, req).catch(() => null);
   const token = signSessionToken(creatorId, { v: Number(c?.session_version || 0), sid });
   // Connecté avec un mot de passe provisoire de l'administrateur : il doit en choisir un nouveau tout de suite.
-  res.json({ token, mustChangePassword: Boolean(c && c.must_change_password) });
-});
+  return { token, mustChangePassword: Boolean(c && c.must_change_password) };
+}
+const firebase = firebaseRoutes.register({ app, db, rateLimit, normalizePhone: extrasRoutes.normalizePhone, finishLogin, security });
 
 // SMS réel via Twilio — s'active automatiquement dès que les 3 variables
 // TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER sont présentes
@@ -898,7 +907,7 @@ async function trySendEmail(toEmail, subject, text) {
 //   (toute première connexion juste après l'inscription, sans email : à l'écran, comme avant)
 //   4. en notification sur l'autre appareil où le compte est ouvert (comme WhatsApp ou Google) ;
 //   5. dernier recours (aucun email, aucun SMS, aucun autre appareil) : affiché à l'écran, et le propriétaire est prévenu.
-async function sendLoginOtp(creator, via = 'email', req = null) {
+async function sendLoginOtp(creator, via = 'email', req = null, { skipFirebase = false } = {}) {
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
   const minutes = `${LOGIN_CODE_MINUTES} minutes`;
@@ -913,6 +922,12 @@ async function sendLoginOtp(creator, via = 'email', req = null) {
     const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de connexion : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).\n\nNe le donne à personne, même à quelqu'un qui dit être de l'équipe Eaji. Si ce n'est pas toi qui essaies de te connecter, change ton mot de passe.`);
     if (sent) return { code, channel: 'gmail', emailed: true };
     emailTried = true; // l'email n'est pas parti
+  }
+  // SMS par Firebase (10 gratuits par jour) : c'est la page qui l'envoie ; le serveur vérifie ensuite le jeton de Google.
+  if (!skipFirebase && await firebase.canUse(creator, via).catch(() => false)) {
+    await save('firebase');
+    await firebase.noteSent(creator.id).catch(() => {});
+    return { code, channel: 'firebase', firebasePhone: extrasRoutes.normalizePhone(creator.phone, creator.country_code), emailTried };
   }
   if (SMS_PROVIDER_CONNECTED && creator.phone) {
     await save('sms');
