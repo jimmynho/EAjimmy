@@ -1,8 +1,9 @@
 // Eaji — accès au compte (ajouts) :
 //  1. Date de naissance (inscription) : elle sert à retrouver son compte.
 //  2. Nouveau mot de passe automatique : nom complet + numéro (ou email) + date de naissance corrects
-//     → un mot de passe provisoire est créé tout de suite (par email si on a écrit son email, à l'écran
-//     si on a écrit son numéro). Il faut ensuite choisir son propre mot de passe à la connexion.
+//     → un mot de passe provisoire part SEULEMENT vers l'email du compte (ou par SMS) : jamais à l'écran,
+//     car le nom et la date de naissance ne sont pas secrets. Sans email ni SMS, la demande va à l'administrateur.
+//     L'ancien mot de passe reste valable tant que le provisoire n'a pas servi (personne ne peut bloquer un compte).
 //  3. « Mes connexions » : la liste des appareils connectés au compte, et la déconnexion à distance
 //     d'un appareil (téléphone volé ou perdu).
 const crypto = require('crypto');
@@ -30,6 +31,12 @@ const MIGRATIONS = [
      ip TEXT,
      created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
   'CREATE INDEX IF NOT EXISTS password_auto_attempts_idx ON password_auto_attempts (creator_id, created_at DESC)',
+  // Appareil (identifiant envoyé par l'appli) de chaque connexion : un appareil déjà connu du compte.
+  'ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS device_key TEXT',
+  'CREATE INDEX IF NOT EXISTS user_sessions_device_idx ON user_sessions (creator_id, device_key)',
+  // Mot de passe provisoire en attente (envoyé par email ou SMS) : actif seulement quand il sert.
+  'ALTER TABLE creators ADD COLUMN IF NOT EXISTS pending_temp_hash TEXT',
+  'ALTER TABLE creators ADD COLUMN IF NOT EXISTS pending_temp_until TIMESTAMPTZ',
 ];
 
 // « 1990-05-21 » → la même chaîne si c'est une vraie date passée (après 1900), sinon null.
@@ -76,9 +83,27 @@ function create({ db }) {
   async function createSession(creatorId, req) {
     const c = await db.query('SELECT COALESCE(session_version, 0) AS v FROM creators WHERE id = $1', [creatorId]);
     const r = await db.query(
-      'INSERT INTO user_sessions (creator_id, session_version, device, ip) VALUES ($1, $2, $3, $4) RETURNING id',
-      [creatorId, c ? c.v : 0, deviceLabel(req && req.headers && req.headers['user-agent']), String((req && req.ip) || '').slice(0, 60)]);
+      'INSERT INTO user_sessions (creator_id, session_version, device, ip, device_key) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [creatorId, c ? c.v : 0, deviceLabel(req && req.headers && req.headers['user-agent']), String((req && req.ip) || '').slice(0, 60),
+       (req && req.deviceKey) || null]);
     return r.id;
+  }
+  // Appareil déjà connecté à ce compte depuis le dernier changement de mot de passe, et pas déconnecté à distance.
+  async function knownDevice(creatorId, deviceKey) {
+    if (!deviceKey) return false;
+    const r = await db.query(
+      `SELECT 1 FROM user_sessions s JOIN creators c ON c.id = s.creator_id
+       WHERE s.creator_id = $1 AND s.device_key = $2 AND s.revoked_at IS NULL AND s.session_version = COALESCE(c.session_version, 0) LIMIT 1`,
+      [creatorId, deviceKey]);
+    return Boolean(r);
+  }
+  // Autres appareils où le compte est ouvert en ce moment (pour y envoyer le code de connexion).
+  async function activeDevices(creatorId) {
+    return db.all(
+      `SELECT s.id, s.device FROM user_sessions s JOIN creators c ON c.id = s.creator_id
+       WHERE s.creator_id = $1 AND s.revoked_at IS NULL AND s.session_version = COALESCE(c.session_version, 0)
+         AND s.last_used_at > now() - interval '60 days'
+       ORDER BY s.last_used_at DESC LIMIT 5`, [creatorId]);
   }
   function isRevoked(sid) { return Boolean(sid && REVOKED.has(sid)); }
   const USED = new Map();
@@ -99,11 +124,11 @@ function create({ db }) {
   // Deux serveurs : chacun relit la liste des appareils coupés toutes les minutes.
   const sync = setInterval(() => { loadRevoked(); }, 60000);
   if (sync.unref) sync.unref();
-  return { createSession, isRevoked, touch, loadRevoked };
+  return { createSession, isRevoked, touch, loadRevoked, knownDevice, activeDevices };
 }
 
 function register({ app, db, bcrypt, requireAuth, rateLimit, findAccount, trySendEmail, notify, security, sealTemp, getSecret,
-  signSessionToken, sessions }) {
+  signSessionToken, sessions, sendSms = null, notifyAdmins = async () => 0 }) {
   // Journal de sécurité et notification : jamais bloquants.
   const slog = (...a) => { try { Promise.resolve(security && security.log(...a)).catch(() => {}); } catch (e) { /* rien */ } };
   const tell = (...a) => { try { Promise.resolve(notify(...a)).catch(() => {}); } catch (e) { /* rien */ } };
@@ -132,26 +157,35 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, findAccount, trySen
       if (fails.n + 1 >= 3) slog('mot_de_passe_oublie', 'alerte', { creatorId: creator.id, ip: req.ip, detail: `Réinitialisation automatique : ${fails.n + 1} essai(s) raté(s)` });
       return res.status(400).json(wrong);
     }
-    // Bonnes informations : nouveau mot de passe provisoire, tous les appareils sont déconnectés.
+    // Bonnes informations : un mot de passe provisoire part vers l'email du compte (ou par SMS), JAMAIS à l'écran :
+    // le nom et la date de naissance ne sont pas secrets (n'importe qui peut les connaître).
+    // Il reste « en attente » 30 minutes : l'ancien mot de passe marche encore tant qu'il n'a pas servi.
     const alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let temp = ''; for (const x of crypto.randomBytes(10)) temp += alphabet[x % alphabet.length];
-    await db.query(
-      `UPDATE creators SET password_hash = $1, session_version = session_version + 1,
-         temp_password_enc = $3, temp_password_at = now(), must_change_password = TRUE WHERE id = $2`,
-      [await bcrypt.hash(temp, 12), creator.id, sealTemp(temp, getSecret())]);
-    await db.query("UPDATE password_help_requests SET status = 'traitee', handled_at = now() WHERE creator_id = $1 AND status = 'en_attente'", [creator.id]).catch(() => {});
-    slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: 'Nouveau mot de passe automatique (nom, contact et date de naissance vérifiés)' });
-    tell(creator.id, 'securite', '🔑 Ton mot de passe a été réinitialisé (nom, contact et date de naissance). Si ce n\'est pas toi, change-le tout de suite dans Profil et écris à l\'équipe Eaji.', 's-profil');
-    const byEmail = found.via !== 'telephone' && Boolean(creator.email);
-    const text = `Eaji — ton nouveau mot de passe provisoire : ${temp}\nConnecte-toi avec, puis choisis ton propre mot de passe. Si tu n'as rien demandé, écris tout de suite à l'équipe Eaji.`;
-    if (byEmail) {
-      const sent = await trySendEmail(creator.email, 'Eaji — ton nouveau mot de passe', text);
-      if (sent) return res.json({ reset: true, sentTo: maskEmail(creator.email), message: `Ton nouveau mot de passe a été envoyé par email à ${maskEmail(creator.email)}. Regarde aussi dans les spams.` });
-      return res.json({ reset: true, password: temp, emailFailed: true, message: 'L\'email n\'a pas pu être envoyé pour le moment : voici ton nouveau mot de passe.' });
+    const text = `Eaji — ton nouveau mot de passe provisoire : ${temp}\nIl est valable 30 minutes. Connecte-toi avec, puis choisis ton propre mot de passe. Si tu n'as rien demandé, ignore ce message : ton mot de passe actuel reste valable.`;
+    let sentTo = null;
+    if (creator.email && await trySendEmail(creator.email, 'Eaji — ton nouveau mot de passe', text)) sentTo = maskEmail(creator.email);
+    else if (sendSms && creator.phone && await sendSms(creator.phone, text).then(() => true, () => false)) sentTo = 'SMS';
+    if (!sentTo) {
+      // Ni email ni SMS : l'administrateur vérifie l'identité par téléphone puis donne un mot de passe provisoire.
+      const pending = await db.query("SELECT 1 FROM password_help_requests WHERE creator_id = $1 AND status = 'en_attente' AND created_at > now() - interval '30 minutes'", [creator.id]).catch(() => null);
+      if (!pending) {
+        await db.query('INSERT INTO password_help_requests (creator_id, identifier) VALUES ($1, $2)', [creator.id, String(b.identifier).slice(0, 120)]).catch(() => {});
+        Promise.resolve(notifyAdmins({ title: `🔑 Mot de passe oublié : ${creator.name}`,
+          body: `${creator.phone || ''} demande un nouveau mot de passe (nom et date de naissance corrects, mais aucun email). Vérifie son identité par téléphone, puis donne-lui un mot de passe provisoire.`,
+          link: 'admin:v-creators', kind: 'mot_de_passe', permission: 'gerer_comptes_utilisateurs', urgent: true })).catch(() => {});
+      }
+      slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: 'Nouveau mot de passe demandé (sans email) : transmis à l\'administrateur' });
+      return res.json({ reset: false, toAdmin: true, message: 'Par sécurité, le nouveau mot de passe ne s\'affiche jamais à l\'écran. Ton compte n\'a pas d\'email : ta demande est envoyée à l\'administrateur Eaji, qui va vérifier ton identité et t\'envoyer un mot de passe provisoire sur ton numéro.' });
     }
-    // Avec le numéro : le mot de passe s'affiche à l'écran. Si le compte a un email, son propriétaire est prévenu.
-    if (creator.email) trySendEmail(creator.email, 'Eaji — ton mot de passe a été réinitialisé', 'Ton mot de passe Eaji vient d\'être réinitialisé avec ton numéro de téléphone. Si ce n\'est pas toi, écris tout de suite à l\'équipe Eaji.').catch(() => {});
-    res.json({ reset: true, password: temp, message: 'Voici ton nouveau mot de passe. Connecte-toi avec, puis choisis ton propre mot de passe.' });
+    await db.query(
+      `UPDATE creators SET pending_temp_hash = $1, pending_temp_until = now() + interval '30 minutes', temp_password_enc = $3, temp_password_at = now() WHERE id = $2`,
+      [await bcrypt.hash(temp, 12), creator.id, sealTemp(temp, getSecret())]);
+    slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: `Mot de passe provisoire envoyé (${sentTo === 'SMS' ? 'SMS' : 'email'})` });
+    tell(creator.id, 'securite', '🔑 Un nouveau mot de passe provisoire vient d\'être demandé pour ton compte. Si ce n\'est pas toi, ignore-le : ton mot de passe actuel reste valable.', 's-profil');
+    res.json({ reset: true, sentTo, message: sentTo === 'SMS'
+      ? 'Ton nouveau mot de passe provisoire a été envoyé par SMS au numéro de ton compte. Il est valable 30 minutes.'
+      : `Ton nouveau mot de passe provisoire a été envoyé par email à ${sentTo}. Regarde aussi dans les spams. Il est valable 30 minutes.` });
   });
 
   // ==================== Mes connexions ====================

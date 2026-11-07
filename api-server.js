@@ -58,7 +58,23 @@ const app = express();
 // (Avec « true », un pirate pourrait écrire une fausse adresse lui-même et échapper au blocage.)
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
-app.use(cors()); // Le site (GitHub Pages) et l'application appellent l'API depuis une autre adresse.
+// Seules les pages d'Eaji (eaji.org…) peuvent parler à l'API depuis un navigateur. Avant, n'importe quelle page
+// le pouvait : une COPIE du fichier HTML (ouverte depuis le téléphone ou mise sur un faux site, envoyée par email)
+// fonctionnait comme la vraie et récupérait le mot de passe et le code tapés par la victime.
+// Autres adresses autorisées : variable CORS_EXTRA_ORIGINS (séparées par des virgules).
+const ALLOWED_ORIGINS = new Set(['https://eaji.org', 'https://www.eaji.org', 'https://jimmynho.github.io', 'https://ongdlesvolontaires.eaji.org',
+  'https://api.eaji.org', 'https://secours.eaji.org', 'https://eajimmy-production.up.railway.app', 'https://eajimmy.onrender.com']);
+for (const o of [process.env.PUBLIC_SITE_URL, ...String(process.env.CORS_EXTRA_ORIGINS || '').split(','), ...String(process.env.WEBAUTHN_EXTRA_ORIGINS || '').split(',')]) {
+  try { if (o && o.trim()) ALLOWED_ORIGINS.add(new URL(o.trim()).origin); } catch (e) { /* adresse invalide ignorée */ }
+}
+// Les retours des services de paiement (CinetPay, pawaPay) viennent de leurs propres sites : toujours acceptés.
+const OPEN_PATHS = /^\/api\/(cinetpay\/|payments\/callback\/)/;
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOWED_ORIGINS.has(origin) || !req.path.startsWith('/api/') || OPEN_PATHS.test(req.path)) return next();
+  res.status(403).json({ error: 'Cette page n\'est pas une page officielle d\'Eaji. Ouvre https://eaji.org.' });
+});
+app.use(cors({ origin: true, maxAge: 600 })); // renvoie l'adresse de la page (déjà vérifiée juste au-dessus)
 const jsonSmall = express.json({ limit: '200kb' });
 // Domaines experts d'Eajimmy AI : photos jointes, lues plus loin avec une limite plus grande.
 app.use((req, res, next) => (req.path === '/api/agent/expert' ? next() : jsonSmall(req, res, next)));
@@ -358,7 +374,8 @@ const sessions = accessRoutes.create({ db });
 
 // Code secret de 5 chiffres : protège le portefeuille et les groupes (contrôles placés avant toutes les routes).
 const pin = pinRoutes.register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken, notify, security,
-  normalizePhone: extrasRoutes.normalizePhone, phoneTail: extrasRoutes.phoneTail, createDownloadUrl, isBlockedBetween });
+  normalizePhone: extrasRoutes.normalizePhone, phoneTail: extrasRoutes.phoneTail, createDownloadUrl, isBlockedBetween,
+  getSecret: () => SESSION_SECRET });
 
 // Route de test simple : permet de vérifier que l'API répond, en ouvrant
 // simplement ton domaine dans un navigateur.
@@ -459,6 +476,8 @@ async function authenticateAdminToken(req) {
   const adminId = data.sub;
   const admin = await db.query('SELECT * FROM admins WHERE id = $1', [adminId]);
   if (!admin || admin.status !== 'actif') throw new Error('Administrateur inconnu ou suspendu.');
+  // Mot de passe administrateur changé depuis : les anciennes connexions (même volées) ne marchent plus.
+  if (Number(data.v || 0) !== Number(admin.token_version || 0)) throw new Error('Connexion expirée : reconnecte-toi.');
   return admin;
 }
 
@@ -633,13 +652,18 @@ app.post('/api/auth/register', rateLimit('register', 60, 60 * 60 * 1000, "Trop d
 
 // Vérifie un des deux canaux (sms ou gmail). Le compte est actif
 // seulement quand les deux sont vérifiés.
-app.post('/api/auth/verify', async (req, res) => {
-  const { creatorId, channel, code } = req.body;
+app.post('/api/auth/verify', rateLimit('verify', 60, 15 * 60 * 1000), async (req, res) => {
+  const { creatorId, channel } = req.body;
+  const code = String(req.body.code || '');
+  if (!/^[0-9a-f-]{36}$/i.test(String(creatorId || ''))) return res.status(400).json({ error: 'Code invalide ou expiré.' });
   const record = await db.query(
     'SELECT * FROM account_verifications WHERE creator_id = $1 AND channel = $2 AND verified = FALSE ORDER BY created_at DESC LIMIT 1',
     [creatorId, channel]
   );
-  if (!record || !(await bcrypt.compare(code, record.code_hash)) || new Date() > record.expires_at) {
+  // Même règle que la connexion : 5 essais au plus par code.
+  if (!record || Number(record.attempts || 0) >= 5 || new Date() > record.expires_at) return res.status(400).json({ error: 'Code invalide ou expiré.' });
+  if (!(await bcrypt.compare(code, record.code_hash))) {
+    await db.query('UPDATE account_verifications SET attempts = attempts + 1 WHERE id = $1', [record.id]);
     return res.status(400).json({ error: 'Code invalide ou expiré.' });
   }
   await db.query('UPDATE account_verifications SET verified = TRUE WHERE id = $1', [record.id]);
@@ -673,7 +697,16 @@ app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('
   }
   const password = req.body.password;
 
-  const passwordOk = creator && (await bcrypt.compare(password || '', creator.password_hash));
+  let passwordOk = creator && (await bcrypt.compare(password || '', creator.password_hash));
+  // Mot de passe provisoire envoyé par email ou SMS (« Mot de passe oublié ») : il devient le mot de passe quand il sert.
+  if (!passwordOk && creator && creator.pending_temp_hash && creator.pending_temp_until && new Date(creator.pending_temp_until) > new Date()
+      && await bcrypt.compare(password || '', creator.pending_temp_hash)) {
+    passwordOk = true;
+    const up = await db.query(
+      `UPDATE creators SET password_hash = pending_temp_hash, pending_temp_hash = NULL, pending_temp_until = NULL,
+         must_change_password = TRUE, session_version = session_version + 1 WHERE id = $1 RETURNING session_version`, [creator.id]);
+    if (up) creator.session_version = up.session_version;
+  }
 
   await logLoginAttempt({ creatorId: creator?.id, ipAddress, deviceFingerprint, success: !!passwordOk });
 
@@ -692,24 +725,26 @@ app.post('/api/auth/login', rateLimit('login', 300, 15 * 60 * 1000), rateLimit('
     return res.status(403).json({ error: 'Ce compte est suspendu. Contacte l\'administrateur.' });
   }
 
-  const { code, channel, emailed, smsSent } = await sendLoginOtp(creator, via);
-  // Un nouveau code à CHAQUE connexion. Connexion avec l'email : le code part SEULEMENT par email (jamais à l'écran).
-  // Connexion avec le numéro : le code s'affiche à l'écran (ou part par SMS si Twilio est payé). Si le code
-  // tarde par email, la personne peut se connecter avec son numéro. Si l'email n'a pas pu partir (service
-  // d'email en panne ou pas réglé), le code s'affiche avec un message qui le dit clairement.
-  const byEmail = via !== 'telephone' && Boolean(creator.email);
-  const showOnScreen = LOGIN_CODE_ON_SCREEN || !(emailed || smsSent);
-  const emailFailed = byEmail && !emailed;
+  const { code, channel, emailed, smsSent, device, emailTried } = await sendLoginOtp(creator, via, req);
+  // Un nouveau code à CHAQUE connexion. Il ne s'affiche à l'écran QUE sur un appareil déjà connecté à ce compte
+  // (ou, en tout dernier recours, pour un compte sans email, sans SMS et sans aucun autre appareil connecté).
+  // Sinon il part par email, par SMS, ou en notification sur l'autre téléphone où le compte est ouvert :
+  // connaître le mot de passe ne suffit plus pour entrer dans le compte de quelqu'un.
+  const showOnScreen = channel === 'ecran' || (LOGIN_CODE_ON_SCREEN && channel === 'gmail');
+  const emailFailed = Boolean(emailTried) && !emailed;
   res.json({
     creatorId: creator.id,
     via,
     channel,
     emailed: !!emailed,
     smsSent: !!smsSent,
+    device: device || null,
     firstLogin: !creator.first_login_at,
     expiresInMinutes: LOGIN_CODE_MINUTES,
-    message: showOnScreen ? 'Ton code de confirmation est affiché ci-dessous.' : (emailed ? 'Code envoyé par email.' : 'Code envoyé par SMS.'),
-    emailTo: byEmail ? maskEmail(creator.email) : null,
+    message: showOnScreen ? 'Ton code de confirmation est affiché ci-dessous.'
+      : channel === 'appareil' ? `Code envoyé en notification sur ton autre appareil connecté à Eaji (${device}).`
+      : (emailed ? 'Code envoyé par email.' : 'Code envoyé par SMS.'),
+    emailTo: emailed ? maskEmail(creator.email) : null,
     emailFailed,
     ...(showOnScreen ? { devCode: code } : {}),
   });
@@ -818,7 +853,7 @@ setInterval(checkSmtpReachable, 10 * 60 * 1000).unref();
 
 async function sendEmailReal(toEmail, subject, text) {
   // Rappel anti-phishing en bas de chaque email.
-  text = `${text}\n\n—\n🔒 L'équipe Eaji ne te demandera jamais ton mot de passe, ton code ou ton code PIN (ni par message, ni par WhatsApp, ni par téléphone). Ne les donne à personne.`;
+  text = `${text}\n\n—\n🔒 Tape tes codes et ton mot de passe SEULEMENT sur https://eaji.org (ou dans l'application Eaji). Si une autre page, un fichier ou un message te les demande, c'est un piège.\nL'équipe Eaji ne te demandera jamais ton mot de passe, ton code ou ton code PIN (ni par message, ni par WhatsApp, ni par téléphone). Ne les donne à personne.`;
   if (BREVO_CONNECTED) {
     const res = await fetch(process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
@@ -857,47 +892,51 @@ async function trySendEmail(toEmail, subject, text) {
 // privilégiant toujours le gratuit (email) tant que Twilio n'est pas payé.
 // Écrit dans account_verifications avec le canal réellement utilisé, pour
 // que verify-2fa retrouve le bon enregistrement peu importe le canal.
-async function sendLoginOtp(creator, via = 'email') {
+// Où envoyer le code de connexion (le 2e verrou du compte) :
+//   1. appareil déjà connecté à ce compte (depuis le dernier changement de mot de passe) → affiché à l'écran ;
+//   2. sinon par email (si le compte en a un), 3. par SMS (si Twilio est payé),
+//   (toute première connexion juste après l'inscription, sans email : à l'écran, comme avant)
+//   4. en notification sur l'autre appareil où le compte est ouvert (comme WhatsApp ou Google) ;
+//   5. dernier recours (aucun email, aucun SMS, aucun autre appareil) : affiché à l'écran, et le propriétaire est prévenu.
+async function sendLoginOtp(creator, via = 'email', req = null) {
   const code = crypto.randomInt(100000, 999999).toString();
   const codeHash = await bcrypt.hash(code, 10);
   const minutes = `${LOGIN_CODE_MINUTES} minutes`;
-
-  // Connexion avec le numéro de téléphone (ou compte sans email) : code affiché à l'écran (et par SMS si Twilio est payé).
-  // Connexion avec l'email : le code part par email (jamais à l'écran).
-  if (via === 'telephone' || !creator.email) {
-    await db.query(
-      `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at)
-       VALUES ($1, 'sms', $2, now() + $3::interval)`, [creator.id, codeHash, minutes]);
-    let smsSent = false;
-    if (SMS_PROVIDER_CONNECTED && creator.phone) {
-      smsSent = await sendSmsReal(creator.phone, `Eaji — ton code de connexion : ${code}. Ne le donne à personne.`).then(() => true, () => false);
-    }
-    return { code, channel: smsSent ? 'sms' : 'ecran', smsSent };
+  const save = (channel) => db.query(
+    `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at) VALUES ($1, $2, $3, now() + $4::interval)`,
+    [creator.id, channel, codeHash, minutes]);
+  const deviceKey = req && req.deviceKey;
+  let emailTried = false;
+  if (await sessions.knownDevice(creator.id, deviceKey).catch(() => false)) { await save('sms'); return { code, channel: 'ecran', known: true }; }
+  if (creator.email && EMAIL_PROVIDER_CONNECTED) {
+    await save('gmail');
+    const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de connexion : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).\n\nNe le donne à personne, même à quelqu'un qui dit être de l'équipe Eaji. Si ce n'est pas toi qui essaies de te connecter, change ton mot de passe.`);
+    if (sent) return { code, channel: 'gmail', emailed: true };
+    emailTried = true; // l'email n'est pas parti
   }
-
-  let channel = 'demo';
-  if (EMAIL_PROVIDER_CONNECTED) channel = 'gmail';
-  else if (SMS_PROVIDER_CONNECTED) channel = 'sms';
-
-  // La base n'accepte que 'sms' ou 'gmail' comme canal : en mode test (aucun envoi
-  // configuré), on enregistre 'gmail' — le code reste valable de la même façon.
-  await db.query(
-    `INSERT INTO account_verifications (creator_id, channel, code_hash, expires_at)
-     VALUES ($1, $2, $3, now() + $4::interval)`,
-    [creator.id, channel === 'sms' ? 'sms' : 'gmail', codeHash, minutes]
-  );
-
-  // Le code est toujours renvoyé à l'appelant : la route décide s'il s'affiche à l'écran
-  // (toujours affiché si l'email ou le SMS n'a pas pu partir — personne ne reste bloqué).
-  if (channel === 'gmail') {
-    const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de vérification : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).`);
-    return { code, channel: sent ? 'gmail' : 'ecran', emailed: !!sent };
-  } else if (channel === 'sms') {
-    const sent = await sendSmsReal(creator.phone, `Eaji — ton code de vérification : ${code}. Ne le donne à personne.`).then(() => true, (e) => { console.error('Échec envoi SMS Twilio :', e.message); return false; });
-    return { code, channel: sent ? 'sms' : 'ecran', smsSent: sent };
+  if (SMS_PROVIDER_CONNECTED && creator.phone) {
+    await save('sms');
+    const sent = await sendSmsReal(creator.phone, `Eaji — ton code de connexion : ${code}. Ne le donne à personne.`).then(() => true, (e) => { console.error('Échec envoi SMS Twilio :', e.message); return false; });
+    if (sent) return { code, channel: 'sms', smsSent: true };
   }
-
-  return { code, channel: 'ecran' }; // rien n'est configuré : le code s'affiche à l'écran
+  // Toute première connexion juste après l'inscription (compte encore jamais ouvert, sans email) : code à l'écran, comme avant.
+  if (!creator.first_login_at) { await save('sms'); return { code, channel: 'ecran', first: true, emailTried }; }
+  const where = deviceLabelOf(req);
+  const others = await sessions.activeDevices(creator.id).catch(() => []);
+  await save('sms');
+  if (others.length) {
+    await notify(creator.id, 'securite', `🔐 Code de connexion Eaji : ${code} — demandé sur un nouvel appareil (${where}). Ne le donne à personne. Si ce n'est pas toi, change ton mot de passe dans Profil.`, 's-profil',
+      { title: '🔐 Code de connexion Eaji', body: `${code} — demandé sur ${where}. Ne le donne à personne.` });
+    return { code, channel: 'appareil', device: others[0].device || 'ton téléphone', emailTried };
+  }
+  notify(creator.id, 'securite', `🔐 Ton compte vient d'être ouvert sur un nouvel appareil (${where}). Si ce n'est pas toi, change ton mot de passe tout de suite et ajoute ton email dans Profil.`, 's-profil').catch(() => {});
+  return { code, channel: 'ecran', emailTried };
+}
+function deviceLabelOf(req) {
+  const ua = String((req && req.headers && req.headers['user-agent']) || '');
+  const os = /iPhone|iPad/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac OS X|Macintosh/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : 'appareil';
+  const br = /EdgA?\//.test(ua) ? 'Edge' : /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'navigateur';
+  return `${os} · ${br}`;
 }
 
 // Code de connexion : valable 30 minutes. Connexion avec l'email : envoyé par email uniquement ; connexion
@@ -1087,6 +1126,7 @@ async function earningsOf(creatorId) {
 }
 
 app.get('/api/creators/:id/eligibility', requireAuth, async (req, res) => {
+  if (req.params.id !== req.creatorId) return res.status(403).json({ error: 'Ces chiffres sont privés.' }); // gains d'un autre : jamais
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const m = await earningsOf(req.params.id);
   const result = calculateEligibility(subscribers, views);
@@ -1104,6 +1144,7 @@ async function monthlyViewsOf(creatorId, period) {
 }
 
 app.get('/api/creators/:id/payout-preview', requireAuth, async (req, res) => {
+  if (req.params.id !== req.creatorId) return res.status(403).json({ error: 'Ces chiffres sont privés.' }); // gains d'un autre : jamais
   const { subscribers, views } = await getLatestMetrics(req.params.id);
   const currency = isSupportedCurrency(req.query.currency) ? String(req.query.currency).toUpperCase() : 'USD';
   const m = await earningsOf(req.params.id);
@@ -1942,7 +1983,8 @@ extrasRoutes.register({
   notifyAdmins, rateLimit, getSecret: () => SESSION_SECRET,
 });
 accessRoutes.register({ app, db, bcrypt, requireAuth, rateLimit, findAccount: extrasRoutes.findAccount, trySendEmail, notify, security,
-  sealTemp: extrasRoutes.sealTemp, getSecret: () => SESSION_SECRET, signSessionToken, sessions });
+  sealTemp: extrasRoutes.sealTemp, getSecret: () => SESSION_SECRET, signSessionToken, sessions,
+  sendSms: SMS_PROVIDER_CONNECTED ? sendSmsReal : null, notifyAdmins });
 const thumbs = videoThumbs.register({ db, createDownloadUrl, uploadThroughServer, buildStorageKey });
 setTimeout(() => thumbs.available(), 3000); // vérifie ffmpeg une fois, peu après le démarrage
 app.get('/api/apercu/status', (req, res) => res.json({ ffmpeg: thumbs.available() }));
@@ -2503,9 +2545,11 @@ app.delete('/api/content/:id', requireAdminPermission('moderer_contenu'), async 
 // Seul l'admin principal peut approuver un nouvel administrateur.
 app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
   const { name, phone, password, permissions } = req.body;
-  if (!name || !phone || !password || password.length < 8) {
-    return res.status(400).json({ error: 'Nom, téléphone et mot de passe initial (8 caractères minimum) sont requis.' });
-  }
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!name || !phone || !password) return res.status(400).json({ error: 'Nom, téléphone et mot de passe initial sont requis.' });
+  const weak = adminPasswordProblem(password);
+  if (weak) return res.status(400).json({ error: weak });
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return res.status(400).json({ error: 'Email invalide.' });
   const taken = await db.query('SELECT 1 FROM admin_phone_numbers WHERE phone = $1', [phone]);
   if (taken) return res.status(409).json({ error: 'Ce numéro est déjà utilisé par un administrateur.' });
   const passwordHash = await bcrypt.hash(password, 12);
@@ -2514,6 +2558,8 @@ app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
     [name, phone, passwordHash, req.adminId]
   );
   await db.query('INSERT INTO admin_phone_numbers (admin_id, phone) VALUES ($1, $2)', [admin.id, phone]);
+  if (email) await db.query('UPDATE admins SET email = $1 WHERE id = $2', [email, admin.id]);
+  await security.log('admin_ajoute', 'alerte', { detail: `Nouvel administrateur secondaire : ${String(name).slice(0, 60)} (${String(phone).slice(0, 20)}).` }).catch(() => {});
   const allowed = ['moderer_contenu', 'gerer_comptes_utilisateurs', 'repondre_signalements'];
   for (const permission of (permissions || []).filter((p) => allowed.includes(p))) {
     await db.query(
@@ -2522,6 +2568,27 @@ app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
     );
   }
   res.status(201).json({ adminId: admin.id });
+});
+
+// Email de connexion d'un administrateur secondaire (il y reçoit son code ; jamais affiché à l'écran).
+app.post('/api/admin/:id/email', requireAdminPrincipal, async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 160) return res.status(400).json({ error: 'Email invalide.' });
+  const r = await db.query("UPDATE admins SET email = $1, token_version = token_version + 1 WHERE id = $2 AND role <> 'admin_principal' RETURNING name", [email, req.params.id]);
+  if (!r) return res.status(404).json({ error: 'Administrateur secondaire introuvable.' });
+  await security.log('admin_email_change', 'alerte', { detail: `Email de connexion de l'administrateur ${r.name} changé (${maskEmail(email)}).` }).catch(() => {});
+  res.json({ saved: true, email: maskEmail(email) });
+});
+
+// Suspendre / réactiver un administrateur secondaire (ses connexions sont coupées tout de suite).
+app.post('/api/admin/:id/status', requireAdminPrincipal, async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+  const status = req.body.status === 'actif' ? 'actif' : 'suspendu';
+  const r = await db.query("UPDATE admins SET status = $1, token_version = token_version + 1 WHERE id = $2 AND role <> 'admin_principal' RETURNING name", [status, req.params.id]);
+  if (!r) return res.status(404).json({ error: 'Administrateur secondaire introuvable.' });
+  await security.log('admin_statut', 'alerte', { detail: `Administrateur ${r.name} : ${status === 'actif' ? 'réactivé' : 'suspendu'}.` }).catch(() => {});
+  res.json({ status });
 });
 
 // Qui suis-je ? (nom et rôle de l'administrateur connecté)
@@ -2537,7 +2604,7 @@ app.get('/api/admin/me', async (req, res) => {
 // Liste des administrateurs et de leurs permissions (principal uniquement).
 app.get('/api/admin/admins', requireAdminPrincipal, async (req, res) => {
   const admins = await db.all(
-    `SELECT a.id, a.name, a.role, a.status,
+    `SELECT a.id, a.name, a.role, a.status, a.email IS NOT NULL AS has_email,
             (SELECT string_agg(phone, ', ') FROM admin_phone_numbers WHERE admin_id = a.id) AS phones,
             (SELECT string_agg(permission, ', ') FROM admin_permissions WHERE admin_id = a.id) AS permissions
      FROM admins a ORDER BY a.role DESC, a.created_at`
@@ -2588,15 +2655,25 @@ app.post('/api/admin/auth/change-password', async (req, res) => {
   try { admin = await authenticateAdminToken(req); }
   catch (e) { return res.status(401).json({ error: e.message }); }
   const { currentPassword, newPassword } = req.body;
-  if (!newPassword || newPassword.length < 8) {
-    return res.status(400).json({ error: 'Le nouveau mot de passe doit contenir au moins 8 caractères.' });
-  }
+  const weak = adminPasswordProblem(newPassword);
+  if (weak) return res.status(400).json({ error: weak });
   if (!(await bcrypt.compare(currentPassword || '', admin.password_hash || ''))) {
     return res.status(401).json({ error: 'Mot de passe actuel incorrect.' });
   }
-  await db.query('UPDATE admins SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(newPassword, 12), admin.id]);
-  res.json({ updated: true });
+  // Toutes les autres connexions de cet administrateur sont coupées ; celle-ci reçoit un nouveau jeton.
+  const up = await db.query('UPDATE admins SET password_hash = $1, token_version = token_version + 1 WHERE id = $2 RETURNING token_version, role',
+    [await bcrypt.hash(newPassword, 12), admin.id]);
+  await security.log('admin_mot_de_passe', 'alerte', { detail: `Mot de passe administrateur changé (${admin.name}) : ses autres connexions sont coupées.` }).catch(() => {});
+  res.json({ updated: true, token: signSessionToken(admin.id, { typ: 'admin', v: up.token_version, ttl: adminAuth.PRINCIPAL_TTL_MS }) });
 });
+// Mot de passe administrateur : 12 caractères au moins, avec des lettres et des chiffres, pas une suite évidente.
+function adminPasswordProblem(p) {
+  p = String(p || '');
+  if (p.length < 12) return 'Le mot de passe administrateur doit contenir au moins 12 caractères.';
+  if (!/[a-zA-Z]/.test(p) || !/[0-9]/.test(p)) return 'Mets des lettres ET des chiffres dans le mot de passe administrateur.';
+  if (/^(.)\1+$/.test(p) || /(0123|1234|2345|3456|4567|5678|6789|azerty|qwerty|password|motdepasse|eaji)/i.test(p)) return 'Mot de passe trop facile à deviner : choisis-en un autre.';
+  return null;
+}
 
 // Seul l'administrateur principal choisit les permissions d'un administrateur secondaire.
 app.post('/api/admin/:id/permissions', requireAdminPrincipal, async (req, res) => {
@@ -2824,48 +2901,53 @@ app.post('/api/admin/auth/login', rateLimit('adminlogin', 15, 15 * 60 * 1000), a
   }
 
   // Administrateur principal : code envoyé dans sa boîte mail, ou empreinte digitale de son téléphone.
+  if (admin.status !== 'actif') return res.status(401).json({ error: 'Identifiants refusés.' });
   if (admin.role === 'admin_principal') return res.json(await adminSecure.startPrincipal(admin, req, phone));
-  const code = await sendAdminVerificationCode(admin.id, phone);
-  res.json({
-    adminId: admin.id,
-    message: 'Code de vérification envoyé.',
-    ...(code ? { devCode: code, devWarning: 'Mode test — aucun SMS réel envoyé. À retirer avant le vrai lancement.' } : {}),
-  });
+  // Administrateur secondaire : code par email (ou SMS), jamais à l'écran.
+  const sent = await sendAdminVerificationCode(admin, phone);
+  if (!sent) return res.status(403).json({ error: "Impossible d'envoyer ton code de connexion : demande à l'administrateur principal d'enregistrer ton email (onglet Administrateurs)." });
+  res.json({ adminId: admin.id, channel: sent.channel, message: sent.message });
 });
 
 app.post('/api/admin/auth/login/verify-2fa', rateLimit('adminotp', 15, 15 * 60 * 1000), async (req, res) => {
-  const { adminId, code } = req.body;
+  const adminId = String(req.body.adminId || '');
+  const typed = String(req.body.code || '').trim();
+  if (!/^[0-9a-f-]{36}$/i.test(adminId) || !typed) return res.status(401).json({ error: 'Code invalide ou expiré.' });
   const record = await db.query(
-    'SELECT * FROM admin_verifications WHERE admin_id = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1',
-    [adminId]
-  );
-  if (!record || !(await bcrypt.compare(code, record.code_hash)) || new Date() > record.expires_at) {
-    return res.status(401).json({ error: 'Code invalide ou expiré.' });
+    'SELECT * FROM admin_verifications WHERE admin_id = $1 AND verified = FALSE ORDER BY created_at DESC LIMIT 1', [adminId]);
+  // 5 essais au plus par code, 10 minutes : impossible de deviner le code.
+  if (!record || new Date() > new Date(record.expires_at) || Number(record.attempts || 0) >= 5) {
+    return res.status(401).json({ error: 'Code expiré : recommence avec ton mot de passe.' });
   }
-  await db.query('UPDATE admin_verifications SET verified = TRUE WHERE id = $1', [record.id]);
-  const role = (await db.query('SELECT role FROM admins WHERE id = $1', [adminId]) || {}).role;
-  // La connexion de l'administrateur principal dure 12 heures au plus.
-  const token = signSessionToken(adminId, { typ: 'admin', ttl: role === 'admin_principal' ? adminAuth.PRINCIPAL_TTL_MS : undefined });
-  res.json({ token, adminId, role });
+  const admin = await db.query("SELECT id, role, name, token_version FROM admins WHERE id = $1 AND status = 'actif'", [adminId]);
+  if (!admin) return res.status(401).json({ error: 'Code invalide ou expiré.' });
+  // Administrateur principal : la clé de secours (ADMIN_RECOVERY_KEY) remplace le code si l'email ne marche pas.
+  const key = adminAuth.recoveryKey();
+  const byKey = admin.role === 'admin_principal' && key && typed.length >= 16 && adminAuth.sameSecret(typed, key);
+  const ok = byKey || (record.kind !== 'cle' && /^\d{6}$/.test(typed) && await bcrypt.compare(typed, record.code_hash));
+  if (!ok) {
+    await db.query('UPDATE admin_verifications SET attempts = attempts + 1 WHERE id = $1', [record.id]);
+    await security.log('admin_code_faux', 'critique', { ip: req.ip, detail: `Code (ou clé de secours) faux pour l'administrateur ${admin.name}.` }).catch(() => {});
+    return res.status(401).json({ error: `Code invalide (essais restants : ${Math.max(0, 4 - Number(record.attempts || 0))}).` });
+  }
+  await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]);
+  if (byKey) await security.log('admin_cle_secours', 'alerte', { ip: req.ip, detail: 'Connexion de l\'administrateur principal avec la clé de secours.' }).catch(() => {});
+  // Une connexion d'administrateur dure 12 heures au plus.
+  const token = signSessionToken(adminId, { typ: 'admin', v: Number(admin.token_version || 0), ttl: adminAuth.PRINCIPAL_TTL_MS });
+  res.json({ token, adminId, role: admin.role });
 });
 
-async function sendAdminVerificationCode(adminId, phone) {
-  const code = crypto.randomInt(100000, 999999).toString();
-  const codeHash = await bcrypt.hash(code, 10);
-  await db.query(
-    `INSERT INTO admin_verifications (admin_id, code_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')`,
-    [adminId, codeHash]
-  );
-
-  if (SMS_PROVIDER_CONNECTED && phone) {
-    try {
-      await sendSmsReal(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`);
-    } catch (e) {
-      console.error('Échec envoi SMS admin Twilio :', e.message);
-    }
-    return null;
+// Code d'un administrateur secondaire : par email (enregistré par l'administrateur principal), sinon par SMS.
+// Jamais affiché à l'écran. Renvoie null si aucun envoi n'a marché.
+async function sendAdminVerificationCode(admin, phone) {
+  const code = await adminSecure.newCode(admin.id);
+  if (admin.email && await trySendEmail(admin.email, 'Eaji Admin — code de connexion', `Ton code de connexion au tableau d'administration Eaji : ${code} (valable 10 minutes).\n\nSi ce n'est pas toi, préviens tout de suite l'administrateur principal.`)) {
+    return { channel: 'email', message: `Code envoyé à ${maskEmail(admin.email)}.` };
   }
-  return SMS_PROVIDER_CONNECTED ? null : code;
+  if (SMS_PROVIDER_CONNECTED && phone && await sendSmsReal(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`).then(() => true, () => false)) {
+    return { channel: 'sms', message: 'Code envoyé par SMS.' };
+  }
+  return null;
 }
 
 // ==================== PROTECTION RENFORCÉE DU COMPTE ADMIN ====================

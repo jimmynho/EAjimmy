@@ -9,6 +9,11 @@ const crypto = require('crypto');
 
 const MIGRATIONS = [
   'ALTER TABLE admins ADD COLUMN IF NOT EXISTS email TEXT',
+  // Version des connexions : changer le mot de passe administrateur déconnecte toutes ses autres connexions.
+  'ALTER TABLE admins ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0',
+  // 5 essais au plus par code ; « cle » = la clé de secours (ADMIN_RECOVERY_KEY) remplace le code.
+  'ALTER TABLE admin_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
+  "ALTER TABLE admin_verifications ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'code'",
   `CREATE TABLE IF NOT EXISTS admin_passkeys (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
      admin_id UUID NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
@@ -78,6 +83,14 @@ function coseToKey(cose) {
   throw new Error('Type de clé du téléphone non pris en charge.');
 }
 
+// Clé de secours de l'administrateur principal (variable ADMIN_RECOVERY_KEY de Railway / Render, 16 caractères au moins) :
+// elle remplace le code quand l'email et le SMS ne marchent pas. Le code n'est JAMAIS affiché à l'écran.
+function recoveryKey() { const k = String(process.env.ADMIN_RECOVERY_KEY || '').trim(); return k.length >= 16 ? k : null; }
+function sameSecret(a, b) {
+  const x = crypto.createHash('sha256').update(String(a || '')).digest(), y = crypto.createHash('sha256').update(String(b || '')).digest();
+  return crypto.timingSafeEqual(x, y);
+}
+
 function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEmail, signSessionToken, security, rateLimit, smsConnected, sendSms }) {
   // Adresses autorisées pour l'empreinte : le site (PUBLIC_SITE_URL) + WEBAUTHN_EXTRA_ORIGINS (séparées par des virgules).
   function allowedOrigins() {
@@ -93,11 +106,12 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
     return allowedOrigins().includes(o) ? o : null;
   }
 
-  async function newCode(adminId) {
+  async function newCode(adminId, kind = 'code') {
     const code = crypto.randomInt(100000, 999999).toString();
+    await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]); // un seul code valable
     await db.query(
-      "INSERT INTO admin_verifications (admin_id, code_hash, expires_at) VALUES ($1, $2, now() + interval '10 minutes')",
-      [adminId, await bcrypt.hash(code, 10)]);
+      "INSERT INTO admin_verifications (admin_id, code_hash, expires_at, kind) VALUES ($1, $2, now() + interval '10 minutes', $3)",
+      [adminId, await bcrypt.hash(code, 10), kind]);
     return code;
   }
 
@@ -113,29 +127,45 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
         [admin.id, challenge, origin]);
       out.webauthn = { challenge, rpId: new URL(origin).hostname, allowCredentials: keys.map((k) => k.credential_id), timeout: 60000 };
     }
+    // Empreinte enregistrée : elle devient OBLIGATOIRE (ou la clé de secours). Une empreinte ne marche que sur le vrai
+    // site eaji.org : même si quelqu'un recopie la page ou l'envoie par email, il ne peut pas s'en servir.
+    // (Un code envoyé par email, lui, peut être recopié sur une fausse page.)
+    if (keys.length) {
+      await newCode(admin.id, 'cle');
+      out.channel = 'empreinte'; out.passkeyRequired = true;
+      out.needsRecoveryKey = !out.webauthn; out.recoveryKeySet = Boolean(recoveryKey());
+      out.message = out.webauthn ? 'Touche « Utiliser mon empreinte ». (En cas de problème : ta clé de secours.)'
+        : "Ouvre le tableau d'administration depuis https://eaji.org pour utiliser ton empreinte, ou tape ta clé de secours.";
+      return out;
+    }
     const code = await newCode(admin.id);
     if (admin.email) {
       const sent = await trySendEmail(admin.email, 'Eaji Admin — code de connexion',
         `Ton code de connexion au tableau d'administration Eaji : ${code}\n\nIl est valable 10 minutes.\n\nSi ce n'est pas toi qui essaies de te connecter, change tout de suite ton mot de passe administrateur.`);
       if (sent) {
         out.channel = 'email'; out.emailTo = maskEmail(admin.email);
-        out.message = `Code envoyé à ${maskEmail(admin.email)}.`;
+        out.message = `Code envoyé à ${maskEmail(admin.email)}.` + (recoveryKey() ? ' Tu peux aussi taper ta clé de secours.' : '');
         return out;
       }
-      // Email impossible à envoyer (panne du service d'email) : pour ne jamais bloquer l'administrateur principal,
-      // le code passe par SMS si possible, sinon il est affiché — et l'événement est noté comme alerte de sécurité.
       out.emailFailed = true;
       await security.log('admin_email_code_echec', 'alerte', { detail: "Code de connexion de l'administrateur principal : l'email n'a pas pu être envoyé." }).catch(() => {});
     } else {
       out.needsSetup = true;
     }
-    if (smsConnected && phone) {
-      await sendSms(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`).catch(() => {});
+    if (smsConnected && phone && await sendSms(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`).then(() => true, () => false)) {
       out.channel = 'sms'; out.message = 'Code envoyé par SMS.';
-    } else {
-      out.channel = 'ecran'; out.devCode = code;
-      out.message = admin.email ? "L'email n'a pas pu être envoyé : voici le code." : 'Code de vérification (ajoute ton email dans Sécurité pour le recevoir par email).';
+      return out;
     }
+    // Ni email ni SMS : la clé de secours (dans les variables de Railway, que seul l'administrateur peut lire).
+    // Le code n'est plus jamais affiché à l'écran : sinon le mot de passe suffirait pour entrer.
+    await newCode(admin.id, 'cle');
+    out.channel = 'cle';
+    out.needsRecoveryKey = true;
+    out.recoveryKeySet = Boolean(recoveryKey());
+    out.message = recoveryKey()
+      ? (admin.email ? "L'email n'a pas pu être envoyé : tape ta clé de secours (variable ADMIN_RECOVERY_KEY de Railway)." : 'Tape ta clé de secours (variable ADMIN_RECOVERY_KEY de Railway). Ajoute ensuite ton email dans l\'onglet Sécurité.')
+      : "Aucun moyen sûr d'envoyer le code (email et SMS indisponibles). Ajoute la variable ADMIN_RECOVERY_KEY (16 caractères ou plus) dans Railway et Render, puis reconnecte-toi.";
+    if (out.webauthn) out.message += ' Ou utilise ton empreinte.';
     return out;
   }
 
@@ -175,11 +205,14 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
       await security.log('admin_empreinte_refusee', 'critique', { detail: `Empreinte refusée pour l'administrateur principal : ${e.message}` }).catch(() => {});
       return res.status(401).json({ error: e.message });
     }
-    const admin = await db.query("SELECT id, role FROM admins WHERE id = $1 AND status = 'actif'", [adminId]);
+    const admin = await db.query("SELECT id, role, token_version FROM admins WHERE id = $1 AND status = 'actif'", [adminId]);
     if (!admin) return res.status(401).json({ error: 'Administrateur inconnu ou suspendu.' });
+    // L'empreinte n'est acceptée qu'après le bon mot de passe (une demande de code en cours, de moins de 10 minutes).
+    const pending = await db.query('SELECT id FROM admin_verifications WHERE admin_id = $1 AND verified = FALSE AND expires_at > now() LIMIT 1', [adminId]);
+    if (!pending) return res.status(401).json({ error: 'Demande expirée : recommence avec ton mot de passe.' });
     // Le code envoyé par email pour cette connexion n'est plus utilisable.
     await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]);
-    res.json({ token: signSessionToken(adminId, { typ: 'admin', ttl: admin.role === 'admin_principal' ? PRINCIPAL_TTL_MS : undefined }), adminId, role: admin.role });
+    res.json({ token: signSessionToken(adminId, { typ: 'admin', v: Number(admin.token_version || 0), ttl: PRINCIPAL_TTL_MS }), adminId, role: admin.role });
   });
 
   async function checkPassword(adminId, password) {
@@ -264,10 +297,10 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
     res.json({ deleted: true });
   });
 
-  return { startPrincipal };
+  return { startPrincipal, newCode };
 }
 
-// La connexion de l'administrateur principal ne dure jamais plus de 12 heures (sécurité), même si la page reste ouverte.
+// Une connexion d'administrateur (principal ou secondaire) ne dure jamais plus de 12 heures (sécurité), même si la page reste ouverte.
 const PRINCIPAL_TTL_MS = 12 * 60 * 60 * 1000;
 
-module.exports = { MIGRATIONS, register, PRINCIPAL_TTL_MS, cborDecode, parseAuthData };
+module.exports = { MIGRATIONS, register, PRINCIPAL_TTL_MS, cborDecode, parseAuthData, recoveryKey, sameSecret };

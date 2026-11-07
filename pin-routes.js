@@ -44,9 +44,10 @@ const WALLET_PATHS = [
   /^\/api\/creators\/me\/transactions$/, /^\/api\/payments\/[^/]+\/pay-with-(balance|earnings)$/,
 ];
 
-function register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken, notify = async () => {}, security, normalizePhone, phoneTail, createDownloadUrl, isBlockedBetween }) {
-  const secret = process.env.SESSION_SECRET || 'eaji-pin';
-  const sign = (s) => crypto.createHmac('sha256', secret).update('pin:' + s).digest('base64url');
+function register({ app, db, bcrypt, requireAuth, rateLimit, decodeSessionToken, notify = async () => {}, security, normalizePhone, phoneTail, createDownloadUrl, isBlockedBetween,
+  getSecret = () => process.env.SESSION_SECRET }) {
+  // Même clé secrète que les sessions (jamais une clé par défaut devinable).
+  const sign = (s) => crypto.createHmac('sha256', String(getSecret() || '')).update('pin:' + s).digest('base64url');
   function makeToken(creatorId, sid) {
     const body = Buffer.from(JSON.stringify({ c: creatorId, s: sid || null, e: Date.now() + PIN_MINUTES * 60000 })).toString('base64url');
     return `${body}.${sign(body)}`;
