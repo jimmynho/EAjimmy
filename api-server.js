@@ -50,6 +50,7 @@ const agentRoutes = require('./agent-routes');
 // Code secret (portefeuille, groupes protégés) et contacts du téléphone (pin-routes.js).
 const pinRoutes = require('./pin-routes');
 const firebaseRoutes = require('./firebase-routes');
+const accountClose = require('./account-close-routes');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -307,6 +308,7 @@ async function runStartupMigrations() {
     // Code secret, groupes protégés, contacts du téléphone (pin-routes.js).
     ...pinRoutes.MIGRATIONS,
     ...firebaseRoutes.MIGRATIONS,
+    ...accountClose.MIGRATIONS,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -2010,6 +2012,7 @@ const agent = agentRoutes.register({ app, db, security, notify, notifyAdmins, re
 agentRef = agent;
 agentGuard = agent.guard();
 backupRoutes.register({ app, db, pool, bcrypt, requireAdminPrincipal, rateLimit });
+accountClose.register({ app, db, pool, bcrypt, requireAuth, rateLimit, notify, deleteCreatorAccount, deleteCreatorFiles, isLeader: leader.isLeader });
 const adminSecure = adminAuth.register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEmail, signSessionToken, security, rateLimit,
   smsConnected: SMS_PROVIDER_CONNECTED, sendSms: (to, text) => sendSmsReal(to, text) });
 liveRoutes.register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, isBlockedBetween, isMonetizedCreator,
