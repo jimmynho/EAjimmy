@@ -2678,6 +2678,9 @@ app.post('/api/admin/auth/change-password', async (req, res) => {
   // Toutes les autres connexions de cet administrateur sont coupées ; celle-ci reçoit un nouveau jeton.
   const up = await db.query('UPDATE admins SET password_hash = $1, token_version = token_version + 1 WHERE id = $2 RETURNING token_version, role',
     [await bcrypt.hash(newPassword, 12), admin.id]);
+  // Les appareils « connus » sont oubliés, sauf celui-ci.
+  await db.query('DELETE FROM admin_devices WHERE admin_id = $1', [admin.id]).catch(() => {});
+  await adminSecure.rememberAdminDevice(admin.id, req);
   await security.log('admin_mot_de_passe', 'alerte', { detail: `Mot de passe administrateur changé (${admin.name}) : ses autres connexions sont coupées.` }).catch(() => {});
   res.json({ updated: true, token: signSessionToken(admin.id, { typ: 'admin', v: up.token_version, ttl: adminAuth.PRINCIPAL_TTL_MS }) });
 });
@@ -2919,7 +2922,8 @@ app.post('/api/admin/auth/login', rateLimit('adminlogin', 15, 15 * 60 * 1000), a
   if (admin.status !== 'actif') return res.status(401).json({ error: 'Identifiants refusés.' });
   if (admin.role === 'admin_principal') return res.json(await adminSecure.startPrincipal(admin, req, phone));
   // Administrateur secondaire : code par email (ou SMS), jamais à l'écran.
-  const sent = await sendAdminVerificationCode(admin, phone);
+  const sent = await sendAdminVerificationCode(admin, phone, req);
+  if (sent && sent.devCode) return res.json({ adminId: admin.id, channel: 'ecran', devCode: sent.devCode, message: sent.message });
   if (!sent) return res.status(403).json({ error: "Impossible d'envoyer ton code de connexion : demande à l'administrateur principal d'enregistrer ton email (onglet Administrateurs)." });
   res.json({ adminId: admin.id, channel: sent.channel, message: sent.message });
 });
@@ -2946,6 +2950,7 @@ app.post('/api/admin/auth/login/verify-2fa', rateLimit('adminotp', 15, 15 * 60 *
     return res.status(401).json({ error: `Code invalide (essais restants : ${Math.max(0, 4 - Number(record.attempts || 0))}).` });
   }
   await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]);
+  await adminSecure.rememberAdminDevice(adminId, req);
   if (byKey) await security.log('admin_cle_secours', 'alerte', { ip: req.ip, detail: 'Connexion de l\'administrateur principal avec la clé de secours.' }).catch(() => {});
   // Une connexion d'administrateur dure 12 heures au plus.
   const token = signSessionToken(adminId, { typ: 'admin', v: Number(admin.token_version || 0), ttl: adminAuth.PRINCIPAL_TTL_MS });
@@ -2954,7 +2959,7 @@ app.post('/api/admin/auth/login/verify-2fa', rateLimit('adminotp', 15, 15 * 60 *
 
 // Code d'un administrateur secondaire : par email (enregistré par l'administrateur principal), sinon par SMS.
 // Jamais affiché à l'écran. Renvoie null si aucun envoi n'a marché.
-async function sendAdminVerificationCode(admin, phone) {
+async function sendAdminVerificationCode(admin, phone, req = null) {
   const code = await adminSecure.newCode(admin.id);
   if (admin.email && await trySendEmail(admin.email, 'Eaji Admin — code de connexion', `Ton code de connexion au tableau d'administration Eaji : ${code} (valable 10 minutes).\n\nSi ce n'est pas toi, préviens tout de suite l'administrateur principal.`)) {
     return { channel: 'email', message: `Code envoyé à ${maskEmail(admin.email)}.` };
@@ -2962,6 +2967,8 @@ async function sendAdminVerificationCode(admin, phone) {
   if (SMS_PROVIDER_CONNECTED && phone && await sendSmsReal(phone, `Eaji Admin — ton code de vérification : ${code} (valable 10 minutes).`).then(() => true, () => false)) {
     return { channel: 'sms', message: 'Code envoyé par SMS.' };
   }
+  // Appareil où il s'est déjà connecté : code affiché (personne bloqué). Appareil inconnu : refusé.
+  if (await adminSecure.knownAdminDevice(admin.id, req)) return { channel: 'ecran', devCode: code, message: 'Cet appareil est déjà connu : voici ton code.' };
   return null;
 }
 

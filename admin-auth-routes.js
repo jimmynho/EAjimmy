@@ -13,6 +13,12 @@ const MIGRATIONS = [
   'ALTER TABLE admins ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0',
   // 5 essais au plus par code ; « cle » = la clé de secours (ADMIN_RECOVERY_KEY) remplace le code.
   'ALTER TABLE admin_verifications ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
+  // Appareils où l'administrateur s'est déjà connecté (identifiant aléatoire gardé dans le navigateur, haché ici).
+  `CREATE TABLE IF NOT EXISTS admin_devices (
+    admin_id UUID NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    device_hash TEXT NOT NULL,
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (admin_id, device_hash))`,
   "ALTER TABLE admin_verifications ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'code'",
   `CREATE TABLE IF NOT EXISTS admin_passkeys (
      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -106,6 +112,24 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
     return allowedOrigins().includes(o) ? o : null;
   }
 
+  // Appareil déjà utilisé par cet administrateur (depuis son dernier changement de mot de passe) : si l'email
+  // ne part pas, le code peut s'y afficher, comme avant. Un appareil inconnu (un pirate) ne le voit jamais.
+  const deviceHash = (req) => {
+    const k = String((req && req.headers && req.headers['x-eaji-admin-device']) || '');
+    return /^[A-Za-z0-9_-]{16,80}$/.test(k) ? crypto.createHash('sha256').update('eaji-admin-appareil:' + k).digest('hex') : null;
+  };
+  async function knownAdminDevice(adminId, req) {
+    const h = deviceHash(req);
+    if (!h) return false;
+    return Boolean(await db.query('SELECT 1 FROM admin_devices WHERE admin_id = $1 AND device_hash = $2', [adminId, h]).catch(() => null));
+  }
+  async function rememberAdminDevice(adminId, req) {
+    const h = deviceHash(req);
+    if (!h) return;
+    await db.query(`INSERT INTO admin_devices (admin_id, device_hash) VALUES ($1, $2)
+      ON CONFLICT (admin_id, device_hash) DO UPDATE SET last_used_at = now()`, [adminId, h]).catch(() => {});
+  }
+
   async function newCode(adminId, kind = 'code') {
     const code = crypto.randomInt(100000, 999999).toString();
     await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]); // un seul code valable
@@ -127,17 +151,7 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
         [admin.id, challenge, origin]);
       out.webauthn = { challenge, rpId: new URL(origin).hostname, allowCredentials: keys.map((k) => k.credential_id), timeout: 60000 };
     }
-    // Empreinte enregistrée : elle devient OBLIGATOIRE (ou la clé de secours). Une empreinte ne marche que sur le vrai
-    // site eaji.org : même si quelqu'un recopie la page ou l'envoie par email, il ne peut pas s'en servir.
-    // (Un code envoyé par email, lui, peut être recopié sur une fausse page.)
-    if (keys.length) {
-      await newCode(admin.id, 'cle');
-      out.channel = 'empreinte'; out.passkeyRequired = true;
-      out.needsRecoveryKey = !out.webauthn; out.recoveryKeySet = Boolean(recoveryKey());
-      out.message = out.webauthn ? 'Touche « Utiliser mon empreinte ». (En cas de problème : ta clé de secours.)'
-        : "Ouvre le tableau d'administration depuis https://eaji.org pour utiliser ton empreinte, ou tape ta clé de secours.";
-      return out;
-    }
+    // L'empreinte est un choix en plus : le code part TOUJOURS aussi par email.
     const code = await newCode(admin.id);
     if (admin.email) {
       const sent = await trySendEmail(admin.email, 'Eaji Admin — code de connexion',
@@ -156,8 +170,14 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
       out.channel = 'sms'; out.message = 'Code envoyé par SMS.';
       return out;
     }
-    // Ni email ni SMS : la clé de secours (dans les variables de Railway, que seul l'administrateur peut lire).
-    // Le code n'est plus jamais affiché à l'écran : sinon le mot de passe suffirait pour entrer.
+    // Ni email ni SMS : sur un appareil où l'administrateur s'est déjà connecté, le code s'affiche (personne n'est bloqué).
+    // Sur un appareil inconnu (un pirate qui aurait le mot de passe) : jamais, il faut la clé de secours.
+    if (await knownAdminDevice(admin.id, req)) {
+      out.channel = 'ecran'; out.devCode = code;
+      out.message = (admin.email ? "L'email n'a pas pu être envoyé. " : '') + 'Cet appareil est déjà connu : voici ton code.';
+      if (out.webauthn) out.message += ' Ou utilise ton empreinte.';
+      return out;
+    }
     await newCode(admin.id, 'cle');
     out.channel = 'cle';
     out.needsRecoveryKey = true;
@@ -212,6 +232,7 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
     if (!pending) return res.status(401).json({ error: 'Demande expirée : recommence avec ton mot de passe.' });
     // Le code envoyé par email pour cette connexion n'est plus utilisable.
     await db.query('UPDATE admin_verifications SET verified = TRUE WHERE admin_id = $1 AND verified = FALSE', [adminId]);
+    await rememberAdminDevice(adminId, req);
     res.json({ token: signSessionToken(adminId, { typ: 'admin', v: Number(admin.token_version || 0), ttl: PRINCIPAL_TTL_MS }), adminId, role: admin.role });
   });
 
@@ -297,7 +318,7 @@ function register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEm
     res.json({ deleted: true });
   });
 
-  return { startPrincipal, newCode };
+  return { startPrincipal, newCode, knownAdminDevice, rememberAdminDevice };
 }
 
 // Une connexion d'administrateur (principal ou secondaire) ne dure jamais plus de 12 heures (sécurité), même si la page reste ouverte.
