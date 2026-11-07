@@ -2256,7 +2256,7 @@ app.get('/api/admin/system-status', requireAdminPrincipal, async (req, res) => {
     turn: { provider: turnProvider(), working: turn.some((x) => [].concat(x.urls).some((u) => /^turns?:/.test(u))) },
     pawapay: Boolean(process.env.PAWAPAY_TOKEN), pawapayLive: process.env.PAWAPAY_ENV === 'production',
     paypal: Boolean(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_SECRET), paypalLive: process.env.PAYPAL_ENV === 'production',
-    sms: SMS_PROVIDER_CONNECTED, storage: STORAGE_CONNECTED, email: Boolean(process.env.GMAIL_USER || process.env.RESEND_API_KEY || process.env.BREVO_API_KEY),
+    sms: SMS_PROVIDER_CONNECTED, firebase: firebase.enabled(), firebaseMax: Math.max(0, Number(process.env.FIREBASE_SMS_MAX_PER_DAY || 10)), storage: STORAGE_CONNECTED, email: Boolean(process.env.GMAIL_USER || process.env.RESEND_API_KEY || process.env.BREVO_API_KEY),
     push: true, // clés de notification créées automatiquement
   });
 });
