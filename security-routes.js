@@ -42,7 +42,7 @@ function makeSecurity({ db, notify = async () => {}, notifyAdmins = async () => 
       [kind, level, creatorId, identifier ? String(identifier).slice(0, 120) : null, ip, device ? String(device).slice(0, 200) : null, detail || LABELS[kind] || kind]).catch(() => {});
     // Alerte grave : prévenir l'administrateur tout de suite (au plus une fois toutes les 10 min par sujet).
     if (level === 'critique' && once(`adm:${kind}:${ip || creatorId || identifier}`, 10 * 60 * 1000)) {
-      notifyAdmins({ title: '🚨 Alerte sécurité Eaji', body: `${LABELS[kind] || kind}${ip ? ' — adresse ' + ip : ''}`, link: 'admin:v-threats', kind: 'securite', permission: 'gerer_comptes_utilisateurs', urgent: true });
+      notifyAdmins({ title: '🚨 Alerte sécurité Eaji', body: `${LABELS[kind] || kind}${ip ? ' — adresse ' + ip : ''}`, link: 'admin:v-threats', kind: 'securite', permission: ['gerer_comptes_utilisateurs', 'alertes_securite'], urgent: true });
     }
   }
 
@@ -99,7 +99,7 @@ function makeSecurity({ db, notify = async () => {}, notifyAdmins = async () => 
 }
 
 function register({ app, db, requireAdminPermission, security, notify = async () => {} }) {
-  const canSee = requireAdminPermission('gerer_comptes_utilisateurs');
+  const canSee = requireAdminPermission(['gerer_comptes_utilisateurs', 'alertes_securite']);
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   app.get('/api/admin/security/overview', canSee, async (req, res) => {

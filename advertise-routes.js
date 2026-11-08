@@ -23,7 +23,7 @@ const MIGRATIONS = [
 
 const clean = (v, max) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, max);
 
-function register({ app, db, requireAdminPrincipal, optionalViewerId, rateLimit, notifyAdmins = async () => {}, M }) {
+function register({ app, db, requireAdminPrincipal, requireAdminPermission = () => requireAdminPrincipal, optionalViewerId, rateLimit, notifyAdmins = async () => {}, M }) {
   // ---------- Chiffres d'audience (cache 10 minutes) ----------
   let cache = null, cacheAt = 0;
   async function audience() {
@@ -83,12 +83,12 @@ function register({ app, db, requireAdminPrincipal, optionalViewerId, rateLimit,
       const row = await db.query(
         `INSERT INTO advertise_requests (creator_id, name, company, contact, country_code, message) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
         [viewer && UUID_RE.test(String(viewer)) ? viewer : null, name, company, contact, country, message]);
-      notifyAdmins({ title: `📣 Annonceur : ${company}`, body: `${name} (${contact}) : ${message.slice(0, 140)}`, link: 'admin:v-advertise', kind: 'annonceur' });
+      notifyAdmins({ title: `📣 Annonceur : ${company}`, body: `${name} (${contact}) : ${message.slice(0, 140)}`, link: 'admin:v-advertise', kind: 'annonceur', permission: 'gerer_annonceurs' });
       res.status(201).json({ sent: true, id: row.id });
     });
 
   // ---------- Administration (administrateur principal) ----------
-  app.get('/api/admin/advertise/requests', requireAdminPrincipal, async (req, res) => {
+  app.get('/api/admin/advertise/requests', requireAdminPermission('gerer_annonceurs'), async (req, res) => {
     const rows = await db.all(
       `SELECT a.*, cr.name AS account_name,
               EXISTS (SELECT 1 FROM premium_subscriptions ps WHERE ps.creator_id = a.creator_id AND ps.plan LIKE 'entreprise%' AND ps.ends_at > now()) AS is_business
@@ -103,7 +103,7 @@ function register({ app, db, requireAdminPrincipal, optionalViewerId, rateLimit,
               (SELECT COUNT(DISTINCT creator_id)::int FROM premium_subscriptions WHERE plan LIKE 'entreprise%' AND ends_at > now()) AS active_business`);
     res.json({ requests: rows, ...k, audience: await audience(), whatsapp: WHATSAPP });
   });
-  app.post('/api/admin/advertise/requests/:id/done', requireAdminPrincipal, async (req, res) => {
+  app.post('/api/admin/advertise/requests/:id/done', requireAdminPermission('gerer_annonceurs'), async (req, res) => {
     if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
     const r = await db.query(
       `UPDATE advertise_requests SET status = 'traite', handled_at = now(), admin_note = $2 WHERE id = $1 RETURNING id`,

@@ -107,7 +107,7 @@ function deviceTracker({ db, verifySessionToken }) {
 
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 
-function register({ app, db, requireAuth, requireAdminPrincipal, notify, notifyAdmins = async () => {}, isMonetizedCreator, calculateMonthlyPayout }) {
+function register({ app, db, requireAuth, requireAdminPrincipal, requireAdminPermission = () => requireAdminPrincipal, notify, notifyAdmins = async () => {}, isMonetizedCreator, calculateMonthlyPayout }) {
   // ---------- Périodes Premium d'un créateur ----------
   // Abonnements Premium mis bout à bout (un renouvellement commence à la fin du précédent) = une « chaîne ».
   async function premiumChains(creatorId) {
@@ -435,14 +435,14 @@ function register({ app, db, requireAuth, requireAdminPrincipal, notify, notifyA
     res.json({ items, budget: await budgetNow(), ...totals });
   });
   app.post('/api/admin/cycles/run', requireAdminPrincipal, async (req, res) => res.json(await runDue()));
-  app.get('/api/admin/warnings', requireAdminPrincipal, async (req, res) => {
+  app.get('/api/admin/warnings', requireAdminPermission('controle_fraude'), async (req, res) => {
     const rows = await db.all(
       `SELECT w.id, w.level, w.fake_views, w.total_views, w.details, w.message, w.created_at, w.read_at,
               cr.id AS creator_id, cr.name, cr.country_code, cr.account_status
        FROM creator_warnings w JOIN creators cr ON cr.id = w.creator_id ORDER BY w.created_at DESC LIMIT 200`);
     res.json({ warnings: rows });
   });
-  app.get('/api/admin/duplicates', requireAdminPrincipal, async (req, res) => {
+  app.get('/api/admin/duplicates', requireAdminPermission('controle_fraude'), async (req, res) => {
     const rows = await db.all(
       `SELECT d.id, d.title, d.created_at, d.content_type, cr.id AS creator_id, cr.name AS creator_name,
               o.id AS original_id, o.title AS original_title, o.created_at AS original_at, oc.name AS original_creator

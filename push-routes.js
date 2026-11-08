@@ -149,7 +149,8 @@ function create(db) {
       const subs = await db.all(
         `SELECT s.id, s.endpoint, s.p256dh, s.auth FROM admin_push_subscriptions s JOIN admins a ON a.id = s.admin_id
          WHERE a.status = 'actif' AND (a.role = 'admin_principal'
-           OR ($1::text IS NOT NULL AND EXISTS (SELECT 1 FROM admin_permissions p WHERE p.admin_id = a.id AND p.permission = $1)))`, [permission]);
+           OR ($1::text[] IS NOT NULL AND EXISTS (SELECT 1 FROM admin_permissions p WHERE p.admin_id = a.id AND p.permission = ANY($1::text[]))))`,
+        [permission == null ? null : (Array.isArray(permission) ? permission : [permission])]);
       if (!subs.length) return 0;
       const payload = JSON.stringify({ title: String(title || 'Eaji Admin').slice(0, 80), body: String(body || '').slice(0, 240), link, kind, tag: kind, at: Date.now() });
       return await deliver(subs, payload, 'admin_push_subscriptions', urgent);

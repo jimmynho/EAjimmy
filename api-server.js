@@ -310,6 +310,13 @@ async function runStartupMigrations() {
     ...pinRoutes.MIGRATIONS,
     ...firebaseRoutes.MIGRATIONS,
     ...accountClose.MIGRATIONS,
+    // Poste d'un administrateur secondaire (ex. « Service client », « Modérateur »).
+    'ALTER TABLE admins ADD COLUMN IF NOT EXISTS job_title TEXT',
+    // Tâches qu'on peut confier (liste aussi dans ADMIN_TASKS plus bas).
+    'ALTER TABLE admin_permissions DROP CONSTRAINT IF EXISTS admin_permissions_permission_check',
+    `ALTER TABLE admin_permissions ADD CONSTRAINT admin_permissions_permission_check CHECK (permission IN (
+      'moderer_contenu', 'gerer_comptes_utilisateurs', 'repondre_signalements', 'verifier_identites', 'alertes_securite',
+      'controle_fraude', 'envoyer_annonces', 'gerer_annonceurs', 'gerer_arriere_plans'))`,
   ];
   for (const sql of steps) {
     try { await pool.query(sql); }
@@ -507,16 +514,33 @@ async function requireAdminPrincipal(req, res, next) {
 
 // Laisse passer l'admin principal (accès total) ou un admin secondaire qui
 // détient explicitement la permission demandée.
+// Tâches que l'administrateur principal peut confier à un administrateur secondaire.
+// Tout ce qui touche à l'argent (paiements, retraits, revenus, tarifs, rémunération, commissions), aux sauvegardes,
+// aux administrateurs et à la lecture des messages privés reste RÉSERVÉ à l'administrateur principal.
+const ADMIN_TASKS = [
+  { key: 'moderer_contenu', label: 'Modération : retirer les contenus signalés, surveiller les mots interdits' },
+  { key: 'repondre_signalements', label: 'Service client : répondre aux demandes d\'aide (Support)' },
+  { key: 'gerer_comptes_utilisateurs', label: 'Comptes : voir, suspendre ou réactiver les utilisateurs, mots de passe oubliés' },
+  { key: 'verifier_identites', label: 'Vérification des identités (pièces d\'identité des créateurs)' },
+  { key: 'alertes_securite', label: 'Alertes sécurité : bloquer une adresse, déconnecter un compte piraté' },
+  { key: 'controle_fraude', label: 'Contrôle : fausses vues et contenus copiés' },
+  { key: 'envoyer_annonces', label: 'Annonces : envoyer un message à tous les utilisateurs' },
+  { key: 'gerer_annonceurs', label: 'Annonceurs : demandes des entreprises (« Annoncer sur Eaji »)' },
+  { key: 'gerer_arriere_plans', label: 'Arrière-plans des publications texte' },
+];
+const ADMIN_TASK_KEYS = ADMIN_TASKS.map((t) => t.key);
+// permission : une tâche, ou une liste (il suffit d'en avoir UNE).
 function requireAdminPermission(permission) {
+  const list = Array.isArray(permission) ? permission : [permission];
   return async (req, res, next) => {
     try {
       const admin = await authenticateAdminToken(req);
       if (admin.role === 'admin_principal') { req.adminId = admin.id; return next(); }
       const granted = await db.query(
-        'SELECT 1 FROM admin_permissions WHERE admin_id = $1 AND permission = $2',
-        [admin.id, permission]
+        'SELECT 1 FROM admin_permissions WHERE admin_id = $1 AND permission = ANY($2::text[])',
+        [admin.id, list]
       );
-      if (!granted) return res.status(403).json({ error: `Permission "${permission}" non accordée à cet administrateur.` });
+      if (!granted) return res.status(403).json({ error: 'Cette tâche ne t\'a pas été confiée par l\'administrateur principal.' });
       req.adminId = admin.id;
       next();
     } catch (e) {
@@ -1403,7 +1427,7 @@ function readImageBody(req, max) {
     req.on('error', () => { if (!done) { done = true; resolve(null); } });
   });
 }
-app.post('/api/admin/backgrounds', requireAdminPrincipal, async (req, res) => {
+app.post('/api/admin/backgrounds', requireAdminPermission('gerer_arriere_plans'), async (req, res) => {
   const body = await readImageBody(req, 4 * 1024 * 1024);
   if (body === 'trop_gros') return res.status(413).json({ error: 'Image trop lourde (4 Mo maximum).' });
   req.body = body;
@@ -1417,7 +1441,7 @@ app.post('/api/admin/backgrounds', requireAdminPrincipal, async (req, res) => {
     [name, category, mime, buf]);
   res.status(201).json({ id: b.id });
 });
-app.delete('/api/admin/backgrounds/:id', requireAdminPrincipal, async (req, res) => {
+app.delete('/api/admin/backgrounds/:id', requireAdminPermission('gerer_arriere_plans'), async (req, res) => {
   if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).json({ error: 'Arrière-plan introuvable.' });
   const b = await db.query('DELETE FROM backgrounds WHERE id = $1 RETURNING id', [req.params.id]);
   if (!b) return res.status(404).json({ error: 'Arrière-plan introuvable.' });
@@ -1977,7 +2001,7 @@ app.get('/api/currencies', (req, res) => {
 // ==================== ARGENT : PREMIUM, VENTES, CADEAUX, DONS, PUBLICITÉ, PORTEFEUILLE ====================
 const kyc = kycRoutes.register({ app, db, requireAuth, requireAdminPermission, createDownloadUrl, isKnownCountry, notify });
 // Rémunération par période d'abonnement Premium (règle interne : voir cycles-routes.js).
-const cycles = cyclesRoutes.register({ app, db, requireAuth, requireAdminPrincipal, notify, notifyAdmins, isMonetizedCreator, calculateMonthlyPayout });
+const cycles = cyclesRoutes.register({ app, db, requireAuth, requireAdminPrincipal, requireAdminPermission, notify, notifyAdmins, isMonetizedCreator, calculateMonthlyPayout });
 const money = moneyRoutes.register({
   app, db, pool, requireAuth, requireAdminPrincipal, optionalViewerId, createDownloadUrl, convertFromUSD, isSupportedCurrency, notify,
   isIdentityVerified: kyc.isVerified, bcrypt, notifyAdmins, cycles, walletOpen: (req) => pin.unlocked(req),
@@ -1985,7 +2009,7 @@ const money = moneyRoutes.register({
 supportRoutes.register({ app, db, requireAuth, requireAdminPermission, notify, notifyAdmins,
   agentReply: (threadId, creatorId) => (agentRef ? agentRef.replyInThread(threadId, creatorId) : Promise.resolve()) });
 // « Annoncer sur Eaji » : page publique pour les entreprises (chiffres d'audience, essai, contact).
-advertiseRoutes.register({ app, db, requireAdminPrincipal, optionalViewerId, rateLimit, notifyAdmins, M: require('./monetization') });
+advertiseRoutes.register({ app, db, requireAdminPrincipal, requireAdminPermission, optionalViewerId, rateLimit, notifyAdmins, M: require('./monetization') });
 // Lecteur de musique : paroles des chansons (écrites par le créateur ou automatiques).
 const music = musicRoutes.register({ app, db, requireAuth, optionalViewerId });
 securityRoutes.register({ app, db, requireAdminPermission, security, notify });
@@ -2565,6 +2589,7 @@ app.delete('/api/content/:id', requireAdminPermission('moderer_contenu'), async 
 // Seul l'admin principal peut approuver un nouvel administrateur.
 app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
   const { name, phone, password, permissions } = req.body;
+  const jobTitle = String(req.body.jobTitle || '').trim().slice(0, 80) || null;
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!name || !phone || !password) return res.status(400).json({ error: 'Nom, téléphone et mot de passe initial sont requis.' });
   const weak = adminPasswordProblem(password);
@@ -2579,9 +2604,9 @@ app.post('/api/admin/approve', requireAdminPrincipal, async (req, res) => {
   );
   await db.query('INSERT INTO admin_phone_numbers (admin_id, phone) VALUES ($1, $2)', [admin.id, phone]);
   if (email) await db.query('UPDATE admins SET email = $1 WHERE id = $2', [email, admin.id]);
+  if (jobTitle) await db.query('UPDATE admins SET job_title = $1 WHERE id = $2', [jobTitle, admin.id]);
   await security.log('admin_ajoute', 'alerte', { detail: `Nouvel administrateur secondaire : ${String(name).slice(0, 60)} (${String(phone).slice(0, 20)}).` }).catch(() => {});
-  const allowed = ['moderer_contenu', 'gerer_comptes_utilisateurs', 'repondre_signalements'];
-  for (const permission of (permissions || []).filter((p) => allowed.includes(p))) {
+  for (const permission of (Array.isArray(permissions) ? permissions : []).filter((p) => ADMIN_TASK_KEYS.includes(p))) {
     await db.query(
       'INSERT INTO admin_permissions (admin_id, permission, granted_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
       [admin.id, permission, req.adminId]
@@ -2615,7 +2640,10 @@ app.post('/api/admin/:id/status', requireAdminPrincipal, async (req, res) => {
 app.get('/api/admin/me', async (req, res) => {
   try {
     const admin = await authenticateAdminToken(req);
-    res.json({ id: admin.id, name: admin.name, role: admin.role });
+    const perms = admin.role === 'admin_principal' ? ADMIN_TASK_KEYS
+      : (await db.all('SELECT permission FROM admin_permissions WHERE admin_id = $1', [admin.id])).map((r) => r.permission);
+    const t = await db.query('SELECT job_title FROM admins WHERE id = $1', [admin.id]);
+    res.json({ id: admin.id, name: admin.name, role: admin.role, permissions: perms, jobTitle: (t && t.job_title) || null });
   } catch (e) {
     res.status(401).json({ error: e.message });
   }
@@ -2624,12 +2652,13 @@ app.get('/api/admin/me', async (req, res) => {
 // Liste des administrateurs et de leurs permissions (principal uniquement).
 app.get('/api/admin/admins', requireAdminPrincipal, async (req, res) => {
   const admins = await db.all(
-    `SELECT a.id, a.name, a.role, a.status, a.email IS NOT NULL AS has_email,
+    `SELECT a.id, a.name, a.role, a.status, a.email IS NOT NULL AS has_email, a.job_title,
+            (SELECT array_agg(permission) FROM admin_permissions WHERE admin_id = a.id) AS permission_list,
             (SELECT string_agg(phone, ', ') FROM admin_phone_numbers WHERE admin_id = a.id) AS phones,
             (SELECT string_agg(permission, ', ') FROM admin_permissions WHERE admin_id = a.id) AS permissions
      FROM admins a ORDER BY a.role DESC, a.created_at`
   );
-  res.json({ admins });
+  res.json({ admins, tasks: ADMIN_TASKS });
 });
 
 // Chiffres réels du tableau de bord administrateur.
@@ -2701,12 +2730,29 @@ function adminPasswordProblem(p) {
 // Seul l'administrateur principal choisit les permissions d'un administrateur secondaire.
 app.post('/api/admin/:id/permissions', requireAdminPrincipal, async (req, res) => {
   const { permission } = req.body;
+  if (!ADMIN_TASK_KEYS.includes(permission) || !/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(400).json({ error: 'Tâche inconnue.' });
   await db.query(
     `INSERT INTO admin_permissions (admin_id, permission, granted_by) VALUES ($1, $2, $3)
      ON CONFLICT (admin_id, permission) DO NOTHING`,
     [req.params.id, permission, req.adminId]
   );
   res.status(201).json({ granted: permission });
+});
+
+// Changer d'un coup le poste et les tâches d'un administrateur secondaire.
+app.put('/api/admin/:id/tasks', requireAdminPrincipal, async (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
+  const target = await db.query("SELECT id, name FROM admins WHERE id = $1 AND role <> 'admin_principal'", [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Administrateur secondaire introuvable.' });
+  const wanted = [...new Set((Array.isArray(req.body.permissions) ? req.body.permissions : []).filter((p) => ADMIN_TASK_KEYS.includes(p)))];
+  const jobTitle = String(req.body.jobTitle || '').trim().slice(0, 80) || null;
+  await db.query('UPDATE admins SET job_title = $1 WHERE id = $2', [jobTitle, target.id]);
+  await db.query('DELETE FROM admin_permissions WHERE admin_id = $1 AND NOT (permission = ANY($2::text[]))', [target.id, wanted]);
+  for (const p of wanted) {
+    await db.query('INSERT INTO admin_permissions (admin_id, permission, granted_by) VALUES ($1, $2, $3) ON CONFLICT (admin_id, permission) DO NOTHING', [target.id, p, req.adminId]);
+  }
+  await security.log('admin_taches', 'info', { detail: `Tâches de l'administrateur ${target.name} : ${wanted.join(', ') || 'aucune'}${jobTitle ? ` (poste : ${jobTitle})` : ''}.` }).catch(() => {});
+  res.json({ saved: true, permissions: wanted, jobTitle });
 });
 
 app.delete('/api/admin/:id/permissions/:permission', requireAdminPrincipal, async (req, res) => {
@@ -2788,14 +2834,14 @@ function broadcastAudience(body) {
   };
 }
 
-app.get('/api/admin/broadcast/count', requireAdminPrincipal, async (req, res) => {
+app.get('/api/admin/broadcast/count', requireAdminPermission('envoyer_annonces'), async (req, res) => {
   const a = broadcastAudience(req.query);
   if (a.error) return res.status(400).json({ error: a.error });
   const r = await db.query(`SELECT COUNT(*)::int AS n FROM creators WHERE ${a.where}`, [a.country, a.city]);
   res.json({ recipients: r.n });
 });
 
-app.post('/api/admin/broadcast', requireAdminPrincipal, async (req, res) => {
+app.post('/api/admin/broadcast', requireAdminPermission('envoyer_annonces'), async (req, res) => {
   const a = broadcastAudience(req.body);
   if (a.error) return res.status(400).json({ error: a.error });
   const title = String(req.body.title || '').trim().slice(0, 80) || '📢 Message de l\'équipe Eaji';
@@ -2815,7 +2861,7 @@ app.post('/api/admin/broadcast', requireAdminPrincipal, async (req, res) => {
   res.status(201).json({ sent: true, recipients: rows.length });
 });
 
-app.get('/api/admin/broadcasts', requireAdminPrincipal, async (req, res) => {
+app.get('/api/admin/broadcasts', requireAdminPermission('envoyer_annonces'), async (req, res) => {
   res.json({ broadcasts: await db.all('SELECT * FROM admin_broadcasts ORDER BY created_at DESC LIMIT 50') });
 });
 

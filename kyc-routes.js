@@ -87,7 +87,7 @@ function register({ app, db, requireAuth, requireAdminPermission, createDownload
   });
 
   // ---------- Administration ----------
-  app.get('/api/admin/identities', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
+  app.get('/api/admin/identities', requireAdminPermission(['gerer_comptes_utilisateurs', 'verifier_identites']), async (req, res) => {
     const status = ['en_attente', 'verifie', 'rejete'].includes(req.query.status) ? req.query.status : 'en_attente';
     const rows = await db.all(
       `SELECT v.*, cr.name AS account_name, cr.email, cr.phone, cr.country_code AS account_country
@@ -103,7 +103,7 @@ function register({ app, db, requireAuth, requireAdminPermission, createDownload
     res.json({ identities: rows });
   });
 
-  app.post('/api/admin/identities/:id/approve', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
+  app.post('/api/admin/identities/:id/approve', requireAdminPermission(['gerer_comptes_utilisateurs', 'verifier_identites']), async (req, res) => {
     if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
     const v = await db.query(
       `UPDATE identity_verifications SET status = 'verifie', reviewed_at = now(), admin_id = $2
@@ -115,7 +115,7 @@ function register({ app, db, requireAuth, requireAdminPermission, createDownload
     res.json({ approved: true });
   });
 
-  app.post('/api/admin/identities/:id/reject', requireAdminPermission('gerer_comptes_utilisateurs'), async (req, res) => {
+  app.post('/api/admin/identities/:id/reject', requireAdminPermission(['gerer_comptes_utilisateurs', 'verifier_identites']), async (req, res) => {
     if (!UUID_RE.test(req.params.id)) return res.status(400).json({ error: 'Identifiant invalide.' });
     const note = String(req.body.note || '').trim().slice(0, 300) || 'Documents illisibles ou non conformes.';
     const v = await db.query(
