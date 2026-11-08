@@ -37,6 +37,13 @@ const MIGRATIONS = [
   // Mot de passe provisoire en attente (envoyé par email ou SMS) : actif seulement quand il sert.
   'ALTER TABLE creators ADD COLUMN IF NOT EXISTS pending_temp_hash TEXT',
   'ALTER TABLE creators ADD COLUMN IF NOT EXISTS pending_temp_until TIMESTAMPTZ',
+  // « Mot de passe oublié » : chaque envoi du mot de passe provisoire (pour limiter les envois par compte).
+  `CREATE TABLE IF NOT EXISTS password_reset_sends (
+    id BIGSERIAL PRIMARY KEY,
+    creator_id UUID REFERENCES creators(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+  'CREATE INDEX IF NOT EXISTS password_reset_sends_idx ON password_reset_sends (creator_id, created_at DESC)',
 ];
 
 // « 1990-05-21 » → la même chaîne si c'est une vraie date passée (après 1900), sinon null.
@@ -128,7 +135,7 @@ function create({ db }) {
 }
 
 function register({ app, db, bcrypt, requireAuth, rateLimit, findAccount, trySendEmail, notify, security, sealTemp, getSecret,
-  signSessionToken, sessions, sendSms = null, notifyAdmins = async () => 0 }) {
+  signSessionToken, sessions, sendSms = null, notifyAdmins = async () => 0, whatsapp = null, normalizePhone = null, getFirebase = () => null }) {
   // Journal de sécurité et notification : jamais bloquants.
   const slog = (...a) => { try { Promise.resolve(security && security.log(...a)).catch(() => {}); } catch (e) { /* rien */ } };
   const tell = (...a) => { try { Promise.resolve(notify(...a)).catch(() => {}); } catch (e) { /* rien */ } };
@@ -157,6 +164,12 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, findAccount, trySen
       if (fails.n + 1 >= 3) slog('mot_de_passe_oublie', 'alerte', { creatorId: creator.id, ip: req.ip, detail: `Réinitialisation automatique : ${fails.n + 1} essai(s) raté(s)` });
       return res.status(400).json(wrong);
     }
+    // Nouvelle page : la personne CHOISIT où recevoir son mot de passe provisoire (email, SMS, WhatsApp,
+    // notification sur son autre téléphone, ou à l'écran si ce téléphone est déjà connu du compte).
+    if (b.choose) {
+      return res.json({ verified: true, ticket: makeTicket(creator.id), channels: await resetChannels(creator, req, b.identifier, b.countryCode) });
+    }
+    // Ancienne page (encore en cache sur certains téléphones) : comme avant.
     // Bonnes informations : un mot de passe provisoire part vers l'email du compte (ou par SMS), JAMAIS à l'écran :
     // le nom et la date de naissance ne sont pas secrets (n'importe qui peut les connaître).
     // Il reste « en attente » 30 minutes : l'ancien mot de passe marche encore tant qu'il n'a pas servi.
@@ -186,6 +199,143 @@ function register({ app, db, bcrypt, requireAuth, rateLimit, findAccount, trySen
     res.json({ reset: true, sentTo, message: sentTo === 'SMS'
       ? 'Ton nouveau mot de passe provisoire a été envoyé par SMS au numéro de ton compte. Il est valable 30 minutes.'
       : `Ton nouveau mot de passe provisoire a été envoyé par email à ${sentTo}. Regarde aussi dans les spams. Il est valable 30 minutes.` });
+  });
+
+  // ---------- « Mot de passe oublié » : choisir où recevoir le mot de passe provisoire ----------
+  const TICKET_MIN = 15;
+  const sign = (x) => crypto.createHmac('sha256', String(getSecret())).update('reset|' + x).digest('base64url');
+  function makeTicket(creatorId) {
+    const body = `${creatorId}.${Date.now() + TICKET_MIN * 60000}.${crypto.randomBytes(6).toString('hex')}`;
+    return `${body}.${sign(body)}`;
+  }
+  function readTicket(t) {
+    const parts = String(t || '').split('.');
+    if (parts.length !== 4) return null;
+    const body = parts.slice(0, 3).join('.');
+    const a = Buffer.from(sign(body)), b = Buffer.from(parts[3]);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    if (!(Number(parts[1]) > Date.now()) || !UUID_RE.test(parts[0])) return null;
+    return parts[0];
+  }
+  const maskPhone = (p) => { const d = String(p || '').replace(/[^\d+]/g, ''); return d.length > 6 ? `${d.slice(0, 4)} ••• ••• ${d.slice(-2)}` : '•••'; };
+  const e164 = (c) => (normalizePhone ? normalizePhone(c.phone, c.country_code) : null) || null;
+  async function otherDevices(creatorId, deviceKey) {
+    const r = await db.query(
+      `SELECT COUNT(*)::int AS n FROM user_sessions s JOIN creators c ON c.id = s.creator_id
+       WHERE s.creator_id = $1 AND s.revoked_at IS NULL AND s.session_version = COALESCE(c.session_version, 0)
+         AND s.last_used_at > now() - interval '60 days' AND s.device_key IS DISTINCT FROM $2`, [creatorId, deviceKey || null]).catch(() => null);
+    return r ? r.n : 0;
+  }
+  // Les moyens possibles pour ce compte, sur ce téléphone.
+  async function resetChannels(creator, req, identifier, countryCode) {
+    const list = [];
+    if (creator.email) list.push({ id: 'email', label: maskEmail(creator.email) });
+    const phone = creator.phone ? e164(creator) : null;
+    const fb = getFirebase();
+    if (creator.phone && sendSms) list.push({ id: 'sms', label: maskPhone(phone || creator.phone) });
+    else if (phone && fb && fb.enabled() && normalizePhone && normalizePhone(identifier, countryCode || creator.country_code) === phone
+      && await fb.canUse(creator, 'telephone').catch(() => false)) {
+      // SMS de Google (Firebase) : le numéro est celui que la personne vient d'écrire elle-même.
+      list.push({ id: 'sms', via: 'firebase', label: maskPhone(phone), firebasePhone: phone });
+    }
+    if (phone && whatsapp && whatsapp.enabled()) list.push({ id: 'whatsapp', label: maskPhone(phone) });
+    const n = await otherDevices(creator.id, req.deviceKey);
+    if (n > 0) list.push({ id: 'appareil', count: n });
+    if (await sessions.knownDevice(creator.id, req.deviceKey).catch(() => false)) list.push({ id: 'ecran' });
+    list.push({ id: 'admin' });
+    return list;
+  }
+  async function saveTemp(creatorId, temp) {
+    await db.query(
+      `UPDATE creators SET pending_temp_hash = $1, pending_temp_until = now() + interval '30 minutes', temp_password_enc = $3, temp_password_at = now() WHERE id = $2`,
+      [await bcrypt.hash(temp, 12), creatorId, sealTemp(temp, getSecret())]);
+  }
+  const newTemp = () => { const al = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'; let t = ''; for (const x of crypto.randomBytes(10)) t += al[x % al.length]; return t; };
+  async function askAdmin(creator, identifier, req) {
+    const pending = await db.query("SELECT 1 FROM password_help_requests WHERE creator_id = $1 AND status = 'en_attente' AND created_at > now() - interval '30 minutes'", [creator.id]).catch(() => null);
+    if (!pending) {
+      await db.query('INSERT INTO password_help_requests (creator_id, identifier) VALUES ($1, $2)', [creator.id, String(identifier || creator.phone || '').slice(0, 120)]).catch(() => {});
+      Promise.resolve(notifyAdmins({ title: `🔑 Mot de passe oublié : ${creator.name}`,
+        body: `${creator.phone || ''} demande un nouveau mot de passe (nom et date de naissance corrects). Vérifie son identité par téléphone, puis donne-lui un mot de passe provisoire.`,
+        link: 'admin:v-creators', kind: 'mot_de_passe', permission: 'gerer_comptes_utilisateurs', urgent: true })).catch(() => {});
+    }
+    slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: 'Nouveau mot de passe demandé : transmis à l\'administrateur' });
+  }
+  const loadCreator = (id) => db.query("SELECT id, name, email, phone, country_code, account_status FROM creators WHERE id = $1 AND account_status = 'actif'", [id]);
+  async function tooMany(creatorId) {
+    const r = await db.query("SELECT COUNT(*)::int AS n FROM password_reset_sends WHERE creator_id = $1 AND created_at > now() - interval '1 hour'", [creatorId]);
+    return r.n >= 5;
+  }
+
+  app.post('/api/auth/auto-reset/send', rateLimit('autoresetsend', 15, 60 * 60 * 1000, 'Trop d\'essais depuis ce réseau. Réessaie dans une heure.'), async (req, res) => {
+    const id = readTicket(req.body && req.body.ticket);
+    const expired = { code: 'ticket_expire', error: 'Cette demande a expiré : remplis à nouveau les trois cases.' };
+    if (!id) return res.status(400).json(expired);
+    const creator = await loadCreator(id);
+    if (!creator) return res.status(400).json(expired);
+    const channel = String(req.body.channel || '');
+    const allowed = await resetChannels(creator, req, req.body.identifier, req.body.countryCode);
+    const ch = allowed.find((c) => c.id === channel);
+    if (!ch) return res.status(400).json({ error: 'Ce moyen n\'est pas disponible pour ton compte. Choisis-en un autre.' });
+    if (await tooMany(creator.id)) return res.status(429).json({ code: 'trop_envois', error: 'Trop d\'envois pour ce compte en une heure. Réessaie plus tard.' });
+    if (ch.via === 'firebase') {
+      // C'est la page Eaji qui demande à Google d'envoyer le SMS (code à 6 chiffres) ; on compte l'envoi (limite gratuite du jour).
+      const fb = getFirebase();
+      await fb.noteSent(creator.id).catch(() => {});
+      await db.query('INSERT INTO password_reset_sends (creator_id, channel) VALUES ($1, $2)', [creator.id, 'sms']);
+      return res.json({ sent: false, channel, firebase: true, firebasePhone: ch.firebasePhone,
+        message: `Code envoyé par SMS au ${ch.label}. Tape-le ci-dessous : il arrive en quelques secondes.` });
+    }
+    if (channel === 'admin') {
+      await askAdmin(creator, req.body.identifier, req);
+      await db.query('INSERT INTO password_reset_sends (creator_id, channel) VALUES ($1, $2)', [creator.id, channel]);
+      return res.json({ sent: true, channel, toAdmin: true, message: 'Ta demande est envoyée à l\'administrateur Eaji : il va vérifier ton identité et t\'envoyer un mot de passe provisoire sur ton numéro.' });
+    }
+    const temp = newTemp();
+    const text = `Eaji — ton mot de passe provisoire : ${temp}\nIl est valable 30 minutes. Connecte-toi avec, puis choisis ton propre mot de passe. Si tu n'as rien demandé, ignore ce message : ton mot de passe actuel reste valable.`;
+    let ok = false;
+    try {
+      if (channel === 'email') ok = Boolean(await trySendEmail(creator.email, 'Eaji — ton nouveau mot de passe', text));
+      else if (channel === 'sms') ok = await sendSms(creator.phone, text).then(() => true, () => false);
+      else if (channel === 'whatsapp') ok = await whatsapp.sendCode(e164(creator), temp).then(() => true, (e) => { console.error('[whatsapp]', e.message); return false; });
+      else if (channel === 'appareil') {
+        await notify(creator.id, 'securite', `🔑 Ton mot de passe provisoire Eaji : ${temp} — valable 30 minutes. Si ce n'est pas toi qui l'as demandé, ignore ce message : ton mot de passe actuel reste valable.`, 's-profil');
+        ok = true;
+      } else if (channel === 'ecran') ok = true;
+    } catch (e) { ok = false; }
+    if (!ok) return res.status(502).json({ code: 'envoi_rate', error: 'L\'envoi n\'a pas marché. Choisis un autre moyen.' });
+    await saveTemp(creator.id, temp);
+    await db.query('INSERT INTO password_reset_sends (creator_id, channel) VALUES ($1, $2)', [creator.id, channel]);
+    slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: `Mot de passe provisoire envoyé (${channel})` });
+    if (channel !== 'appareil') tell(creator.id, 'securite', '🔑 Un nouveau mot de passe provisoire vient d\'être demandé pour ton compte. Si ce n\'est pas toi, ignore-le : ton mot de passe actuel reste valable.', 's-profil');
+    const msg = {
+      email: `Ton mot de passe provisoire a été envoyé par email à ${ch.label}. Regarde aussi dans les spams. Il est valable 30 minutes.`,
+      sms: `Ton mot de passe provisoire a été envoyé par SMS au ${ch.label}. Il est valable 30 minutes.`,
+      whatsapp: `Ton mot de passe provisoire a été envoyé sur WhatsApp au ${ch.label}. Il est valable 30 minutes.`,
+      appareil: 'Ton mot de passe provisoire a été envoyé en notification sur ton autre téléphone connecté à Eaji. Il est valable 30 minutes.',
+      ecran: 'Voici ton mot de passe provisoire, valable 30 minutes. Connecte-toi avec, puis choisis ton propre mot de passe.',
+    }[channel];
+    res.json({ sent: true, channel, message: msg, ...(channel === 'ecran' ? { password: temp } : {}) });
+  });
+
+  // SMS de Google (Firebase) : la personne a tapé le code reçu par SMS sur le numéro du compte → mot de passe provisoire à l'écran.
+  app.post('/api/auth/auto-reset/firebase', rateLimit('autoresetfb', 15, 60 * 60 * 1000), async (req, res) => {
+    const id = readTicket(req.body && req.body.ticket);
+    if (!id) return res.status(400).json({ code: 'ticket_expire', error: 'Cette demande a expiré : remplis à nouveau les trois cases.' });
+    const creator = await loadCreator(id);
+    const fb = getFirebase();
+    if (!creator || !fb || !fb.verify) return res.status(400).json({ error: 'Ce moyen n\'est pas disponible.' });
+    let t;
+    try { t = await fb.verify(req.body.idToken); } catch (e) { return res.status(400).json({ error: 'La vérification du code par SMS a échoué. Réessaie.' }); }
+    if (!t.phone_number || t.phone_number !== e164(creator)) {
+      slog('firebase_autre_numero', 'critique', { creatorId: creator.id, ip: req.ip, detail: 'Mot de passe oublié : code SMS validé pour un AUTRE numéro que celui du compte, refusé.' });
+      return res.status(400).json({ error: 'Ce code a été envoyé à un autre numéro que celui du compte.' });
+    }
+    const temp = newTemp();
+    await saveTemp(creator.id, temp);
+    slog('mot_de_passe_oublie', 'info', { creatorId: creator.id, ip: req.ip, detail: 'Mot de passe provisoire donné après code SMS (Google)' });
+    tell(creator.id, 'securite', '🔑 Un nouveau mot de passe provisoire vient d\'être demandé pour ton compte (code SMS validé). Si ce n\'est pas toi, change ton mot de passe.', 's-profil');
+    res.json({ sent: true, channel: 'sms', password: temp, message: 'Code SMS correct. Voici ton mot de passe provisoire, valable 30 minutes. Connecte-toi avec, puis choisis ton propre mot de passe.' });
   });
 
   // ==================== Mes connexions ====================

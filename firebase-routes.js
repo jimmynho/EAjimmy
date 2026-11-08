@@ -110,7 +110,7 @@ function register({ app, db, rateLimit, normalizePhone, finishLogin, security })
     res.json(await finishLogin(creatorId, record.id, req));
   });
 
-  return { canUse, noteSent, enabled: () => Boolean(config()) };
+  return { canUse, noteSent, enabled: () => Boolean(config()), verify: verifyIdToken };
 }
 
 module.exports = { MIGRATIONS, register, verifyIdToken };

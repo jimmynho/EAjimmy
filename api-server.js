@@ -51,6 +51,7 @@ const agentRoutes = require('./agent-routes');
 const pinRoutes = require('./pin-routes');
 const firebaseRoutes = require('./firebase-routes');
 const accountClose = require('./account-close-routes');
+const whatsapp = require('./whatsapp');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -2001,7 +2002,8 @@ extrasRoutes.register({
 });
 accessRoutes.register({ app, db, bcrypt, requireAuth, rateLimit, findAccount: extrasRoutes.findAccount, trySendEmail, notify, security,
   sealTemp: extrasRoutes.sealTemp, getSecret: () => SESSION_SECRET, signSessionToken, sessions,
-  sendSms: SMS_PROVIDER_CONNECTED ? sendSmsReal : null, notifyAdmins });
+  sendSms: SMS_PROVIDER_CONNECTED ? sendSmsReal : null, notifyAdmins,
+  whatsapp, normalizePhone: extrasRoutes.normalizePhone, getFirebase: () => firebase });
 const thumbs = videoThumbs.register({ db, createDownloadUrl, uploadThroughServer, buildStorageKey });
 setTimeout(() => thumbs.available(), 3000); // vérifie ffmpeg une fois, peu après le démarrage
 app.get('/api/apercu/status', (req, res) => res.json({ ffmpeg: thumbs.available() }));
