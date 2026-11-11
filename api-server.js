@@ -52,6 +52,7 @@ const pinRoutes = require('./pin-routes');
 const firebaseRoutes = require('./firebase-routes');
 const accountClose = require('./account-close-routes');
 const whatsapp = require('./whatsapp');
+const creatorTools = require('./creator-tools-routes');
 const { ZONES, MONETIZED_COUNTRIES, isKnownCountry, zoneOf, isMonetizedCreator, monetizationReason } = require('./world-countries');
 const { SALE_PRICE_MIN, SALE_PRICE_MAX, VIDEO_TYPES, MAX_VIDEO_SECONDS, round2 } = require('./monetization');
 
@@ -1588,7 +1589,7 @@ async function feedIds(viewerId, country) {
   rows.forEach((r, i) => { if (i < 50) ids.push(r.id); else if (r.boost && extra < 20) { ids.push(r.id); extra++; } });
   return ids;
 }
-async function feedItems(viewerId, country, contentId) {
+async function feedItems(viewerId, country, contentId, onlyIds) {
   const items = await db.all(
     `SELECT c.id, c.title, c.content_type, c.created_at, c.visibility_scope,
             c.storage_url, c.duration_seconds, c.sale_price, c.sound_content_id, c.ai_generated, c.media_width, c.media_height, c.text_bg, (c.storage_url = '') AS text_only,
@@ -1614,7 +1615,7 @@ async function feedItems(viewerId, country, contentId) {
      -- Toujours dans l'ordre de publication : les plus récentes d'abord.
      ORDER BY c.created_at DESC
      LIMIT 70`,
-    [country, viewerId, contentId || null, contentId ? null : await feedIds(viewerId, country)]
+    [country, viewerId, contentId || null, contentId ? null : (Array.isArray(onlyIds) ? onlyIds : await feedIds(viewerId, country))]
   );
   for (const item of items) {
     // Le numéro n'est jamais envoyé : il sert seulement à savoir si le créateur est monétisé.
@@ -2038,6 +2039,7 @@ const agent = agentRoutes.register({ app, db, security, notify, notifyAdmins, re
 agentRef = agent;
 agentGuard = agent.guard();
 backupRoutes.register({ app, db, pool, bcrypt, requireAdminPrincipal, rateLimit });
+creatorTools.register({ app, db, requireAuth, optionalViewerId, feedItems, rateLimit });
 accountClose.register({ app, db, pool, bcrypt, requireAuth, rateLimit, notify, deleteCreatorAccount, deleteCreatorFiles, isLeader: leader.isLeader });
 const adminSecure = adminAuth.register({ app, db, bcrypt, requireAdminPrincipal, trySendEmail, maskEmail, signSessionToken, security, rateLimit,
   smsConnected: SMS_PROVIDER_CONNECTED, sendSms: (to, text) => sendSmsReal(to, text) });

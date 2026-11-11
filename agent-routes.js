@@ -81,16 +81,35 @@ const short = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim();
 
 // ---------- L'IA (Claude d'Anthropic), seulement si une clé est donnée au serveur ----------
 const aiReady = () => Boolean(process.env.ANTHROPIC_API_KEY);
-async function askClaude({ system, messages, maxTokens = 600, timeoutMs = 20000, model = null }) {
+// Une demande à Anthropic. Se rattrape tout seul quand c'est possible :
+//  - serveur surchargé ou trop de demandes (429, 5xx) : un nouvel essai après une courte attente ;
+//  - version d'API refusée : nouvel essai avec la version classique ;
+//  - modèle introuvable (variable ANTHROPIC_MODEL mal écrite) : nouvel essai avec le modèle par défaut.
+const DEFAULT_MODEL = 'claude-haiku-5-5';
+async function askClaude({ system, messages, maxTokens = 600, timeoutMs = 20000, model = null, strict = false }) {
   if (!aiReady()) return null;
-  const res = await fetch(process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages', {
+  const started = Date.now();
+  const call = (m, version) => fetch(process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': process.env.ANTHROPIC_VERSION || '2026-10-21', 'content-type': 'application/json',
+    headers: { 'x-api-key': String(process.env.ANTHROPIC_API_KEY).trim(), 'anthropic-version': version, 'content-type': 'application/json',
       ...(process.env.ANTHROPIC_WORKSPACE_ID ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID } : {}) },
-    body: JSON.stringify({ model: model || process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5', max_tokens: maxTokens, system, messages }),
-    signal: AbortSignal.timeout(timeoutMs),
+    body: JSON.stringify({ model: m, max_tokens: maxTokens, system, messages }),
+    signal: AbortSignal.timeout(Math.max(3000, timeoutMs - (Date.now() - started))),
   });
-  if (!res.ok) throw new Error(`IA ${res.status} : ${(await res.text()).slice(0, 200)}`);
+  let useModel = model || process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+  let version = process.env.ANTHROPIC_VERSION || '2026-10-21';
+  let res = await call(useModel, version), body = '';
+  for (let i = 0; i < 2 && !res.ok; i++) {
+    body = await res.text().catch(() => '');
+    const left = timeoutMs - (Date.now() - started);
+    if (left < 4000) break;
+    if ((res.status === 429 || res.status >= 500) && i === 0) await new Promise((r) => setTimeout(r, 1500));
+    else if (res.status === 400 && /version/i.test(body) && version !== '2023-06-01') version = '2023-06-01';
+    else if (!strict && res.status === 404 && /model/i.test(body) && useModel !== DEFAULT_MODEL) useModel = DEFAULT_MODEL; // (le test de l'administrateur, lui, signale le mauvais nom)
+    else break;
+    res = await call(useModel, version); body = '';
+  }
+  if (!res.ok) throw new Error(`IA ${res.status} : ${(body || await res.text().catch(() => '')).slice(0, 200)}`);
   const d = await res.json();
   return (d.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
 }
@@ -864,7 +883,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     const tryModel = async (model) => {
       const t0 = Date.now();
       try {
-        const text = await askClaude({ system: 'Réponds seulement par le mot OK.', messages: [{ role: 'user', content: 'Test' }], maxTokens: 10, timeoutMs: 30000, model });
+        const text = await askClaude({ system: 'Réponds seulement par le mot OK.', messages: [{ role: 'user', content: 'Test' }], maxTokens: 10, timeoutMs: 30000, model, strict: true });
         return { model, ok: Boolean(text), ms: Date.now() - t0 };
       } catch (e) {
         const m = String(e.message || ''), st = Number((m.match(/^IA (\d{3})/) || [])[1]) || 0;
