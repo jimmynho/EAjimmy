@@ -80,7 +80,10 @@ const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toL
 const short = (s, n) => { const t = String(s || '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
 
 // ---------- L'IA (Claude d'Anthropic), seulement si une clé est donnée au serveur ----------
-const aiReady = () => Boolean(process.env.ANTHROPIC_API_KEY);
+// La clé est nettoyée : espaces, retours à la ligne ou guillemets collés par erreur dans la variable.
+const aiKey = () => String(process.env.ANTHROPIC_API_KEY || '').replace(/[\s"'“”«»]/g, '');
+const aiReady = () => Boolean(aiKey());
+let LAST_AI_ERROR = null; // dernière panne de l'IA (montrée à l'administrateur dans « Tester l'IA »)
 // Une demande à Anthropic. Se rattrape tout seul quand c'est possible :
 //  - serveur surchargé ou trop de demandes (429, 5xx) : un nouvel essai après une courte attente ;
 //  - version d'API refusée : nouvel essai avec la version classique ;
@@ -91,7 +94,7 @@ async function askClaude({ system, messages, maxTokens = 600, timeoutMs = 20000,
   const started = Date.now();
   const call = (m, version) => fetch(process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: { 'x-api-key': String(process.env.ANTHROPIC_API_KEY).trim(), 'anthropic-version': version, 'content-type': 'application/json',
+    headers: { 'x-api-key': aiKey(), 'anthropic-version': version, 'content-type': 'application/json',
       ...(process.env.ANTHROPIC_WORKSPACE_ID ? { 'anthropic-workspace-id': process.env.ANTHROPIC_WORKSPACE_ID } : {}) },
     body: JSON.stringify({ model: m, max_tokens: maxTokens, system, messages }),
     signal: AbortSignal.timeout(Math.max(3000, timeoutMs - (Date.now() - started))),
@@ -467,7 +470,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     };
   }
   const SYSTEM = (ctx) => `Tu es « Eajimmy AI », l'agent IA et assistant automatique de l'application Eaji (réseau social qui rémunère les créateurs de pays en développement). `
-    + `Tu aides quand l'équipe est absente : compte, connexion, paiements, Premium, publicité, montage. Réponds dans la langue de la personne, en 2 à 6 phrases simples, `
+    + `Tu aides quand l'équipe est absente : compte, connexion, paiements, Premium, publicité, montage. Tu réponds aussi, brièvement et simplement, aux questions générales (sens d'un mot, culture, école, santé de base, idées de contenu…) : ne refuse pas une question parce qu'elle ne parle pas d'Eaji. Si la question n'est pas claire, donne la réponse la plus probable puis demande une précision. Réponds dans la langue de la personne, en 2 à 6 phrases simples, `
     + `avec des étapes concrètes ; beaucoup d'utilisateurs connaissent peu le téléphone. `
     + `Règles absolues : ne demande JAMAIS un mot de passe, un code de confirmation, un code PIN ou un numéro de carte ; n'invente pas de fonction ni de prix ; `
     + `ne donne aucun détail sur la répartition interne de l'argent, les périodes de calcul ou les dates de versement aux créateurs ; ne promets pas de remboursement. `
@@ -487,7 +490,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
           const escalate = /\[EQUIPE\]/i.test(out);
           return { text: out.replace(/\s*\[EQUIPE\]\s*/gi, ' ').trim(), escalate, source: 'ia' };
         }
-      } catch (e) { console.warn('[Eaji] Agent : IA indisponible, réponses préparées :', e.message); }
+      } catch (e) { LAST_AI_ERROR = { at: new Date().toISOString(), message: String(e.message || e).slice(0, 300) }; console.warn('[Eaji] Agent : IA indisponible, réponses préparées :', e.message); }
     }
     if (ctx && ctx.blocked) return { text: `L'accès depuis ton téléphone ou ton réseau a été bloqué par la sécurité d'Eaji après une activité suspecte. Seul l'administrateur peut le débloquer : écris-lui sur WhatsApp au ${WHATSAPP}.`, escalate: true, source: 'regles' };
     const topic = detectTopic(question);
@@ -495,7 +498,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
       const text = topic.fn ? topic.fn(ctx) : topic.a;
       if (text) return { text, escalate: Boolean(topic.escalate) || ['paiement', 'retrait'].includes(topic.id), source: 'regles', topic: topic.id };
     }
-    return { text: `Je n'ai pas bien compris. Parle-moi de ton souci avec quelques mots (exemples : « code pas reçu », « paiement en attente », « mot de passe oublié », « compte suspendu »). Je peux aussi transmettre ta demande à l'équipe Eaji, ou tu peux écrire sur WhatsApp : ${WHATSAPP}.`, escalate: true, source: 'regles' };
+    return { text: `Je n'ai pas de réponse prête pour cette question. Pour l'instant, je réponds surtout aux questions sur Eaji : compte, connexion, code, mot de passe, paiement, Premium, publication, publicité (exemples : « code pas reçu », « paiement en attente », « comment publier une vidéo »). Je peux aussi transmettre ta demande à l'équipe Eaji, ou tu peux écrire sur WhatsApp : ${WHATSAPP}.`, escalate: true, source: 'regles' };
   }
   const cleanMsgs = (list, keep = 12, max = 1500) => (Array.isArray(list) ? list : []).slice(-keep)
     .map((m) => ({ role: m && m.role === 'assistant' ? 'assistant' : 'user', text: String((m && m.text) || '').trim().slice(0, max) })).filter((m) => m.text);
@@ -900,7 +903,7 @@ function register({ app, db, security, notify = async () => {}, notifyAdmins = a
     };
     const chat = await tryModel(process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5');
     const expert = await tryModel(process.env.ANTHROPIC_MODEL_EXPERT || 'claude-sonnet-5-5');
-    res.json({ ok: chat.ok && expert.ok, server, chat, expert, aide: (await settings()).aide });
+    res.json({ ok: chat.ok && expert.ok, server, chat, expert, aide: (await settings()).aide, lastError: LAST_AI_ERROR });
   });
   app.put('/api/admin/agent/settings', requireAdminPrincipal, async (req, res) => {
     const cur = await settings(), next = { ...cur };
