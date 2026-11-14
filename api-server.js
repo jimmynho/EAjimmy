@@ -1830,7 +1830,7 @@ app.delete('/api/content/:id/like', requireAuth, async (req, res) => {
 
 app.get('/api/content/:id/comments', async (req, res) => {
   const comments = await db.all(
-    `SELECT cc.id, cc.text, cc.created_at, cr.name AS creator_name
+    `SELECT cc.id, cc.text, cc.created_at, cc.creator_id, cr.name AS creator_name
      FROM content_comments cc JOIN creators cr ON cr.id = cc.creator_id
      WHERE cc.content_id = $1 ORDER BY cc.created_at ASC`,
     [req.params.id]
@@ -1849,6 +1849,18 @@ app.post('/api/content/:id/comments', requireAuth, async (req, res) => {
     [req.params.id, req.creatorId, text]
   );
   res.status(201).json({ commentId: comment.id });
+});
+
+// Supprimer son propre commentaire (sans supprimer son compte).
+app.delete('/api/content/:id/comments/:commentId', requireAuth, async (req, res) => {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!UUID_RE.test(req.params.id) || !UUID_RE.test(req.params.commentId)) return res.status(404).json({ error: 'Commentaire introuvable.' });
+  const gone = await db.query(
+    'DELETE FROM content_comments WHERE id = $1 AND content_id = $2 AND creator_id = $3 RETURNING id',
+    [req.params.commentId, req.params.id, req.creatorId]
+  );
+  if (!gone) return res.status(404).json({ error: 'Commentaire introuvable.' });
+  res.json({ deleted: true });
 });
 
 app.post('/api/creators/:id/follow', requireAuth, async (req, res) => {
@@ -1893,6 +1905,8 @@ app.patch('/api/creators/me/profile', requireAuth, async (req, res) => {
   if (photoUrl && (!String(photoUrl).startsWith(`${req.creatorId}/`) || String(photoUrl).includes('..'))) {
     return res.status(403).json({ error: 'Photo non autorisée.' });
   }
+  // Retirer sa photo de profil (on revient à l'initiale du nom).
+  if (req.body.removePhoto === true) await db.query('UPDATE creators SET photo_url = NULL WHERE id = $1', [req.creatorId]);
   // La zone suit toujours le pays.
   const newZone = countryCode ? zoneOf(countryCode) : null;
   if (newZone || primaryContentType) {
