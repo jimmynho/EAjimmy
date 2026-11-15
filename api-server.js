@@ -798,6 +798,8 @@ app.post('/api/auth/login/verify-2fa', rateLimit('otp', 300, 15 * 60 * 1000), as
     return res.status(401).json({ code: 'code_expire', error: 'Ce code n\'est plus valable : un nouveau code arrive.' });
   }
   const typed = code.replace(/\D/g, '');
+  // Compte d'examen Google Play : code fixe accepté pour CE SEUL compte (voir isPlayReviewCode).
+  if (await isPlayReviewCode(creatorId, typed)) return res.json(await finishLogin(creatorId, record.id, req));
   if (!(await bcrypt.compare(typed, record.code_hash))) {
     await db.query('UPDATE account_verifications SET attempts = attempts + 1 WHERE id = $1', [record.id]);
     await security.codeFailed({ creatorId, ip: req.ip, attempts: Number(record.attempts || 0) });
@@ -808,6 +810,27 @@ app.post('/api/auth/login/verify-2fa', rateLimit('otp', 300, 15 * 60 * 1000), as
   }
   res.json(await finishLogin(creatorId, record.id, req));
 });
+// Compte d'examen Google Play : les examinateurs de Google ne peuvent pas recevoir le code envoyé par email.
+// Variables (seulement sur Railway / Render) :
+//   PLAY_REVIEW_ACCOUNT = email ou numéro de téléphone du compte de test réservé à Google
+//   PLAY_REVIEW_CODE    = code fixe de 6 chiffres
+// Pour ce seul compte, ce code est accepté EN PLUS du code normal (le mot de passe reste obligatoire,
+// les essais restent limités). Tous les autres comptes : rien ne change. Sans les deux variables : désactivé.
+const PLAY_REVIEW_ACCOUNT = String(process.env.PLAY_REVIEW_ACCOUNT || '').trim().toLowerCase();
+const PLAY_REVIEW_CODE = String(process.env.PLAY_REVIEW_CODE || '').trim();
+const PLAY_REVIEW_ON = Boolean(PLAY_REVIEW_ACCOUNT) && /^\d{6}$/.test(PLAY_REVIEW_CODE);
+if (PLAY_REVIEW_ACCOUNT && !PLAY_REVIEW_ON) console.warn("[Eaji] PLAY_REVIEW_CODE doit faire exactement 6 chiffres : compte d'examen Google Play désactivé.");
+else if (PLAY_REVIEW_ON) console.log("[Eaji] Compte d'examen Google Play activé (un seul compte).");
+async function isPlayReviewCode(creatorId, typed) {
+  if (!PLAY_REVIEW_ON || typed.length !== 6) return false;
+  const a = Buffer.from(typed), b = Buffer.from(PLAY_REVIEW_CODE);
+  if (!require('crypto').timingSafeEqual(a, b)) return false;
+  const c = await db.query('SELECT email, phone FROM creators WHERE id = $1', [creatorId]);
+  if (!c) return false;
+  const digits = (x) => String(x || '').replace(/\D/g, '');
+  return String(c.email || '').trim().toLowerCase() === PLAY_REVIEW_ACCOUNT
+    || (digits(PLAY_REVIEW_ACCOUNT).length >= 8 && digits(c.phone) === digits(PLAY_REVIEW_ACCOUNT));
+}
 // Code accepté (le nôtre, ou celui du SMS Firebase) : la connexion est ouverte.
 async function finishLogin(creatorId, recordId, req) {
   await db.query('UPDATE account_verifications SET verified = TRUE WHERE id = $1', [recordId]);
