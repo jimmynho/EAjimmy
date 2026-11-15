@@ -1485,16 +1485,20 @@ app.post('/api/live/start', requireAuth, async (req, res) => {
   }
   // Un seul live à la fois : un ancien live resté ouvert (téléphone éteint…) est fermé.
   await db.query("UPDATE live_sessions SET status = 'termine', ended_at = now() WHERE creator_id = $1 AND status = 'en_cours'", [req.creatorId]);
+  // Type de live : vidéo (par défaut), audio ou podcast (avec un titre d'épisode).
+  const liveType = ['video', 'audio', 'podcast'].includes(req.body && req.body.type) ? req.body.type : 'video';
+  const liveTitle = String((req.body && req.body.title) || '').trim().slice(0, 120) || null;
   const session = await db.query(
-    'INSERT INTO live_sessions (creator_id) VALUES ($1) RETURNING id',
-    [req.creatorId]
+    'INSERT INTO live_sessions (creator_id, live_type, title) VALUES ($1, $2, $3) RETURNING id',
+    [req.creatorId, liveType, liveType === 'podcast' ? liveTitle : null]
   );
   // Les abonnés sont prévenus que le live commence.
   const host = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
+  const what = liveType === 'audio' ? '🎙️ est en live audio' : liveType === 'podcast' ? `🎧 enregistre un podcast en direct${liveTitle ? ` : « ${liveTitle} »` : ''}` : 'est en direct';
   await db.query(
     `INSERT INTO notifications (creator_id, kind, text, link)
      SELECT follower_id, 'live', $2, $3 FROM follows WHERE followed_id = $1`,
-    [req.creatorId, `🔴 ${host.name} est en direct maintenant !`, `live:${session.id}`]
+    [req.creatorId, liveType === 'video' ? `🔴 ${host.name} est en direct maintenant !` : `🔴 ${host.name} ${what} maintenant !`, `live:${session.id}`]
   ).catch(() => {});
   res.status(201).json({ liveSessionId: session.id });
 });

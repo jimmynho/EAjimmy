@@ -38,6 +38,9 @@ const MIGRATIONS = [
      answer_applied BOOLEAN NOT NULL DEFAULT FALSE,
      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
      PRIMARY KEY (live_id, guest_id))`,
+  // Type de live choisi par le créateur : vidéo, audio (micro seulement) ou podcast (audio avec un titre d'épisode).
+  `ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS live_type TEXT NOT NULL DEFAULT 'video'`,
+  `ALTER TABLE live_sessions ADD COLUMN IF NOT EXISTS title TEXT`,
 ];
 
 function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, isBlockedBetween, isMonetizedCreator, isPremium = async () => false }) {
@@ -56,7 +59,7 @@ function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, i
   app.get('/api/lives', async (req, res) => {
     const viewerId = optionalViewerId(req);
     const lives = await db.all(
-      `SELECT l.id, l.started_at, cr.id AS creator_id, cr.name AS creator_name, cr.country_code, cr.phone, cr.photo_url,
+      `SELECT l.id, l.started_at, l.live_type, l.title, cr.id AS creator_id, cr.name AS creator_name, cr.country_code, cr.phone, cr.photo_url,
               ${watching} AS viewers
        FROM live_sessions l JOIN creators cr ON cr.id = l.creator_id
        WHERE l.status = 'en_cours' AND cr.account_status = 'actif' AND l.started_at > now() - interval '12 hours'
@@ -72,7 +75,7 @@ function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, i
 
   app.get('/api/live/:id', checkId, async (req, res) => {
     const live = await db.query(
-      `SELECT l.id, l.status, l.started_at, l.creator_id, cr.name AS creator_name, cr.country_code, cr.phone, ${watching} AS viewers
+      `SELECT l.id, l.status, l.started_at, l.live_type, l.title, l.creator_id, cr.name AS creator_name, cr.country_code, cr.phone, ${watching} AS viewers
        FROM live_sessions l JOIN creators cr ON cr.id = l.creator_id WHERE l.id = $1`, [req.params.id]);
     if (!live) return res.status(404).json({ error: 'Live introuvable.' });
     live.monetized = isMonetizedCreator(live.country_code, live.phone);
@@ -98,7 +101,8 @@ function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, i
     const me = await db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]);
     await db.query("INSERT INTO live_events (live_id, author_id, kind, text) VALUES ($1, $2, 'arrivee', $3)",
       [live.id, req.creatorId, `${me.name} a rejoint le live`]);
-    res.json({ joined: true, creatorName: live.creator_name, monetized: isMonetizedCreator(live.country_code, live.phone) });
+    res.json({ joined: true, creatorName: live.creator_name, monetized: isMonetizedCreator(live.country_code, live.phone),
+      liveType: live.live_type || 'video', title: live.title || null });
   });
 
   // Le spectateur attend l'offre vidéo du créateur.
@@ -255,7 +259,7 @@ function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, i
               (v.viewer_id IS NOT NULL AND ${activeViewer}) AS present
        FROM live_guests g JOIN creators cr ON cr.id = g.guest_id
        LEFT JOIN live_viewers v ON v.live_id = g.live_id AND v.viewer_id = g.guest_id
-       WHERE g.live_id = $1 AND g.status IN ('demande', 'invite', 'accepte') ORDER BY g.updated_at`, [live.id]);
+       WHERE g.live_id = $1 AND g.status IN ('demande', 'invite', 'accepte', 'retire') ORDER BY g.updated_at`, [live.id]);
     const viewers = await db.all(
       `SELECT v.viewer_id, cr.name FROM live_viewers v JOIN creators cr ON cr.id = v.viewer_id
        WHERE v.live_id = $1 AND ${activeViewer}
@@ -271,6 +275,8 @@ function register({ app, db, requireAuth, optionalViewerId, createDownloadUrl, i
       // Invités partis (réseau coupé, retirés…) : le créateur ferme leur connexion.
       gone: rows.filter((r) => r.status === 'accepte' && !r.present).map((r) => r.guest_id),
       viewers: viewers.map((v) => ({ viewerId: v.viewer_id, name: v.name })),
+      // Retirés par le créateur et toujours dans le live : il peut les réinviter.
+      removed: present.filter((r) => r.status === 'retire').map((r) => ({ guestId: r.guest_id, name: r.name })),
     });
   });
 
