@@ -1593,7 +1593,7 @@ app.post('/api/content/:id/dims', rateLimit('dims', 300, 60 * 60 * 1000), async 
 // Publications telles qu'affichées dans le fil (une seule si contentId est donné : publication partagée).
 // Publications visibles par la personne (pays choisi, publiques ou de ses abonnements, comptes non bloqués).
 const FEED_WHERE = `c.status = 'actif' AND cr.account_status = 'actif'
-       AND ($1::text IS NULL OR cr.country_code = $1)
+       AND ($1::text IS NULL OR cr.country_code = ANY(string_to_array($1::text, ',')))
        AND (c.visibility_scope = 'public'
             OR c.creator_id = $2
             OR EXISTS (SELECT 1 FROM follows f WHERE f.follower_id = $2 AND f.followed_id = c.creator_id))
@@ -1665,7 +1665,9 @@ async function feedItems(viewerId, country, contentId, onlyIds) {
 
 app.get('/api/feed', async (req, res) => {
   const viewerId = optionalViewerId(req);
-  const country = /^[A-Z]{2}$/.test(String(req.query.country || '')) ? req.query.country : null;
+  // Un pays (« Mon pays ») ou plusieurs pays choisis dans un continent : FR,BE,CD (80 au plus).
+  const codes = [...new Set(String(req.query.country || '').split(',').filter((c) => /^[A-Z]{2}$/.test(c)))].slice(0, 80);
+  const country = codes.length ? codes.join(',') : null;
   const items = await engage.mergeRepostsIntoFeed(viewerId, await feedItems(viewerId, country, null));
   let following = [];
   if (viewerId) {
@@ -1675,7 +1677,7 @@ app.get('/api/feed', async (req, res) => {
   const viewerPremium = viewerId ? Boolean(await money.premiumUntil(viewerId)) : false;
   // Publicités ciblées : selon le pays et la ville du profil de la personne connectée (sinon le pays demandé).
   const where = viewerId ? await db.query('SELECT country_code, city FROM creators WHERE id = $1', [viewerId]).catch(() => null) : null;
-  const ads = (await money.adsForFeed({ country: (where && where.country_code) || country, city: where && where.city }).catch(() => [])).slice(0, viewerPremium ? 1 : 5);
+  const ads = (await money.adsForFeed({ country: (where && where.country_code) || (codes.length === 1 ? codes[0] : null), city: where && where.city }).catch(() => [])).slice(0, viewerPremium ? 1 : 5);
   res.json({ items, following, ads, viewerPremium });
 });
 
