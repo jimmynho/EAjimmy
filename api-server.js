@@ -2919,7 +2919,12 @@ app.get('/api/admin/broadcasts', requireAdminPermission('envoyer_annonces'), asy
 // Suppression DÉFINITIVE d'un compte et de toutes ses données — administrateur principal uniquement
 // (jamais accordable à un administrateur secondaire).
 app.delete('/api/admin/creators/:id', requireAdminPrincipal, async (req, res) => {
-  const deleted = await deleteCreatorAccount(pool, req.params.id);
+  let deleted;
+  try { deleted = await deleteCreatorAccount(pool, req.params.id); }
+  catch (e) {
+    console.error(`[Eaji] Suppression du compte ${req.params.id} impossible :`, e.message, e.detail || '');
+    return res.status(500).json({ error: `Suppression impossible : ${e.message}${e.table ? ' (table ' + e.table + ')' : ''}. Rien n'a été effacé.` });
+  }
   if (!deleted) return res.status(404).json({ error: 'Compte introuvable.' });
   console.log(`[Eaji] Compte ${req.params.id} supprimé par l'administrateur ${req.adminId}`);
   // Les fichiers (dont la pièce d'identité et la photo du visage) sont effacés du stockage en arrière-plan.

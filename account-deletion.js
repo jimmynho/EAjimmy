@@ -45,6 +45,17 @@ async function deleteCreatorAccount(pool, creatorId) {
     for (const sql of DELETION_STATEMENTS) {
       await client.query(sql, [creatorId]);
     }
+    // Autres tables qui pointent encore vers le compte sans s'effacer toutes seules (tables plus anciennes
+    // de la base réelle) : leurs lignes du compte sont effacées aussi, sinon la suppression est refusée.
+    // Les tables de l'ONGD ne sont jamais touchées ici.
+    const blockers = await client.query(
+      `SELECT c.conrelid::regclass::text AS tbl, a.attname AS col
+         FROM pg_constraint c JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+        WHERE c.contype = 'f' AND c.confrelid = 'creators'::regclass AND c.confdeltype IN ('a', 'r')
+          AND array_length(c.conkey, 1) = 1 AND c.conrelid::regclass::text NOT ILIKE '%ongd%'`);
+    for (const b of blockers.rows) {
+      await client.query(`DELETE FROM ${b.tbl} WHERE "${String(b.col).replace(/"/g, '""')}" = $1`, [creatorId]);
+    }
     const result = await client.query('DELETE FROM creators WHERE id = $1', [creatorId]);
     await client.query('COMMIT');
     return result.rowCount > 0;
