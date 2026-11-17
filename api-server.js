@@ -2445,10 +2445,16 @@ app.post('/api/calls/:id/reject', requireAuth, async (req, res) => {
 });
 
 app.post('/api/calls/:id/end', requireAuth, async (req, res) => {
-  await db.query(
-    "UPDATE calls SET status = CASE WHEN status = 'ringing' THEN 'missed' ELSE 'ended' END, ended_at = now(), updated_at = now() WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted')",
+  const ended = await db.query(
+    "UPDATE calls SET status = CASE WHEN status = 'ringing' THEN 'missed' ELSE 'ended' END, ended_at = now(), updated_at = now() WHERE id = $1 AND (caller_id = $2 OR callee_id = $2) AND status IN ('ringing', 'accepted') RETURNING id, status, caller_id, callee_id",
     [req.params.id, req.creatorId]
   );
+  // L'appelant a raccroché avant la réponse : le téléphone de l'appelé arrête de sonner (« Appel manqué »).
+  if (ended && ended.status === 'missed' && ended.caller_id === req.creatorId) {
+    db.query('SELECT name FROM creators WHERE id = $1', [req.creatorId]).then((c) =>
+      push.sendTo(ended.callee_id, { kind: 'appel_fin', urgent: true, ttl: 60, tag: `call:${ended.id}`, link: `dm:${req.creatorId}`,
+        title: '📞 Appel manqué', body: `${c ? c.name : 'Quelqu\'un'} a essayé de t'appeler.` })).catch(() => {});
+  }
   res.json({ ended: true });
 });
 
