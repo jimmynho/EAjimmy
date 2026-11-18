@@ -146,7 +146,10 @@ function makeNotifier(db, sendPush) {
       } catch (e) { console.error('[Eaji] Notification non enregistrée :', e.message); }
     }
     // Sur l'appareil (écran verrouillé compris), sans faire attendre la personne qui agit.
-    if (sendPush) sendPush(creatorId, { kind, link, title: opts.title, body: opts.body || text, urgent: kind === 'appel' }).catch(() => {});
+    // Appels et messages : priorité haute (le téléphone en veille se réveille et sonne tout de suite) ;
+    // un message reste gardé 24 h si le téléphone est éteint.
+    if (sendPush) sendPush(creatorId, { kind, link, title: opts.title, body: opts.body || text,
+      urgent: kind === 'appel' || kind === 'message', ttl: kind === 'message' ? 24 * 3600 : undefined }).catch(() => {});
   };
 }
 
