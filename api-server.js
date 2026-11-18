@@ -313,6 +313,9 @@ async function runStartupMigrations() {
     ...accountClose.MIGRATIONS,
     // Poste d'un administrateur secondaire (ex. « Service client », « Modérateur »).
     'ALTER TABLE admins ADD COLUMN IF NOT EXISTS job_title TEXT',
+    // Abonnés prévenus d'une nouvelle publication (une seule fois). Les publications d'avant sont marquées « déjà prévenues ».
+    'ALTER TABLE content_items ADD COLUMN IF NOT EXISTS followers_notified_at TIMESTAMPTZ DEFAULT now()',
+    'ALTER TABLE content_items ALTER COLUMN followers_notified_at DROP DEFAULT',
     // Tâches qu'on peut confier (liste aussi dans ADMIN_TASKS plus bas).
     'ALTER TABLE admin_permissions DROP CONSTRAINT IF EXISTS admin_permissions_permission_check',
     `ALTER TABLE admin_permissions ADD CONSTRAINT admin_permissions_permission_check CHECK (permission IN (
@@ -1387,7 +1390,44 @@ app.post('/api/content', requireAuth, async (req, res) => {
   if (!aiMarkers.length && !textOnly) watch.checkAiInStorage(content.id, storageUrl).catch(() => {});
   watch.flag({ creatorId: req.creatorId, source: 'publication', refId: content.id, origin: 'texte', text: title }).catch(() => {});
   res.status(201).json({ contentId: content.id, status: content.status });
+  if (content.status === 'actif') notifyFollowersNewPost(content.id).catch(() => {});
 });
+
+// ==== Nouvelle publication : les abonnés sont prévenus (cloche + notification sur le téléphone + nombre sur l'icône) ====
+// Une seule fois par publication, même si plusieurs serveurs essaient (la ligne est « réservée » d'abord).
+// Une publication mise en ligne plus tard (vérifiée par l'équipe ou par l'IA) est prise par la vérification de chaque minute.
+const POST_KIND_WORDS = { video_courte: 'une vidéo', video_longue: 'une vidéo', film: 'un film', photo: 'une photo', musique: 'une musique',
+  podcast: 'un podcast', livre: 'un livre', pdf: 'un document', powerpoint: 'une présentation' };
+async function notifyFollowersNewPost(contentId) {
+  const c = await db.query(
+    `UPDATE content_items c SET followers_notified_at = now() FROM creators cr
+     WHERE c.id = $1 AND cr.id = c.creator_id AND c.status = 'actif' AND cr.account_status = 'actif' AND c.followers_notified_at IS NULL
+     RETURNING c.id, c.title, c.content_type, c.creator_id, cr.name`, [contentId]);
+  if (!c) return 0;
+  const fans = await db.all(
+    `SELECT f.follower_id AS id FROM follows f JOIN creators x ON x.id = f.follower_id
+     WHERE f.followed_id = $1 AND x.account_status = 'actif'
+       AND NOT EXISTS (SELECT 1 FROM blocks b WHERE (b.blocker_id = f.follower_id AND b.blocked_id = $1) OR (b.blocker_id = $1 AND b.blocked_id = f.follower_id))
+     LIMIT 20000`, [c.creator_id]);
+  const what = POST_KIND_WORDS[c.content_type] || ''; // publication texte : « a publié : … »
+  const t = String(c.title || '').replace(/\s+/g, ' ').trim();
+  const shortTitle = t.length > 70 ? `${t.slice(0, 70)}…` : t;
+  const did = `a publié${what ? ` ${what}` : ''}${shortTitle ? ` : « ${shortTitle} »` : ''}`;
+  const text = `📢 ${c.name} ${did}`;
+  for (const f of fans) {
+    await notify(f.id, 'nouvelle_publication', text, `post:${c.id}`, { title: `📢 ${c.name}`, body: did.charAt(0).toUpperCase() + did.slice(1) }).catch(() => {});
+  }
+  return fans.length;
+}
+// Publications mises en ligne après coup (vérification) : abonnés prévenus dans la minute.
+setInterval(async () => {
+  try {
+    const rows = await db.all(
+      `SELECT id FROM content_items WHERE status = 'actif' AND followers_notified_at IS NULL AND created_at > now() - interval '3 days'
+       ORDER BY created_at LIMIT 20`);
+    for (const r of rows) await notifyFollowersNewPost(r.id).catch(() => {});
+  } catch (e) { /* base indisponible : nouvel essai dans une minute */ }
+}, 60000).unref();
 
 // Sons d'Eaji : les vidéos et musiques gratuites et publiques, réutilisables dans l'éditeur (« utiliser ce son »).
 app.get('/api/sounds', requireAuth, async (req, res) => {
