@@ -158,7 +158,7 @@ function create(db) {
   }
 
   // Envoie une notification à tous les appareils actifs d'un compte (sans bloquer la requête).
-  async function sendTo(creatorId, { title, body, link = null, kind = 'info', tag = null, urgent = false, ttl } = {}) {
+  async function sendTo(creatorId, { title, body, link = null, kind = 'info', tag = null, urgent = false, ttl, report = null } = {}) {
     if (!creatorId) return 0;
     try {
       const subs = await db.all(
@@ -178,8 +178,12 @@ function create(db) {
           TTL: String(ttl != null ? ttl : (urgent ? 60 : 24 * 3600)), Urgency: urgent ? 'high' : 'normal',
           Authorization: vapidHeader(s.endpoint, k, subject()),
         }, enc);
+        if (report) report.push(status);
         if (status >= 200 && status < 300) { sent++; db.query('UPDATE push_subscriptions SET last_ok_at = now() WHERE id = $1', [s.id]).catch(() => {}); }
-        else if (status === 404 || status === 410 || status === 401 || status === 403) await db.query('DELETE FROM push_subscriptions WHERE id = $1', [s.id]); // appareil désabonné
+        else {
+          console.warn(`[Eaji] Notification refusée par ${new URL(s.endpoint).host} (code ${status || 'pas de réponse'})`);
+          if (status === 404 || status === 410 || status === 401 || status === 403) await db.query('DELETE FROM push_subscriptions WHERE id = $1', [s.id]); // appareil désabonné
+        }
       }
       return sent;
     } catch (e) { console.error('[Eaji] Notification appareil non envoyée :', e.message); return 0; }
@@ -234,8 +238,9 @@ function create(db) {
     });
 
     app.post('/api/push/test', requireAuth, async (req, res) => {
-      const sent = await sendTo(req.creatorId, { title: '🔔 Eaji', body: 'Les notifications fonctionnent sur cet appareil.', kind: 'info', link: 's-profil', tag: 'test' });
-      res.json({ sent });
+      const report = [];
+      const sent = await sendTo(req.creatorId, { title: '🔔 Eaji', body: 'Les notifications fonctionnent sur cet appareil.', kind: 'info', link: 's-profil', tag: 'test', urgent: true, report });
+      res.json({ sent, devices: report.length, codes: report });
     });
   }
 

@@ -316,6 +316,9 @@ async function runStartupMigrations() {
     // Abonnés prévenus d'une nouvelle publication (une seule fois). Les publications d'avant sont marquées « déjà prévenues ».
     'ALTER TABLE content_items ADD COLUMN IF NOT EXISTS followers_notified_at TIMESTAMPTZ DEFAULT now()',
     'ALTER TABLE content_items ALTER COLUMN followers_notified_at DROP DEFAULT',
+    // Une même publication envoyée deux fois (réseau qui coupe, nouvel essai automatique) n'est enregistrée qu'une fois.
+    'ALTER TABLE content_items ADD COLUMN IF NOT EXISTS client_ref TEXT',
+    'CREATE UNIQUE INDEX IF NOT EXISTS content_items_client_ref_idx ON content_items (creator_id, client_ref) WHERE client_ref IS NOT NULL',
     // Tâches qu'on peut confier (liste aussi dans ADMIN_TASKS plus bas).
     'ALTER TABLE admin_permissions DROP CONSTRAINT IF EXISTS admin_permissions_permission_check',
     `ALTER TABLE admin_permissions ADD CONSTRAINT admin_permissions_permission_check CHECK (permission IN (
@@ -1361,14 +1364,25 @@ app.post('/api/content', requireAuth, async (req, res) => {
   }
   // Marques d'outils d'intelligence artificielle trouvées dans le fichier par le téléphone (Sora, Veo, Meta AI…).
   const aiMarkers = (Array.isArray(req.body.aiMarkers) ? req.body.aiMarkers : []).map((m) => String(m).slice(0, 60)).slice(0, 5);
+  // Même envoi reçu deux fois (même numéro d'envoi) : on renvoie la publication déjà enregistrée, sans doublon.
+  const clientRef = /^[A-Za-z0-9_-]{8,64}$/.test(String(req.body.clientRef || '')) ? String(req.body.clientRef) : null;
+  if (clientRef) {
+    const already = await db.query('SELECT id, status FROM content_items WHERE creator_id = $1 AND client_ref = $2', [req.creatorId, clientRef]);
+    if (already) return res.status(200).json({ contentId: already.id, status: already.status, duplicate: true });
+  }
   const content = await db.query(
-    `INSERT INTO content_items (creator_id, content_type, title, storage_url, file_size_bytes, visibility_scope, duration_seconds, sale_price, status, sound_content_id, ai_generated, ai_source)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id, status`,
+    `INSERT INTO content_items (creator_id, content_type, title, storage_url, file_size_bytes, visibility_scope, duration_seconds, sale_price, status, sound_content_id, ai_generated, ai_source, client_ref)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     ON CONFLICT (creator_id, client_ref) WHERE client_ref IS NOT NULL DO NOTHING RETURNING id, status`,
     [req.creatorId, contentType, title, storageUrl, fileSizeBytes || null, visibilityScope || 'public', durationSeconds, sale.skip ? null : sale.value,
      // Détection de nudité impossible sur le téléphone (pas de réseau…) : la publication attend l'équipe Eaji.
      !textOnly && req.body.safetyCheck === 'non_verifie' ? 'en_revue' : 'actif', soundId,
-     aiMarkers.length > 0, aiMarkers.length ? `Marque IA dans le fichier : ${aiMarkers.join(', ')}` : null]
+     aiMarkers.length > 0, aiMarkers.length ? `Marque IA dans le fichier : ${aiMarkers.join(', ')}` : null, clientRef]
   );
+  if (!content) { // le même envoi est arrivé en même temps par un autre chemin : un seul est gardé
+    const same = await db.query('SELECT id, status FROM content_items WHERE creator_id = $1 AND client_ref = $2', [req.creatorId, clientRef]);
+    return res.status(200).json({ contentId: same && same.id, status: same && same.status, duplicate: true });
+  }
   if (textOnly) await db.query('UPDATE content_items SET text_bg = $2 WHERE id = $1', [content.id, textBgOf(req.body.textBg)]);
   // Image d'aperçu préparée par le téléphone (image de la vidéo, photo réduite ou texte sur son fond).
   const thumb = thumbOf(req.body, req.creatorId);
