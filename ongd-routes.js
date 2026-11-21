@@ -265,7 +265,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   const PREFIXES = [['/admin/activites', 'activites'], ['/admin/volontaires', 'volontaires'], ['/admin/dons', 'dons'], ['/admin/messages', 'messages'],
     ['/admin/programmes', 'formations'], ['/admin/inscriptions', 'formations'], ['/admin/produits', 'boutique'], ['/admin/commandes', 'boutique'],
     ['/admin/annonces', 'annonces'], ['/admin/sujets', 'dialogue'], ['/admin/reponses', 'dialogue'], ['/admin/directs', 'direct'],
-    ['/admin/fichiers', 'fichiers'], ['/admin/achats', 'fichiers'], ['/admin/membres', 'membres'], ['/admin/cotisations', 'membres'], ['/admin/consultations', 'membres']];
+    ['/admin/fichiers', 'fichiers'], ['/admin/achats', 'fichiers'], ['/admin/membres', 'membres'], ['/admin/cotisations', 'membres'], ['/admin/consultations', 'membres'], ['/admin/commentaires', 'activites']];
   const PAIEMENT_SECTION = { DON: 'dons', INS: 'formations', CMD: 'boutique', PUB: 'annonces', TEL: 'fichiers', COT: 'membres' };
   function sectionDe(chemin) {
     if (/^\/admin\/(deconnexion|moi|resume)$/.test(chemin)) return null; // commun à tous les administrateurs
@@ -315,7 +315,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   r.use((req, res, next) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.set('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
     res.set('X-Frame-Options', 'DENY');
@@ -351,13 +351,14 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
     if (titre.length < 3) throw new ErrUtil("Donnez un titre à l'activité.");
     if (texte.length < 20) throw new ErrUtil("Décrivez l'activité (au moins 20 caractères).");
     const photos = photosValides(b.photos);
+    const video = volontaireId == null ? await videoValide(b.video_cle, b.video_nom) : null; // vidéo : équipe de l'ONGD seulement
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const { rows } = await client.query(
-        `INSERT INTO ongd_activites(volontaire_id, titre, lieu, date_activite, texte, statut, publie_le)
-         VALUES($1,$2,$3,$4,$5,$6, CASE WHEN $6 = 'publie' THEN now() END) RETURNING id`,
-        [volontaireId, titre, lieu || null, date, texte, statut]);
+        `INSERT INTO ongd_activites(volontaire_id, titre, lieu, date_activite, texte, statut, publie_le, video_cle, video_type)
+         VALUES($1,$2,$3,$4,$5,$6, CASE WHEN $6 = 'publie' THEN now() END, $7, $8) RETURNING id`,
+        [volontaireId, titre, lieu || null, date, texte, statut, video?.cle || null, video?.type || null]);
       for (const [i, p] of photos.entries())
         await client.query('INSERT INTO ongd_photos(activite_id, ordre, type, donnees) VALUES($1,$2,$3,$4)', [rows[0].id, i, p.type, p.buf]);
       await client.query('COMMIT');
@@ -365,8 +366,24 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
     } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
   }
 
+  // Vidéo d'une publication : envoyée d'abord sur Backblaze (comme les fichiers), puis rattachée ici
+  async function videoValide(cle, nom) {
+    if (!cle) return null;
+    cle = String(cle);
+    if (!/^ongd\/fichiers\/[0-9a-f-]{36}\.[a-z0-9]{1,5}$/.test(cle)) throw new ErrUtil('Vidéo invalide.');
+    const sto = ctx.sto && ctx.sto();
+    if (!sto) throw new ErrUtil('Le stockage des vidéos n\'est pas configuré sur le serveur (variables B2_*).');
+    if (ctx.genreDe(cle) !== 'video') throw new ErrUtil('Ce fichier n\'est pas une vidéo (MP4, MOV, WebM, 3GP…).');
+    try { await sto.infos(cle); } catch { throw new ErrUtil('La vidéo n\'est pas arrivée sur le stockage. Réessayez l\'envoi.'); }
+    const e = cle.split('.').pop();
+    const type = { mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm', '3gp': 'video/3gpp', mkv: 'video/x-matroska', avi: 'video/x-msvideo' }[e] || 'video/mp4';
+    return { cle, type, nom: txt(nom, 200) };
+  }
+
   const SELECT_ACTIVITE = `SELECT a.id, a.titre, a.lieu, to_char(a.date_activite, 'YYYY-MM-DD') AS date_activite, a.texte, a.statut, a.motif_refus, a.cree_le, a.publie_le,
-      COALESCE(v.nom, 'Équipe de l''ONGD') AS auteur, v.telephone AS auteur_telephone,
+      COALESCE(v.nom, 'Équipe de l''ONGD') AS auteur, v.telephone AS auteur_telephone, a.modifie_le, (a.video_cle IS NOT NULL) AS video,
+      (SELECT count(*)::int FROM ongd_jaime j WHERE j.activite_id = a.id) AS jaime,
+      (SELECT count(*)::int FROM ongd_commentaires c WHERE c.activite_id = a.id) AS commentaires,
       COALESCE((SELECT json_agg(p.id ORDER BY p.ordre) FROM ongd_photos p WHERE p.activite_id = a.id), '[]') AS photos
     FROM ongd_activites a LEFT JOIN ongd_volontaires v ON v.id = a.volontaire_id`;
 
@@ -793,7 +810,8 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   }));
 
   r.delete('/admin/activites/:id', admin, wrap(async (req, res) => {
-    await q('DELETE FROM ongd_activites WHERE id = $1', [req.params.id]);
+    const { rows } = await q('DELETE FROM ongd_activites WHERE id = $1 RETURNING video_cle', [req.params.id]);
+    if (rows[0]?.video_cle) ctx.sto?.()?.supprimer(rows[0].video_cle).catch(e => console.error('[ONGD] suppression vidéo', e.message));
     journal('suppression_activite', req, 'activité ' + req.params.id);
     res.json({ ok: true });
   }));
@@ -966,9 +984,10 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   /* ---------- Fonctions supplémentaires (formations, boutique, annonces, dialogue, direct) ---------- */
   const ctx = { r, pool, q, wrap, anti, antiRobot, exige, admin, txt, tel, ErrUtil, imagesValides, nouvelleRef, initierPaiement,
     verifierCinetpay, marquerPaye, typeDe, surPaiement, journal, reglage, prixEn, ia, iaPrete, presentationIa, creerSession, ipDe, envoyerCsv, DEVISES,
-    stockage: options.stockage, detailsPaiement: {}, equipeAbsente };
+    stockage: options.stockage, detailsPaiement: {}, equipeAbsente, SELECT_ACTIVITE, photosValides, videoValide, SITE_URL };
   const extensions = require('./ongd-extensions')(ctx);
   const membres = require('./ongd-membres')(ctx);
+  require('./ongd-publications')(ctx); // publication entière, correction, j'aime, commentaires, partage
   options.contexteIa = async () => [await extensions.contexteIa(), await membres.contexteIa()].join('\n');
 
   app.use('/api/ongd', r);
@@ -1014,6 +1033,16 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
       id SERIAL PRIMARY KEY, nom TEXT NOT NULL, telephone TEXT UNIQUE NOT NULL, charge TEXT, permissions JSONB NOT NULL DEFAULT '[]',
       mdp_hash TEXT NOT NULL, statut TEXT NOT NULL DEFAULT 'actif', cree_le TIMESTAMPTZ NOT NULL DEFAULT now());
     ALTER TABLE ongd_sessions ADD COLUMN IF NOT EXISTS admin_id INT REFERENCES ongd_admins(id) ON DELETE CASCADE;
+    ALTER TABLE ongd_activites ADD COLUMN IF NOT EXISTS video_cle TEXT;
+    ALTER TABLE ongd_activites ADD COLUMN IF NOT EXISTS video_type TEXT;
+    ALTER TABLE ongd_activites ADD COLUMN IF NOT EXISTS modifie_le TIMESTAMPTZ;
+    CREATE TABLE IF NOT EXISTS ongd_jaime (
+      activite_id INT NOT NULL REFERENCES ongd_activites(id) ON DELETE CASCADE, visiteur TEXT NOT NULL,
+      cree_le TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (activite_id, visiteur));
+    CREATE TABLE IF NOT EXISTS ongd_commentaires (
+      id SERIAL PRIMARY KEY, activite_id INT NOT NULL REFERENCES ongd_activites(id) ON DELETE CASCADE,
+      nom TEXT NOT NULL, texte TEXT NOT NULL, cree_le TIMESTAMPTZ NOT NULL DEFAULT now());
+    CREATE INDEX IF NOT EXISTS ongd_commentaires_activite ON ongd_commentaires(activite_id);
   `).then(() => extensions.creerTables()).then(() => membres.creerTables())
     .then(() => console.log('[ONGD] Les Volontaires : tables prêtes'))
     .catch(e => console.error('[ONGD] création des tables', e.message));

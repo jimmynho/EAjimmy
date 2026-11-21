@@ -48,9 +48,13 @@ module.exports = function (ctx) {
       urlLecture: (cle, nom) => getSignedUrl(s3, new sdk.GetObjectCommand({ Bucket: B, Key: cle,
         ResponseContentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(String(nom).slice(0, 150))}` }), { expiresIn: 900 }),
       supprimer: cle => s3.send(new sdk.DeleteObjectCommand({ Bucket: B, Key: cle })),
+      // Lecture d'une vidéo directement dans la page (publications), lien valable 6 h
+      urlVoir: (cle, type) => getSignedUrl(s3, new sdk.GetObjectCommand({ Bucket: B, Key: cle, ResponseContentType: type || undefined,
+        ResponseContentDisposition: 'inline' }), { expiresIn: 21600 }),
     };
     return stockage;
   }
+  ctx.sto = () => sto(); ctx.genreDe = nom => genreDe(nom); // utilisés par les publications (vidéos)
   const stoOuErreur = () => { const s = sto(); if (!s) throw new ErrUtil('Le stockage des fichiers n\'est pas configuré sur le serveur (variables B2_*).'); return s; };
 
   // Test du stockage pour le diagnostic de l'administration
@@ -317,14 +321,16 @@ module.exports = function (ctx) {
     res.json({ cle, genre, url_envoi: await stoOuErreur().urlEnvoi(cle, type), type });
   }));
   // Envoi par le serveur si l'envoi direct vers Backblaze échoue (le fichier passe sans être gardé en mémoire)
-  r.put('/admin/fichiers/relais', admin, wrap(async (req, res) => {
+  const relais = wrap(async (req, res) => {
     const cle = String(req.query.cle || '');
     if (!/^ongd\/fichiers\/[0-9a-f-]{36}\.[a-z0-9]{1,5}$/.test(cle)) throw new ErrUtil('Envoi non autorisé.');
     const taille = Number(req.headers['content-length']);
     if (!(taille > 0 && taille <= TAILLE_MAX)) throw new ErrUtil('Taille de fichier invalide.');
     await stoOuErreur().envoyer(cle, txt(req.query.type, 100) || 'application/octet-stream', req, taille);
     res.json({ ok: true });
-  }));
+  });
+  r.put('/admin/fichiers/relais', admin, relais);
+  r.post('/admin/fichiers/relais', admin, relais); // POST : accepté par tous les navigateurs sans réglage particulier
   r.post('/admin/fichiers', admin, wrap(async (req, res) => {
     const b = req.body || {};
     const titre = txt(b.titre, 150), nom = txt(b.nom_fichier, 200), cle = String(b.cle || '');
