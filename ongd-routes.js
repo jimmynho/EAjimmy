@@ -994,6 +994,7 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   const extensions = require('./ongd-extensions')(ctx);
   const membres = require('./ongd-membres')(ctx);
   require('./ongd-publications')(ctx); // publication entière, correction, j'aime, commentaires, partage
+  require('./ongd-site')(app, ctx); // ongdlesvolontaires.eaji.org : pages du site + aperçu des publications partagées
   options.contexteIa = async () => [await extensions.contexteIa(), await membres.contexteIa()].join('\n');
 
   app.use('/api/ongd', r);
