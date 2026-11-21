@@ -437,13 +437,14 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
   }));
 
   r.get('/stats', wrap(async (req, res) => {
-    const [a, v, d] = await Promise.all([
+    const [a, v, d, vis] = await Promise.all([
       q("SELECT count(*)::int n FROM ongd_activites WHERE statut = 'publie'"),
       q("SELECT count(*)::int n FROM ongd_volontaires WHERE statut = 'actif'"),
       q("SELECT devise, sum(montant)::float total, count(*)::int nombre FROM ongd_dons WHERE statut = 'paye' GROUP BY devise ORDER BY devise DESC"),
+      q('SELECT count(DISTINCT visiteur || jour)::int n FROM ongd_visites'), // une visite = un visiteur, un jour
     ]);
     res.set('Cache-Control', 'no-cache');
-    res.json({ activites: a.rows[0].n, volontaires: v.rows[0].n, dons: d.rows, paiement_en_ligne: cinetpayPret(), ia: iaPrete() });
+    res.json({ activites: a.rows[0].n, volontaires: v.rows[0].n, dons: d.rows, visites: vis.rows[0].n, paiement_en_ligne: cinetpayPret(), ia: iaPrete() });
   }));
 
   r.get('/activites', wrap(async (req, res) => {
@@ -785,7 +786,12 @@ ${infos ? 'Informations données par l\'ONGD :\n' + infos + '\n' : ''}${await (a
       (SELECT count(*)::int FROM ongd_achats WHERE statut = 'declare') achats,
       (SELECT count(*)::int FROM ongd_cotisations WHERE statut = 'declare') + (SELECT count(*)::int FROM ongd_consultations WHERE statut = 'proposee') membres`);
     const dons = await q("SELECT devise, sum(montant)::float total, count(*)::int nombre FROM ongd_dons WHERE statut = 'paye' GROUP BY devise");
-    res.json({ en_attente: rows[0], dons_recus: dons.rows, paiement_en_ligne: cinetpayPret(), ia: iaPrete() });
+    const vis = await q(`SELECT
+      count(DISTINCT visiteur) FILTER (WHERE jour = (now() AT TIME ZONE 'Africa/Kinshasa')::date)::int aujourdhui,
+      count(DISTINCT visiteur || jour) FILTER (WHERE jour > (now() AT TIME ZONE 'Africa/Kinshasa')::date - 7)::int sept_jours,
+      count(DISTINCT visiteur || jour)::int total,
+      count(DISTINCT visiteur) FILTER (WHERE le > now() - interval '5 minutes')::int en_ligne FROM ongd_visites`);
+    res.json({ en_attente: rows[0], dons_recus: dons.rows, visites: vis.rows[0], paiement_en_ligne: cinetpayPret(), ia: iaPrete() });
   }));
 
   r.get('/admin/activites', admin, wrap(async (req, res) => {

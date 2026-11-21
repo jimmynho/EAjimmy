@@ -83,32 +83,37 @@ module.exports = function (ctx) {
 
   // Page d'aperçu pour le partage : Facebook et WhatsApp y lisent le titre, la photo et le résumé,
   // puis la personne qui clique est envoyée sur la publication dans le site.
+  // Robots des réseaux sociaux : ils lisent la page d'aperçu. Les personnes, elles, vont tout de suite sur le site.
+  const ROBOTS = /facebookexternalhit|facebot|meta-externalagent|whatsapp|telegrambot|twitterbot|linkedinbot|slackbot|discordbot|skypeuripreview|pinterest|redditbot|googlebot|bingbot|applebot|embedly|vkshare|viber|snapchat|tiktok|bytespider|quora|outbrain|iframely|preview/i;
   r.get('/partage/:id', wrap(async (req, res) => {
     const id = idDe(req.params.id);
     const a = id && await publiee(id);
     const cible = a ? `${SITE_URL}/?p=${a.id}` : SITE_URL + '/';
+    if (!ROBOTS.test(String(req.headers['user-agent'] || ''))) { res.set('Cache-Control', 'no-cache'); return res.redirect(302, cible); }
     const base = `${req.protocol}://${req.get('host')}/api/ongd`;
-    const image = a?.photos?.length ? `${base}/photos/${a.photos[0]}` : `${SITE_URL}/icone-512.png`;
+    const image = a?.photos?.length ? `${base}/photos/${a.photos[0]}` : `${SITE_URL}/affiche-ongd.jpg`;
     const titre = a ? a.titre : 'ONGD Les Volontaires';
-    const resume = a ? a.texte.replace(/\s+/g, ' ').slice(0, 220) + (a.texte.length > 220 ? '…' : '') : 'Agir ensemble, là où on a besoin de nous.';
+    const resume = a ? a.texte.replace(/\s+/g, ' ').slice(0, 280) + (a.texte.length > 280 ? '…' : '') : 'Agir ensemble, là où on a besoin de nous.';
     res.set('Cache-Control', 'public, max-age=600');
     res.type('html').send(`<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${echapper(titre)} — ONGD Les Volontaires</title>
 <meta name="description" content="${echapper(resume)}">
 <meta property="og:type" content="article">
+<meta property="og:url" content="${echapper(base + '/partage/' + (a ? a.id : id))}">
 <meta property="og:site_name" content="ONGD Les Volontaires">
 <meta property="og:title" content="${echapper(titre)}">
 <meta property="og:description" content="${echapper(resume)}">
 <meta property="og:image" content="${echapper(image)}">
+<meta property="og:image:alt" content="${echapper(titre)}">
 <meta property="og:locale" content="fr_FR">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${echapper(titre)}">
 <meta name="twitter:description" content="${echapper(resume)}">
 <meta name="twitter:image" content="${echapper(image)}">
-<meta http-equiv="refresh" content="0;url=${echapper(cible)}">
 </head><body style="font-family:sans-serif;padding:24px">
-<p><a href="${echapper(cible)}">Voir la publication sur le site de l'ONGD Les Volontaires</a></p>
+<h1>${echapper(titre)}</h1><p>${echapper(resume)}</p>
+<p><a href="${echapper(cible)}">Lire la publication sur ongdlesvolontaires.eaji.org</a></p>
 </body></html>`);
   }));
 
