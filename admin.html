@@ -1,0 +1,1220 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://eajimmy-production.up.railway.app; connect-src 'self' https://eajimmy-production.up.railway.app https://*.backblazeb2.com; frame-src 'none'; base-uri 'self'; form-action 'self'; object-src 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Administration — ONGD Les Volontaires</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#10392a">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Source+Sans+3:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="config.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" defer></script>
+</head>
+<body class="page-outil">
+<header class="entete">
+  <div class="conteneur">
+    <a class="marque" href="./"><img src="logo.svg" alt=""><span><small>Administration</small>Les Volontaires</span></a>
+    <button class="btn btn-contour btn-petit" id="btn-sortir" hidden>Se déconnecter</button>
+  </div>
+</header>
+
+<main class="conteneur">
+  <div id="ecran-connexion" class="etroit" style="margin:0 auto">
+    <div class="boite">
+      <h2>Administration de l'ONGD</h2>
+      <form id="form-connexion" novalidate>
+        <div class="champ"><label for="cx-tel">Numéro de l'administrateur</label><input id="cx-tel" type="tel" autocomplete="tel" required></div>
+        <div class="champ"><label for="cx-mdp">Mot de passe</label><input id="cx-mdp" type="password" autocomplete="current-password" required></div>
+        <div class="champ" id="champ-code" hidden><label for="cx-code">Code à 6 chiffres (application d'authentification)</label><input id="cx-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" style="letter-spacing:.3em;font-weight:700"></div>
+        <button class="btn btn-vert" style="width:100%">Se connecter</button>
+        <div class="alerte" hidden></div>
+      </form>
+    </div>
+  </div>
+
+  <div id="ecran-admin" hidden>
+    <div id="qui-admin" style="margin-bottom:10px"></div>
+    <button type="button" class="bandeau-visites" id="bandeau-visites" hidden></button>
+    <div class="onglets" id="onglets">
+      <button data-o="activites" class="actif">À valider <span class="pastille" id="p-activites" hidden></span></button>
+      <button data-o="publier">Publier</button>
+      <button data-o="volontaires">Volontaires <span class="pastille" id="p-volontaires" hidden></span></button>
+      <button data-o="dons">Dons <span class="pastille" id="p-dons" hidden></span></button>
+      <button data-o="messages">Messages <span class="pastille" id="p-messages" hidden></span></button>
+      <button data-o="formations">Formations <span class="pastille" id="p-inscriptions" hidden></span></button>
+      <button data-o="boutique">Boutique <span class="pastille" id="p-commandes" hidden></span></button>
+      <button data-o="annonces">Annonces <span class="pastille" id="p-annonces" hidden></span></button>
+      <button data-o="dialogue">Dialogue</button>
+      <button data-o="direct">Direct</button>
+      <button data-o="reglages">Réglages</button>
+      <button data-o="fichiers">Fichiers <span class="pastille" id="p-achats" hidden></span></button>
+      <button data-o="membres">Membres <span class="pastille" id="p-membres" hidden></span></button>
+      <button data-o="visites">Visites</button>
+      <button data-o="admins">Administrateurs</button>
+      <button data-o="securite">Sécurité</button>
+    </div>
+    <div id="alerte-generale" class="alerte" hidden></div>
+
+    <!-- Activités -->
+    <section class="boite" data-panneau="activites" style="padding:22px">
+      <div class="bascule" id="filtre-act">
+        <button data-s="en_attente" class="actif">En attente</button><button data-s="publie">Publiées</button><button data-s="refuse">Refusées</button>
+      </div>
+      <div id="liste-act"></div>
+    </section>
+
+    <!-- Publier en tant qu'ONGD -->
+    <section class="boite etroit" data-panneau="publier" hidden style="padding:22px">
+      <h2 style="font-size:1.4rem" id="titre-publier">Publier une activité (équipe de l'ONGD)</h2>
+      <p class="petit" id="info-publier">Publiée directement sur le site, sans validation.</p>
+      <form id="form-publier" novalidate>
+        <div class="champ"><label for="a-titre">Titre</label><input id="a-titre" maxlength="150" required></div>
+        <div class="deux">
+          <div class="champ"><label for="a-date">Date</label><input id="a-date" type="date"></div>
+          <div class="champ"><label for="a-lieu">Lieu</label><input id="a-lieu" maxlength="150"></div>
+        </div>
+        <div class="champ"><label for="a-texte">Compte rendu</label><textarea id="a-texte" rows="7" required></textarea></div>
+        <div class="champ"><label for="a-photos">Photos (jusqu'à 4)</label><input id="a-photos" type="file" accept="image/*" multiple><div class="apercus" id="apercus"></div></div>
+        <div class="champ"><label for="a-video">Vidéo <span class="facultatif">(facultatif : MP4, MOV, 3GP… 2 Go maximum)</span></label><input id="a-video" type="file" accept="video/*,.mp4,.mov,.3gp,.webm,.m4v">
+          <div class="petit" id="video-actuelle" hidden></div>
+          <div class="progression" id="barre-video" hidden style="height:auto;padding:0;position:relative"><span style="height:14px;width:0"></span><em class="petit" style="position:absolute;right:8px;top:-2px;font-style:normal"></em></div></div>
+        <button class="btn btn-vert" style="width:100%" id="btn-publier">Publier sur le site</button>
+        <button type="button" class="btn btn-contour" style="width:100%;margin-top:8px" id="annuler-edition" hidden>Annuler la modification</button>
+        <div class="alerte" hidden></div>
+      </form>
+    </section>
+
+    <!-- Volontaires -->
+    <section class="boite" data-panneau="volontaires" hidden style="padding:22px"><div id="liste-vol"></div></section>
+
+    <!-- Dons -->
+    <section class="boite" data-panneau="dons" hidden style="padding:22px">
+      <div class="totaux" id="totaux"></div>
+      <p class="petit" id="etat-paiement"></p>
+      <button class="btn btn-contour btn-petit" id="btn-csv">Télécharger pour la comptabilité (CSV)</button>
+      <div id="liste-dons" style="margin-top:10px"></div>
+    </section>
+
+    <!-- Messages -->
+    <section class="boite" data-panneau="messages" hidden style="padding:22px"><div id="liste-msg"></div></section>
+
+    <!-- Formations et événements -->
+    <section class="boite" data-panneau="formations" hidden style="padding:22px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <button class="btn btn-vert btn-petit" id="btn-nouv-prog">Nouvelle formation / événement</button>
+        <form id="form-entree" style="display:flex;gap:6px" novalidate><input name="code" placeholder="Code à l'entrée" maxlength="6" style="width:150px;min-height:38px;text-transform:uppercase"><button class="btn btn-contour btn-petit">Vérifier</button></form>
+      </div>
+      <div id="resultat-entree"></div>
+      <form id="form-prog" class="carte" hidden novalidate style="margin-bottom:16px">
+        <h3 id="titre-form-prog">Nouvelle formation / événement</h3>
+        <div class="deux">
+          <div class="champ"><label>Type</label><select name="type"><option value="formation">Formation</option><option value="evenement">Événement (réservation de places)</option></select></div>
+          <div class="champ"><label>Statut</label><select name="statut"><option value="publie">Publié</option><option value="brouillon">Brouillon (caché)</option><option value="annule">Annulé</option></select></div>
+        </div>
+        <div class="champ"><label>Titre</label><input name="titre" maxlength="150" required></div>
+        <div class="champ"><label>Résumé (1 phrase)</label><input name="resume" maxlength="300"></div>
+        <div class="champ"><label>Description</label><textarea name="description"></textarea></div>
+        <div class="deux">
+          <div class="champ"><label>Début</label><input name="debut" type="datetime-local"></div>
+          <div class="champ"><label>Fin</label><input name="fin" type="datetime-local"></div>
+          <div class="champ"><label>Lieu</label><input name="lieu" maxlength="150"></div>
+          <div class="champ"><label class="case" style="margin-top:34px"><input type="checkbox" name="en_ligne"> En ligne</label></div>
+          <div class="champ"><label>Nombre de places <span class="facultatif">(vide = illimité)</span></label><input name="places" type="number" min="1"></div>
+          <div class="champ"><label>Prix par place en $ <span class="facultatif">(0 = gratuit)</span></label><input name="prix_usd" type="number" min="0" step="1" value="0"></div>
+        </div>
+        <div class="champ"><label>Image</label><input name="image" type="file" accept="image/*"></div>
+        <h3>Étapes de la formation</h3>
+        <p class="petit">Les participants inscrits voient le contenu de chaque étape et cochent leur progression.</p>
+        <div id="etapes"></div>
+        <button type="button" class="btn btn-contour btn-petit" id="ajout-etape">+ Ajouter une étape</button>
+        <div style="display:flex;gap:8px;margin-top:16px"><button class="btn btn-vert">Enregistrer</button><button type="button" class="btn btn-contour" id="annuler-prog">Annuler</button></div>
+        <div class="alerte" hidden></div>
+      </form>
+      <div id="liste-prog"></div>
+      <div id="inscrits" hidden></div>
+    </section>
+
+    <!-- Boutique -->
+    <section class="boite" data-panneau="boutique" hidden style="padding:22px">
+      <div class="bascule" id="filtre-bout"><button data-v="commandes" class="actif">Commandes</button><button data-v="produits">Produits</button></div>
+      <div id="vue-commandes"></div>
+      <div id="vue-produits" hidden>
+        <form id="form-produit" class="carte" novalidate style="margin-bottom:16px">
+          <h3 id="titre-form-produit">Ajouter un produit</h3>
+          <div class="champ"><label>Nom</label><input name="nom" maxlength="120" required></div>
+          <div class="champ"><label>Description</label><textarea name="description" style="min-height:70px"></textarea></div>
+          <div class="deux">
+            <div class="champ"><label>Prix en $ (nombre entier)</label><input name="prix_usd" type="number" min="1" step="1" required></div>
+            <div class="champ"><label>Stock <span class="facultatif">(vide = illimité)</span></label><input name="stock" type="number" min="0"></div>
+          </div>
+          <div class="champ"><label>Photo</label><input name="image" type="file" accept="image/*"></div>
+          <div style="display:flex;gap:8px"><button class="btn btn-vert">Enregistrer</button><button type="button" class="btn btn-contour" id="annuler-produit" hidden>Annuler</button></div>
+          <div class="alerte" hidden></div>
+        </form>
+        <div id="liste-produits"></div>
+      </div>
+    </section>
+
+    <!-- Annonces -->
+    <section class="boite" data-panneau="annonces" hidden style="padding:22px"><div id="liste-annonces"></div></section>
+
+    <!-- Dialogue -->
+    <section class="boite" data-panneau="dialogue" hidden style="padding:22px"><div id="liste-sujets"></div></section>
+
+    <!-- Direct -->
+    <section class="boite" data-panneau="direct" hidden style="padding:22px">
+      <form id="form-direct" class="carte" novalidate style="margin-bottom:16px">
+        <h3>Programmer une réunion ou un live</h3>
+        <div class="deux">
+          <div class="champ"><label>Type</label><select name="type"><option value="reunion">Réunion virtuelle</option><option value="live">Live d'activité</option></select></div>
+          <div class="champ"><label>Date et heure</label><input name="debut" type="datetime-local"></div>
+        </div>
+        <div class="champ"><label>Titre</label><input name="titre" maxlength="150" required></div>
+        <div class="champ"><label>Description</label><input name="description" maxlength="1000"></div>
+        <div class="champ"><label>Lien YouTube / Facebook <span class="facultatif">(vide = salle Jitsi Meet créée automatiquement)</span></label><input name="lien" type="url" placeholder="https://"></div>
+        <div class="champ"><label>Code d'accès <span class="facultatif">(vide = ouvert à tous)</span></label><input name="code" maxlength="40" autocomplete="off"></div>
+        <label class="case" style="margin-bottom:12px"><input type="checkbox" name="maintenant"> Commencer maintenant</label>
+        <button class="btn btn-vert" style="width:100%">Enregistrer</button>
+        <div class="alerte" hidden></div>
+      </form>
+      <div id="liste-directs"></div>
+    </section>
+
+    <!-- Réglages -->
+    <section class="boite etroit" data-panneau="reglages" hidden style="padding:22px">
+      <p id="etat-services" class="petit"></p>
+      <div class="carte" style="margin-bottom:16px">
+        <h3>État du serveur</h3>
+        <p class="petit">Vérifie l'assistant IA (et la traduction), le stockage des fichiers et le paiement en ligne.</p>
+        <button class="btn btn-contour btn-petit" id="btn-diagnostic">Vérifier maintenant</button>
+        <div id="diagnostic" style="margin-top:10px"></div>
+      </div>
+      <form id="form-reglages" novalidate>
+        <div class="champ"><label>Taux du jour : 1 $ = … FC</label><input name="taux_cdf" type="number" min="100" step="1"></div>
+        <div class="deux">
+          <div class="champ"><label>Prix d'un document / photo ($)</label><input name="prix_document_usd" type="number" min="0" step="1"></div>
+          <div class="champ"><label>Prix d'une vidéo ($)</label><input name="prix_video_usd" type="number" min="0" step="1"></div>
+          <div class="champ"><label>Cotisation membre d'honneur ($ / trimestre)</label><input name="cotisation_honneur_usd" type="number" min="0" step="1"></div>
+          <div class="champ"><label>Cotisation membre VIP ($ / trimestre)</label><input name="cotisation_vip_usd" type="number" min="0" step="1"></div>
+        </div>
+        <label>Forfaits des annonces (jours / prix en $)</label>
+        <div id="forfaits-admin"></div>
+        <div class="champ"><label>Informations pour l'assistant IA <span class="facultatif">(horaires, projets en cours, réponses aux questions fréquentes…)</span></label><textarea name="infos_ia" rows="7"></textarea></div>
+        <label class="case" style="margin-bottom:14px"><input type="checkbox" name="reponses_auto"> Réponses automatiques par l'IA (messages, partenariats, dialogue)</label>
+        <div class="carte" style="margin-bottom:14px">
+          <h3>Absences et jours fériés</h3>
+          <p class="petit">Pendant une absence ou un jour férié, l'assistant IA répond à toutes les demandes (messages, partenariats, dialogue, bulle d'aide) et un bandeau le signale sur le site. Les jours fériés de la RDC sont déjà connus : 1er, 4, 16 et 17 janvier, 6 avril, 1er et 17 mai, 30 juin, 1er et 2 août, 25 décembre.</p>
+          <label class="case" style="margin-bottom:10px"><input type="checkbox" name="absence_actif"> L'équipe est absente (congé)</label>
+          <div class="deux">
+            <div class="champ"><label>Jusqu'au <span class="facultatif">(inclus)</span></label><input name="absence_jusqu" type="date"></div>
+            <div class="champ"><label>Message de l'équipe <span class="facultatif">(facultatif)</span></label><input name="absence_message" maxlength="500" placeholder="ex. Nous sommes en mission à Bikoro."></div>
+          </div>
+          <div class="champ"><label>Autres jours fériés <span class="facultatif">(un par ligne, AAAA-MM-JJ)</span></label><textarea name="jours_feries_supp" style="min-height:60px"></textarea></div>
+        </div>
+        <div class="champ"><label>Mots interdits dans le dialogue <span class="facultatif">(séparés par des virgules)</span></label><textarea name="mots_interdits" style="min-height:70px"></textarea></div>
+        <button class="btn btn-vert" style="width:100%">Enregistrer les réglages</button>
+        <div class="alerte" hidden></div>
+      </form>
+    </section>
+
+    <!-- Visites -->
+    <section class="boite" data-panneau="visites" hidden style="padding:22px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="bascule" id="periode-visites" style="margin:0"><button data-j="7">7 jours</button><button data-j="30" class="actif">30 jours</button><button data-j="365">1 an</button></div>
+        <span class="petit" id="en-ligne"></span>
+      </div>
+      <div class="totaux" id="totaux-visites"></div>
+      <h3 style="margin-top:14px">Visiteurs par jour</h3>
+      <div id="graphe-visites" class="graphe"></div>
+      <div class="grille-3" style="margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))">
+        <div><h3>Pages les plus vues</h3><div id="top-pages"></div></div>
+        <div><h3>D'où viennent les visiteurs</h3><div id="top-sources"></div></div>
+        <div><h3>Pays et régions</h3><div id="top-regions"></div></div>
+        <div><h3>Appareils</h3><div id="top-appareils"></div></div>
+      </div>
+      <p class="petit" style="margin-top:14px">Comptage anonyme : aucun cookie et aucune adresse IP n'est enregistré. Un « visiteur » est une personne différente dans la journée ; une « vue » est une page ouverte. Le pays est déduit du fuseau horaire du téléphone.</p>
+    </section>
+
+    <!-- Administrateurs secondaires -->
+    <section class="boite" data-panneau="admins" hidden style="padding:22px">
+      <p class="petit">Seul l'administrateur principal voit cet onglet, les réglages et la sécurité. Chaque administrateur secondaire ne voit que les parties de ses charges.</p>
+      <form id="form-admin" class="carte" novalidate style="margin-bottom:16px">
+        <h3>Ajouter un administrateur secondaire</h3>
+        <div class="deux">
+          <div class="champ"><label>Nom complet</label><input name="nom" required></div>
+          <div class="champ"><label>Téléphone (sert d'identifiant)</label><input name="telephone" type="tel" required placeholder="+243…"></div>
+          <div class="champ"><label>Charge</label><select name="charge_type"></select></div>
+          <div class="champ" id="champ-charge-libre" hidden><label>Nom de la charge</label><input name="charge_libre" placeholder="ex. Chargé(e) de communication"></div>
+          <div class="champ"><label>Mot de passe (8 caractères minimum)</label><input name="mdp" type="text" autocomplete="off" required></div>
+        </div>
+        <label>Parties de l'administration autorisées</label>
+        <div id="cases-admin" style="margin-bottom:12px"></div>
+        <button class="btn btn-vert" style="width:100%">Ajouter</button>
+        <div class="alerte" hidden></div>
+      </form>
+      <div id="liste-admins"></div>
+    </section>
+
+    <!-- Fichiers payants -->
+    <section class="boite" data-panneau="fichiers" hidden style="padding:22px">
+      <div id="etat-stockage"></div>
+      <form id="form-fichier" class="carte" novalidate style="margin-bottom:16px">
+        <h3>Publier un fichier</h3>
+        <div class="champ"><label>Fichier (PDF, PowerPoint, Word, photo, vidéo… 2 Go maximum)</label><input name="fichier" type="file"></div>
+        <div class="champ"><label>Titre</label><input name="titre" maxlength="150" required></div>
+        <div class="champ"><label>Description <span class="facultatif">(facultatif)</span></label><textarea name="description" style="min-height:70px"></textarea></div>
+        <div class="champ"><label>Prix du téléchargement en $</label><input name="prix_usd" type="number" min="0" step="1"><p class="petit" id="prix-defaut-info"></p></div>
+        <div class="progression" id="barre-envoi" hidden style="height:auto;padding:0;position:relative"><span style="height:14px;width:0"></span><em class="petit" style="position:absolute;right:8px;top:-2px;font-style:normal"></em></div>
+        <button class="btn btn-vert" style="width:100%">Envoyer et publier</button>
+        <div class="alerte" hidden></div>
+      </form>
+      <div id="liste-fichiers"></div>
+      <h3 style="margin-top:24px">Ventes</h3>
+      <div id="liste-achats"></div>
+    </section>
+
+    <!-- Membres -->
+    <section class="boite" data-panneau="membres" hidden style="padding:22px">
+      <div class="bascule" id="filtre-membres"><button data-v="membres" class="actif">Membres</button><button data-v="consultations">Consultations</button></div>
+      <div id="vue-liste-membres">
+        <div class="totaux" id="totaux-membres"></div>
+        <button class="btn btn-contour btn-petit" id="btn-csv-cotisations">Télécharger les cotisations (CSV)</button>
+        <div id="liste-membres" style="margin-top:10px"></div>
+      </div>
+      <div id="vue-consultations" hidden>
+        <form id="form-consultation" class="carte" novalidate style="margin-bottom:16px">
+          <h3>Nouvelle consultation</h3>
+          <div class="champ"><label>Question / orientation à décider</label><input name="titre" maxlength="150" required></div>
+          <div class="champ"><label>Explications</label><textarea name="texte"></textarea></div>
+          <div class="champ"><label>Réponses possibles <span class="facultatif">(une par ligne ; vide = Pour / Contre / Abstention)</span></label><textarea name="options" style="min-height:70px"></textarea></div>
+          <div class="deux">
+            <div class="champ"><label>Qui vote ?</label><select name="public"><option value="tous">Tous les membres (honneur et VIP)</option><option value="vip">Membres VIP seulement</option></select></div>
+            <div class="champ"><label>Date limite <span class="facultatif">(facultatif)</span></label><input name="date_limite" type="datetime-local"></div>
+          </div>
+          <button class="btn btn-vert" style="width:100%">Ouvrir la consultation</button>
+          <div class="alerte" hidden></div>
+        </form>
+        <div id="liste-consultations"></div>
+      </div>
+    </section>
+
+    <!-- Sécurité -->
+    <section class="boite" data-panneau="securite" hidden style="padding:22px">
+      <h3>Double authentification</h3>
+      <div id="etat-2fa"></div>
+      <div id="config-2fa"></div>
+      <h3 style="margin-top:22px">Sessions</h3>
+      <p id="sessions" class="petit"></p>
+      <button class="btn btn-contour btn-petit" id="btn-tout-deco">Déconnecter tous les autres appareils</button>
+      <h3 style="margin-top:22px">Journal de sécurité</h3>
+      <div id="journal" style="font-size:.9rem"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const { esc, api, photo, date, montant, message, lire, ecrire, reduire } = outils;
+const $ = s => document.querySelector(s);
+const lireS = k => { try { return sessionStorage.getItem(k); } catch { return null; } };
+const ecrireS = (k, v) => { try { v == null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} };
+ecrire('ongd_admin_token', null); // ancien emplacement, effacé par sécurité
+let token = lireS('ongd_admin_token');
+const A = (chemin, opts) => api(chemin, opts, token);
+const STATUTS = { en_attente: 'En attente', publie: 'Publiée', refuse: 'Refusée', actif: 'Actif', suspendu: 'Suspendu',
+  paye: 'Reçu', declare: 'Déclaré — à vérifier', annule: 'Annulé', echoue: 'Échoué', confirme: 'Confirmé', payee: 'Payée', livree: 'Livrée',
+  annulee: 'Annulée', active: 'En ligne', refusee: 'Refusée', brouillon: 'Brouillon', prevu: 'Prévu', en_cours: 'En direct', termine: 'Terminé', masque: 'Masqué', visible: 'Visible', ouverte: 'Ouverte', close: 'Close', proposee: 'Proposée' };
+const badge = s => `<span class="statut ${s}">${STATUTS[s] || s}</span>`;
+const heure = iso => new Date(iso).toLocaleString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+function erreur(e) {
+  if (e.status === 401) { token = null; ecrireS('ongd_admin_token', null); montrer(false); return; }
+  message($('#alerte-generale'), e.message, 'erreur'); setTimeout(() => $('#alerte-generale').hidden = true, 5000);
+}
+function montrer(connecte) {
+  $('#ecran-connexion').hidden = connecte; $('#ecran-admin').hidden = !connecte; $('#btn-sortir').hidden = !connecte;
+}
+
+$('#form-connexion').onsubmit = async e => {
+  e.preventDefault();
+  const msg = e.target.querySelector('.alerte'), btn = e.target.querySelector('button');
+  msg.hidden = true; btn.disabled = true;
+  try {
+    const d = await api('/admin/connexion', { method: 'POST', body: JSON.stringify({ telephone: $('#cx-tel').value, mot_de_passe: $('#cx-mdp').value, code: $('#cx-code').value || undefined }) });
+    token = d.token; ecrireS('ongd_admin_token', token); e.target.reset(); $('#champ-code').hidden = true; demarrer();
+  } catch (err) {
+    message(msg, err.message, 'erreur');
+    if (/6 chiffres/.test(err.message)) { $('#champ-code').hidden = false; $('#cx-code').focus(); }
+  }
+  btn.disabled = false;
+};
+$('#btn-sortir').onclick = async () => { try { await A('/admin/deconnexion', { method: 'POST' }); } catch {} token = null; ecrireS('ongd_admin_token', null); montrer(false); };
+
+/* ---------- Onglets ---------- */
+let onglet = 'activites';
+$('#bandeau-visites').onclick = () => { const b = document.querySelector('#onglets button[data-o="visites"]'); if (b && !b.hidden) { b.click(); b.scrollIntoView({ inline: 'center', block: 'nearest' }); } };
+$('#onglets').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  onglet = b.dataset.o;
+  document.querySelectorAll('#onglets button').forEach(x => x.classList.toggle('actif', x === b));
+  document.querySelectorAll('[data-panneau]').forEach(p => p.hidden = p.dataset.panneau !== onglet);
+  charger();
+};
+function charger() { resume(); ({ activites: chargerAct, volontaires: chargerVol, dons: chargerDons, messages: chargerMsg, formations: chargerProg, boutique: chargerBoutique,
+  annonces: chargerAnnonces, dialogue: chargerSujets, direct: chargerDirects, reglages: chargerReglages, securite: chargerSecurite, fichiers: chargerFichiers, membres: chargerMembres, admins: chargerAdmins, visites: chargerVisites }[onglet] || (() => {}))(); }
+
+async function resume() {
+  try {
+    const d = await A('/admin/resume');
+    for (const k of ['activites', 'volontaires', 'dons', 'messages', 'inscriptions', 'commandes', 'annonces', 'achats', 'membres']) { const p = $('#p-' + k); p.textContent = d.en_attente[k]; p.hidden = !d.en_attente[k]; }
+    $('#totaux').innerHTML = (d.dons_recus.length ? d.dons_recus : [{ devise: 'USD', total: 0, nombre: 0 }])
+      .map(t => `<div><strong>${montant(t.total, t.devise)}</strong><span class="petit">${t.nombre} don(s) reçu(s)</span></div>`).join('');
+    if (d.visites) { const v = d.visites, b = $('#bandeau-visites'); b.hidden = false;
+      b.innerHTML = `<span><strong>${v.aujourdhui}</strong> visiteur(s) aujourd'hui</span><span><strong>${v.sept_jours}</strong> visites en 7 jours</span><span><strong>${v.total}</strong> visites en tout</span>${v.en_ligne ? `<span><strong>${v.en_ligne}</strong> en ce moment</span>` : ''}<em>Voir les statistiques ›</em>`; }
+    $('#etat-paiement').textContent = d.paiement_en_ligne ? 'Paiement en ligne CinetPay : actif.' : 'Paiement en ligne non configuré : les donateurs voient les comptes Mobile Money de config.js.';
+  } catch (e) { erreur(e); }
+}
+
+/* ---------- Activités ---------- */
+let filtreAct = 'en_attente'; const actsAdmin = {};
+const lienPartage = id => (ONGD.partage || ONGD.api + '/partage/') + id;
+// Texte prêt à coller sur Facebook (Facebook ne permet pas de le remplir à votre place)
+const textePartage = a => `${a.titre}\n\n${a.texte.length > 300 ? a.texte.slice(0, 300).replace(/\s+\S*$/, '') + '…' : a.texte}\n\n👉 Lire la suite, aimer et commenter : ${lienPartage(a.id ?? a)}`;
+function boutonsPartage(a) {
+  const u = encodeURIComponent(lienPartage(a.id)), t = encodeURIComponent(a.titre + ' — ONGD Les Volontaires');
+  return `<p class="petit" style="margin:10px 0 6px">Facebook : le texte de la publication est copié en même temps. Collez-le dans « Dites quelque chose », et choisissez « Partager sur une Page » pour publier sur la page de l'ONGD.</p>
+    <div class="actions">
+      <a class="btn btn-petit" style="background:#1877f2;color:#fff" target="_blank" rel="noopener" data-a="fb" href="https://www.facebook.com/sharer/sharer.php?u=${u}">Facebook</a>
+      <a class="btn btn-petit" style="background:#1fa855;color:#fff" target="_blank" rel="noopener" href="https://wa.me/?text=${encodeURIComponent(textePartage(a))}">WhatsApp</a>
+      <a class="btn btn-petit" style="background:#229ed9;color:#fff" target="_blank" rel="noopener" href="https://t.me/share/url?url=${u}&text=${t}">Telegram</a>
+      <a class="btn btn-petit" style="background:#111;color:#fff" target="_blank" rel="noopener" href="https://twitter.com/intent/tweet?url=${u}&text=${t}">X (Twitter)</a>
+      <a class="btn btn-petit" style="background:#0a66c2;color:#fff" target="_blank" rel="noopener" href="https://www.linkedin.com/sharing/share-offsite/?url=${u}">LinkedIn</a>
+      <button class="btn btn-contour btn-petit" data-a="copier">Copier le texte et le lien</button>
+    </div>`;
+}
+$('#filtre-act').onclick = e => { const b = e.target.closest('button'); if (!b) return; filtreAct = b.dataset.s;
+  document.querySelectorAll('#filtre-act button').forEach(x => x.classList.toggle('actif', x === b)); chargerAct(); };
+async function chargerAct() {
+  try {
+    const { activites } = await A('/admin/activites?statut=' + filtreAct);
+    $('#liste-act').innerHTML = activites.length ? activites.map(a => `
+      <div class="ligne-item" data-id="${a.id}">
+        ${badge(a.statut)} <span class="petit">par ${esc(a.auteur)}${a.auteur_telephone ? ' (+' + esc(a.auteur_telephone) + ')' : ''} · envoyé le ${heure(a.cree_le)}</span>
+        <h3 style="margin:8px 0 2px">${esc(a.titre)}</h3>
+        <div class="petit">${esc(date(a.date_activite))}${a.lieu ? ' · ' + esc(a.lieu) : ''}</div>
+        <p class="texte-long" style="margin:8px 0">${esc(a.texte)}</p>
+        ${a.photos.length ? `<div class="vignettes">${a.photos.map(p => `<a href="${photo(p, token)}" target="_blank"><img src="${photo(p, token)}" alt=""></a>`).join('')}</div>` : ''}
+        ${a.motif_refus ? `<p class="petit">Motif du refus : ${esc(a.motif_refus)}</p>` : ''}
+        ${a.video || a.statut === 'publie' ? `<p class="petit"><strong>${a.video ? 'Vidéo jointe · ' : ''}${a.statut === 'publie' ? `♥ ${a.jaime} J'aime · ${a.commentaires} commentaire(s)` : ''}</strong>${a.modifie_le ? ' · modifié le ' + heure(a.modifie_le) : ''}</p>` : ''}
+        <div class="actions">
+          ${a.statut !== 'publie' ? '<button class="btn btn-vert btn-petit" data-a="publier">Publier</button>' : ''}
+          ${a.statut === 'en_attente' ? '<button class="btn btn-contour btn-petit" data-a="refuser">Refuser</button>' : ''}
+          <button class="btn btn-contour btn-petit" data-a="modifier">Modifier</button>
+          ${a.statut === 'publie' ? `<button class="btn btn-contour btn-petit" data-a="partager">Partager</button><button class="btn btn-contour btn-petit" data-a="commentaires">Commentaires (${a.commentaires})</button>` : ''}
+          <button class="btn btn-contour btn-petit" data-a="supprimer" style="color:var(--rouge)">Supprimer</button>
+        </div>
+        <div class="zone-plus" hidden></div>
+      </div>`).join('') : '<p class="petit">Aucune activité ici.</p>';
+    activites.forEach(a => actsAdmin[a.id] = a);
+  } catch (e) { erreur(e); }
+}
+$('#liste-act').onclick = async e => {
+  const b = e.target.closest('[data-a]'); if (!b) return;
+  const bloc = b.closest('[data-id]'), id = bloc.dataset.id, a = b.dataset.a, zone = bloc.querySelector('.zone-plus');
+  try {
+    if (a === 'modifier') return commencerEdition(actsAdmin[id]);
+    if (a === 'partager') { zone.innerHTML = boutonsPartage(actsAdmin[id]); zone.hidden = zone.dataset.v === 'p' ? !zone.hidden : false; zone.dataset.v = 'p'; return; }
+    if (a === 'fb') { try { await navigator.clipboard.writeText(textePartage(actsAdmin[id])); commun_toast('Texte copié : collez-le dans « Dites quelque chose » sur Facebook.'); } catch {} return; }
+    if (a === 'copier') { try { await navigator.clipboard.writeText(textePartage(actsAdmin[id])); commun_toast('Texte et lien copiés.'); } catch { prompt('Copiez ce lien :', lienPartage(id)); } return; }
+    if (a === 'commentaires') {
+      const { commentaires } = await A('/admin/commentaires?activite=' + id);
+      zone.innerHTML = commentaires.length ? commentaires.map(c => `<div class="carte" style="padding:10px 12px;margin-top:8px" data-com="${c.id}">
+          <strong>${esc(c.nom)}</strong> <span class="petit">${heure(c.cree_le)}</span><p style="margin:4px 0;white-space:pre-line">${esc(c.texte)}</p>
+          <button class="btn btn-contour btn-petit" data-a="supprimer-com" style="color:var(--rouge)">Supprimer ce commentaire</button></div>`).join('')
+        : '<p class="petit" style="margin-top:8px">Aucun commentaire pour le moment.</p>';
+      zone.hidden = false; zone.dataset.v = 'c'; return;
+    }
+    if (a === 'supprimer-com') { if (!confirm('Supprimer ce commentaire ?')) return;
+      const d = await A('/admin/commentaires/' + b.closest('[data-com]').dataset.com, { method: 'DELETE' }); commun_toast(d.message);
+      b.closest('[data-com]').remove(); return; }
+    if (a === 'publier') await A('/admin/activites/' + id, { method: 'PATCH', body: JSON.stringify({ action: 'publier' }) });
+    if (a === 'refuser') { const motif = prompt('Motif du refus (le volontaire le verra) :'); if (motif === null) return;
+      await A('/admin/activites/' + id, { method: 'PATCH', body: JSON.stringify({ action: 'refuser', motif }) }); }
+    if (a === 'supprimer') { if (!confirm('Supprimer définitivement cette activité et ses photos ?')) return;
+      await A('/admin/activites/' + id, { method: 'DELETE' }); }
+    charger();
+  } catch (err) { erreur(err); }
+};
+
+/* ---------- Publier ---------- */
+let photos = [], edition = null; // edition = { id, garder: [photos gardées], video, retirerVideo } pendant une correction
+const dessinerApercus = () => $('#apercus').innerHTML =
+  (edition ? edition.garder.map((p, i) => `<div><img src="${photo(p, token)}" alt=""><button type="button" data-g="${i}">×</button></div>`).join('') : '') +
+  photos.map((p, i) => `<div><img src="${p}" alt=""><button type="button" data-i="${i}">×</button></div>`).join('');
+$('#apercus').onclick = e => { const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.g !== undefined) edition.garder.splice(+b.dataset.g, 1); else photos.splice(+b.dataset.i, 1); dessinerApercus(); };
+$('#a-photos').onchange = async e => {
+  for (const f of [...e.target.files]) { if (photos.length + (edition ? edition.garder.length : 0) >= 4) break; try { photos.push(await reduire(f)); } catch {} }
+  e.target.value = ''; dessinerApercus();
+};
+const dessinerVideoActuelle = () => {
+  const z = $('#video-actuelle');
+  z.hidden = !(edition && edition.video);
+  if (!z.hidden) z.innerHTML = edition.retirerVideo ? 'La vidéo actuelle sera retirée. <button type="button" class="btn btn-contour btn-petit" data-v="garder">Garder la vidéo</button>'
+    : 'Une vidéo est déjà jointe. Choisissez un fichier pour la remplacer, ou <button type="button" class="btn btn-contour btn-petit" data-v="retirer">Retirer la vidéo</button>';
+};
+$('#video-actuelle').onclick = e => { const b = e.target.closest('[data-v]'); if (b) { edition.retirerVideo = b.dataset.v === 'retirer'; dessinerVideoActuelle(); } };
+function commencerEdition(a) {
+  edition = { id: a.id, garder: [...a.photos], video: a.video, retirerVideo: false };
+  photos = [];
+  $('#a-titre').value = a.titre; $('#a-date').value = a.date_activite || ''; $('#a-lieu').value = a.lieu || ''; $('#a-texte').value = a.texte;
+  $('#a-video').value = '';
+  $('#titre-publier').textContent = 'Modifier la publication';
+  $('#info-publier').textContent = 'Corrigez le texte, les photos ou la vidéo, puis enregistrez. Les « J\'aime » et commentaires sont gardés.';
+  $('#btn-publier').textContent = 'Enregistrer les corrections';
+  $('#annuler-edition').hidden = false;
+  $('#form-publier .alerte').hidden = true;
+  dessinerApercus(); dessinerVideoActuelle();
+  document.querySelector('#onglets button[data-o="publier"]').click();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+function finirEdition() {
+  edition = null; photos = [];
+  $('#form-publier').reset();
+  $('#titre-publier').textContent = "Publier une activité (équipe de l'ONGD)";
+  $('#info-publier').textContent = 'Publiée directement sur le site, sans validation.';
+  $('#btn-publier').textContent = 'Publier sur le site';
+  $('#annuler-edition').hidden = true;
+  dessinerApercus(); dessinerVideoActuelle();
+}
+$('#annuler-edition').onclick = () => { finirEdition(); document.querySelector('#onglets button[data-o="activites"]').click(); };
+$('#form-publier').onsubmit = async e => {
+  e.preventDefault();
+  const msg = e.target.querySelector('.alerte'), btn = $('#btn-publier'), fv = $('#a-video').files[0];
+  msg.hidden = true; btn.disabled = true;
+  const barre = $('#barre-video'), maj = p => { barre.hidden = false; barre.querySelector('span').style.width = Math.round(p * 100) + '%'; barre.querySelector('em').textContent = 'Envoi de la vidéo : ' + Math.round(p * 100) + ' %'; };
+  try {
+    if ($('#a-titre').value.trim().length < 3) throw new Error("Donnez un titre à l'activité.");
+    if ($('#a-texte').value.trim().length < 20) throw new Error("Décrivez l'activité (au moins 20 caractères).");
+    const corps = { titre: $('#a-titre').value, date_activite: $('#a-date').value, lieu: $('#a-lieu').value, texte: $('#a-texte').value, photos };
+    if (fv) { corps.video_cle = await envoyerAuStockage(fv, maj, 'video'); corps.video_nom = fv.name; }
+    let d;
+    if (edition) d = await A('/admin/activites/' + edition.id, { method: 'PUT', body: JSON.stringify({ ...corps, garder: edition.garder, retirer_video: edition.retirerVideo }) });
+    else d = await A('/admin/activites', { method: 'POST', body: JSON.stringify(corps) });
+    const corrige = !!edition;
+    finirEdition(); message(msg, d.message, 'ok');
+    if (corrige) commun_toast(d.message);
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message === 'réseau' ? 'Envoi interrompu : vérifiez la connexion et réessayez.' : err.message, 'erreur'); }
+  barre.hidden = true; btn.disabled = false;
+};
+
+/* ---------- Volontaires ---------- */
+async function chargerVol() {
+  try {
+    const { volontaires } = await A('/admin/volontaires');
+    $('#liste-vol').innerHTML = volontaires.length ? volontaires.map(v => `
+      <div class="ligne-item" data-id="${v.id}">
+        ${badge(v.statut)} <strong>${esc(v.nom)}</strong> <span class="petit">+${esc(v.telephone)}${v.ville ? ' · ' + esc(v.ville) : ''} · ${v.publiees} publication(s)</span>
+        ${v.email ? `<div class="petit">${esc(v.email)}</div>` : ''}
+        ${v.competences ? `<div class="petit">Compétences : ${esc(v.competences)}</div>` : ''}
+        ${v.motivation ? `<p style="margin:6px 0">${esc(v.motivation)}</p>` : ''}
+        <div class="actions">
+          ${v.statut !== 'actif' ? '<button class="btn btn-vert btn-petit" data-s="actif">Valider</button>' : ''}
+          ${v.statut === 'actif' ? '<button class="btn btn-contour btn-petit" data-s="suspendu">Suspendre</button>' : ''}
+          ${v.statut === 'en_attente' ? '<button class="btn btn-contour btn-petit" data-s="refuse">Refuser</button>' : ''}
+          <a class="btn btn-contour btn-petit" href="https://wa.me/${esc(v.telephone)}" target="_blank" rel="noopener">WhatsApp</a>
+        </div>
+      </div>`).join('') : '<p class="petit">Aucune candidature pour le moment.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-vol').onclick = async e => {
+  const b = e.target.closest('[data-s]'); if (!b) return;
+  try { await A('/admin/volontaires/' + b.closest('[data-id]').dataset.id, { method: 'PATCH', body: JSON.stringify({ statut: b.dataset.s }) }); charger(); }
+  catch (err) { erreur(err); }
+};
+
+/* ---------- Dons ---------- */
+async function chargerDons() {
+  try {
+    const { dons } = await A('/admin/dons');
+    $('#liste-dons').innerHTML = dons.length ? dons.map(d => `
+      <div class="ligne-item" data-id="${d.id}">
+        ${badge(d.statut)} <strong>${montant(d.montant, d.devise)}</strong> <span class="petit">· ${esc(d.reference)} · ${heure(d.cree_le)}</span>
+        <div>${esc(d.nom || 'Sans nom')}${d.anonyme ? ' <span class="petit">(anonyme sur le site)</span>' : ''} — ${esc(d.contact || '')}</div>
+        <div class="petit">${d.mode === 'cinetpay' ? 'Paiement en ligne' : 'Envoi manuel'}${d.operateur ? ' · ' + esc(d.operateur) : ''}${d.ref_paiement && d.mode === 'manuel' ? ' · réf. ' + esc(d.ref_paiement) : ''}${d.projet ? ' · projet : ' + esc(d.projet) : ''}</div>
+        ${d.message ? `<p style="margin:6px 0">« ${esc(d.message)} »</p>` : ''}
+        ${['declare', 'en_attente'].includes(d.statut) && d.mode === 'manuel' ? `<div class="actions">
+          <button class="btn btn-vert btn-petit" data-s="paye">Argent reçu — confirmer</button>
+          <button class="btn btn-contour btn-petit" data-s="annule">Annuler</button></div>` : ''}
+      </div>`).join('') : '<p class="petit">Aucun don pour le moment.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-dons').onclick = async e => {
+  const b = e.target.closest('[data-s]'); if (!b) return;
+  if (b.dataset.s === 'paye' && !confirm("Confirmez-vous avoir bien reçu cet argent sur le compte de l'ONGD ?")) return;
+  try { await A('/admin/dons/' + b.closest('[data-id]').dataset.id, { method: 'PATCH', body: JSON.stringify({ statut: b.dataset.s }) }); charger(); }
+  catch (err) { erreur(err); }
+};
+$('#btn-csv').onclick = async () => {
+  try {
+    const r = await fetch(ONGD.api + '/admin/dons.csv', { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) throw Object.assign(new Error('Export impossible.'), { status: r.status });
+    const url = URL.createObjectURL(await r.blob()), a = document.createElement('a');
+    a.href = url; a.download = 'dons-ongd-les-volontaires.csv'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (e) { erreur(e); }
+};
+
+/* ---------- Messages ---------- */
+async function chargerMsg() {
+  try {
+    const { messages } = await A('/admin/messages');
+    $('#liste-msg').innerHTML = messages.length ? messages.map(m => `
+      <div class="ligne-item" data-id="${m.id}" style="${m.traite ? 'opacity:.6' : ''}">
+        <span class="statut ${m.traite ? '' : 'en_attente'}">${m.type === 'partenariat' ? 'Partenariat' : 'Contact'}${m.sujet ? ' · ' + esc(m.sujet) : ''}</span>
+        <span class="petit">${heure(m.cree_le)}</span>
+        <h3 style="margin:8px 0 2px">${esc(m.organisation ? m.organisation + ' — ' : '')}${esc(m.nom)}</h3>
+        <div class="petit">${m.email ? `<a href="mailto:${esc(m.email)}">${esc(m.email)}</a>` : ''} ${m.telephone ? esc(m.telephone) : ''}</div>
+        <p class="texte-long" style="margin:6px 0">${esc(m.message)}</p>
+        <div class="actions"><button class="btn btn-contour btn-petit" data-t="${m.traite ? '0' : '1'}">${m.traite ? 'Marquer non traité' : 'Marquer traité'}</button></div>
+      </div>`).join('') : '<p class="petit">Aucun message.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-msg').onclick = async e => {
+  const b = e.target.closest('[data-t]'); if (!b) return;
+  try { await A('/admin/messages/' + b.closest('[data-id]').dataset.id, { method: 'PATCH', body: JSON.stringify({ traite: b.dataset.t === '1' }) }); charger(); }
+  catch (err) { erreur(err); }
+};
+
+/* ================= Paiements communs ================= */
+async function confirmerPaiement(ref, statut) {
+  if (statut === 'paye' && !confirm("Confirmez-vous avoir bien reçu cet argent sur le compte de l'ONGD ?")) return false;
+  try { await A('/admin/paiements/' + ref, { method: 'PATCH', body: JSON.stringify({ statut }) }); return true; } catch (e) { erreur(e); return false; }
+}
+const boutonsPaiement = (x) => ['declare', 'en_attente'].includes(x.statut) && x.mode === 'manuel'
+  ? `<button class="btn btn-vert btn-petit" data-pay="${esc(x.reference)}" data-s="paye">Argent reçu — confirmer</button><button class="btn btn-contour btn-petit" data-pay="${esc(x.reference)}" data-s="annule">Annuler</button>` : '';
+const versLocal = iso => { if (!iso) return ''; const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
+const versIso = v => v ? new Date(v).toISOString() : null;
+const imageDe = async input => input.files[0] ? await reduire(input.files[0]) : undefined;
+
+/* ================= Formations et événements ================= */
+let programmes = [], progEdite = null;
+async function chargerProg() {
+  $('#inscrits').hidden = true; $('#liste-prog').hidden = false;
+  try {
+    ({ programmes } = await A('/admin/programmes'));
+    $('#liste-prog').innerHTML = programmes.length ? programmes.map(p => `
+      <div class="ligne-item" data-id="${p.id}">
+        ${badge(p.statut)} <span class="etiquette">${p.type === 'formation' ? 'Formation' : 'Événement'}</span>
+        <h3 style="margin:8px 0 2px">${esc(p.titre)}</h3>
+        <div class="petit">${p.debut ? heure(p.debut) : 'Date à confirmer'} · ${p.en_ligne ? 'En ligne' : esc(p.lieu || '')} · ${p.prix_usd ? p.prix_usd + ' $' : 'Gratuit'}
+          · ${p.confirmes}${p.places ? '/' + p.places : ''} inscrit(s) · ${p.etapes.length} étape(s)</div>
+        ${p.a_verifier ? `<div class="alerte info">${p.a_verifier} paiement(s) déclaré(s) à vérifier</div>` : ''}
+        <div class="actions"><button class="btn btn-vert btn-petit" data-a="inscrits">Inscrits</button><button class="btn btn-contour btn-petit" data-a="modifier">Modifier</button>
+          <button class="btn btn-contour btn-petit" data-a="supprimer" style="color:var(--rouge)">Supprimer</button></div>
+      </div>`).join('') : '<p class="petit">Aucune formation ni événement. Créez le premier.</p>';
+  } catch (e) { erreur(e); }
+}
+function ligneEtape(e = {}) {
+  const d = document.createElement('fieldset');
+  d.className = 'carte'; d.style.cssText = 'margin-bottom:10px;padding:14px';
+  d.innerHTML = `<div class="champ"><label>Titre de l'étape</label><input data-e="titre" maxlength="150" value="${esc(e.titre || '')}"></div>
+    <div class="champ"><label>Contenu</label><textarea data-e="contenu" rows="5">${esc(e.contenu || '')}</textarea></div>
+    <div class="champ"><label>Lien vidéo <span class="facultatif">(YouTube…)</span></label><input data-e="video_url" type="url" value="${esc(e.video_url || '')}" placeholder="https://"></div>
+    <button type="button" class="btn btn-contour btn-petit" data-monter>↑ Monter</button> <button type="button" class="btn btn-contour btn-petit" data-retirer style="color:var(--rouge)">Retirer</button>`;
+  return d;
+}
+$('#etapes').onclick = e => {
+  const fs = e.target.closest('fieldset'); if (!fs) return;
+  if (e.target.closest('[data-retirer]')) fs.remove();
+  if (e.target.closest('[data-monter]') && fs.previousElementSibling) fs.parentNode.insertBefore(fs, fs.previousElementSibling);
+};
+$('#ajout-etape').onclick = () => $('#etapes').append(ligneEtape());
+function ouvrirFormProg(p) {
+  progEdite = p ? p.id : null;
+  const f = $('#form-prog'); f.reset(); f.hidden = false; f.querySelector('.alerte').hidden = true;
+  $('#titre-form-prog').textContent = p ? 'Modifier : ' + p.titre : 'Nouvelle formation / événement';
+  $('#etapes').innerHTML = '';
+  if (p) {
+    for (const k of ['type', 'statut', 'titre', 'resume', 'description', 'lieu', 'places', 'prix_usd']) f[k].value = p[k] ?? '';
+    f.en_ligne.checked = p.en_ligne; f.debut.value = versLocal(p.debut); f.fin.value = versLocal(p.fin);
+    p.etapes.forEach(e => $('#etapes').append(ligneEtape(e)));
+  }
+  f.scrollIntoView({ behavior: 'smooth' });
+}
+$('#btn-nouv-prog').onclick = () => ouvrirFormProg(null);
+$('#annuler-prog').onclick = () => $('#form-prog').hidden = true;
+$('#form-prog').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button:not([type=button])');
+  btn.disabled = true;
+  try {
+    const corps = { type: f.type.value, statut: f.statut.value, titre: f.titre.value, resume: f.resume.value, description: f.description.value,
+      lieu: f.lieu.value, en_ligne: f.en_ligne.checked, debut: versIso(f.debut.value), fin: versIso(f.fin.value), places: f.places.value, prix_usd: f.prix_usd.value || 0,
+      image: await imageDe(f.image),
+      etapes: [...$('#etapes').querySelectorAll('fieldset')].map(fs => Object.fromEntries([...fs.querySelectorAll('[data-e]')].map(x => [x.dataset.e, x.value]))) };
+    const d = await A(progEdite ? '/admin/programmes/' + progEdite : '/admin/programmes', { method: progEdite ? 'PATCH' : 'POST', body: JSON.stringify(corps) });
+    message(msg, d.message, 'ok'); f.hidden = true; chargerProg();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+  btn.disabled = false;
+};
+$('#liste-prog').onclick = async e => {
+  const b = e.target.closest('[data-a]'); if (!b) return;
+  const p = programmes.find(x => x.id == b.closest('[data-id]').dataset.id);
+  if (b.dataset.a === 'modifier') ouvrirFormProg(p);
+  if (b.dataset.a === 'supprimer' && confirm('Supprimer « ' + p.titre + ' » ?')) { try { const d = await A('/admin/programmes/' + p.id, { method: 'DELETE' }); alert(d.message); chargerProg(); } catch (err) { erreur(err); } }
+  if (b.dataset.a === 'inscrits') voirInscrits(p);
+};
+async function voirInscrits(p) {
+  try {
+    const { inscriptions } = await A(`/admin/programmes/${p.id}/inscriptions`);
+    $('#liste-prog').hidden = true; $('#inscrits').hidden = false;
+    $('#inscrits').innerHTML = `<button class="btn btn-contour btn-petit" id="retour-prog">← Retour</button>
+      <button class="btn btn-contour btn-petit" id="csv-inscrits">Télécharger la liste (CSV)</button>
+      <h3 style="margin-top:14px">${esc(p.titre)} — ${inscriptions.length} inscription(s)</h3>
+      ${inscriptions.map(i => `<div class="ligne-item" data-i="${i.id}">
+        ${badge(i.statut)} <strong>${esc(i.nom)}</strong> <span class="petit">+${esc(i.telephone)} · code ${esc(i.code)} · ${i.places} place(s)
+        ${i.montant ? '· ' + montant(i.montant, i.devise) : '· gratuit'}${p.type === 'formation' ? ` · ${i.etapes_faites}/${p.etapes.length} étapes` : ''}${i.ref_paiement && i.mode === 'manuel' ? ' · réf. ' + esc(i.ref_paiement) : ''}</span>
+        <div class="actions">
+          ${boutonsPaiement(i)}
+          ${i.statut === 'confirme' ? `<label class="case"><input type="checkbox" data-present ${i.present ? 'checked' : ''}> Présent</label>` : ''}
+          <a class="btn btn-contour btn-petit" href="https://wa.me/${esc(i.telephone)}" target="_blank" rel="noopener">WhatsApp</a>
+        </div></div>`).join('') || '<p class="petit">Personne pour le moment.</p>'}`;
+    $('#retour-prog').onclick = chargerProg;
+    $('#csv-inscrits').onclick = () => telecharger(`/admin/programmes/${p.id}/inscriptions?csv=1`, 'inscriptions.csv');
+    $('#inscrits').onclick = async e => {
+      const pay = e.target.closest('[data-pay]');
+      if (pay && await confirmerPaiement(pay.dataset.pay, pay.dataset.s)) voirInscrits(p);
+    };
+    $('#inscrits').onchange = async e => {
+      if (!e.target.matches('[data-present]')) return;
+      try { await A('/admin/inscriptions/' + e.target.closest('[data-i]').dataset.i, { method: 'PATCH', body: JSON.stringify({ present: e.target.checked }) }); } catch (err) { erreur(err); }
+    };
+  } catch (e) { erreur(e); }
+}
+$('#form-entree').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    const i = await A('/admin/inscriptions/verifier', { method: 'POST', body: JSON.stringify({ code: e.target.code.value }) });
+    $('#resultat-entree').innerHTML = `<div class="alerte ${i.statut === 'confirme' ? 'ok' : 'erreur'}">${esc(i.nom)} — ${esc(i.titre)} — ${i.places} place(s) — ${STATUTS[i.statut] || i.statut}${i.present ? ' — déjà enregistré présent' : ''}
+      ${i.statut === 'confirme' && !i.present ? `<button class="btn btn-vert btn-petit" id="marquer-present" style="margin-left:8px">Marquer présent</button>` : ''}</div>`;
+    const b = $('#marquer-present');
+    if (b) b.onclick = async () => { await A('/admin/inscriptions/' + i.id, { method: 'PATCH', body: JSON.stringify({ present: true }) }); b.replaceWith('✓ Présent'); };
+  } catch (err) { $('#resultat-entree').innerHTML = `<div class="alerte erreur">${esc(err.message)}</div>`; }
+};
+async function telecharger(chemin, nom) {
+  try {
+    const r = await fetch(ONGD.api + chemin, { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) throw Object.assign(new Error('Export impossible.'), { status: r.status });
+    const url = URL.createObjectURL(await r.blob()), a = document.createElement('a');
+    a.href = url; a.download = nom; a.click(); setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (e) { erreur(e); }
+}
+
+/* ================= Boutique ================= */
+let vueBout = 'commandes', produitsAdmin = [], produitEdite = null;
+$('#filtre-bout').onclick = e => { const b = e.target.closest('button'); if (!b) return; vueBout = b.dataset.v;
+  document.querySelectorAll('#filtre-bout button').forEach(x => x.classList.toggle('actif', x === b)); chargerBoutique(); };
+async function chargerBoutique() {
+  $('#vue-commandes').hidden = vueBout !== 'commandes'; $('#vue-produits').hidden = vueBout !== 'produits';
+  try {
+    if (vueBout === 'commandes') {
+      const { commandes } = await A('/admin/commandes');
+      $('#vue-commandes').innerHTML = commandes.map(c => `<div class="ligne-item">
+        ${badge(c.statut)} <strong>${montant(c.montant, c.devise)}</strong> <span class="petit">· ${esc(c.reference)} · ${heure(c.cree_le)}</span>
+        <div>${esc(c.nom)} — ${esc(c.contact)}</div>
+        <div class="petit">${c.articles.map(a => a.qte + ' × ' + esc(a.nom)).join(', ')} · ${esc(c.livraison || '')}${c.ref_paiement && c.mode === 'manuel' ? ' · réf. ' + esc(c.ref_paiement) : ''}</div>
+        <div class="actions">${boutonsPaiement(c)}${c.statut === 'payee' ? `<button class="btn btn-vert btn-petit" data-livree="${c.id}">Marquer livrée</button>` : ''}</div>
+      </div>`).join('') || '<p class="petit">Aucune commande pour le moment.</p>';
+    } else {
+      ({ produits: produitsAdmin } = await A('/admin/produits'));
+      $('#liste-produits').innerHTML = produitsAdmin.map(p => `<div class="ligne-item" data-p="${p.id}" style="${p.actif ? '' : 'opacity:.55'}">
+        ${p.a_image ? `<img src="${ONGD.api}/media/produit/${p.id}" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:8px;float:left;margin-right:10px">` : ''}
+        <strong>${esc(p.nom)}</strong> <span class="petit">· ${p.prix_usd} $ · stock ${p.stock ?? 'illimité'}${p.actif ? '' : ' · retiré'}</span>
+        <div class="actions" style="clear:both"><button class="btn btn-contour btn-petit" data-modif>Modifier</button>${p.actif ? '<button class="btn btn-contour btn-petit" data-retirer style="color:var(--rouge)">Retirer de la boutique</button>' : ''}</div>
+      </div>`).join('') || '<p class="petit">Aucun produit.</p>';
+    }
+  } catch (e) { erreur(e); }
+}
+$('#vue-commandes').onclick = async e => {
+  const pay = e.target.closest('[data-pay]'), liv = e.target.closest('[data-livree]');
+  if (pay && await confirmerPaiement(pay.dataset.pay, pay.dataset.s)) charger();
+  if (liv) { try { await A('/admin/commandes/' + liv.dataset.livree, { method: 'PATCH', body: JSON.stringify({ statut: 'livree' }) }); charger(); } catch (err) { erreur(err); } }
+};
+$('#liste-produits').onclick = async e => {
+  const el = e.target.closest('[data-p]'); if (!el) return;
+  const p = produitsAdmin.find(x => x.id == el.dataset.p), f = $('#form-produit');
+  if (e.target.closest('[data-modif]')) {
+    produitEdite = p.id; f.nom.value = p.nom; f.description.value = p.description || ''; f.prix_usd.value = p.prix_usd; f.stock.value = p.stock ?? '';
+    $('#titre-form-produit').textContent = 'Modifier : ' + p.nom; $('#annuler-produit').hidden = false; f.scrollIntoView({ behavior: 'smooth' });
+  }
+  if (e.target.closest('[data-retirer]') && confirm('Retirer « ' + p.nom + ' » de la boutique ?')) { try { await A('/admin/produits/' + p.id, { method: 'DELETE' }); chargerBoutique(); } catch (err) { erreur(err); } }
+};
+const finEditionProduit = () => { produitEdite = null; $('#form-produit').reset(); $('#titre-form-produit').textContent = 'Ajouter un produit'; $('#annuler-produit').hidden = true; };
+$('#annuler-produit').onclick = finEditionProduit;
+$('#form-produit').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button:not([type=button])'); btn.disabled = true;
+  try {
+    const d = await A(produitEdite ? '/admin/produits/' + produitEdite : '/admin/produits', { method: produitEdite ? 'PATCH' : 'POST',
+      body: JSON.stringify({ nom: f.nom.value, description: f.description.value, prix_usd: f.prix_usd.value, stock: f.stock.value, actif: true, image: await imageDe(f.image) }) });
+    message(msg, d.message, 'ok'); finEditionProduit(); chargerBoutique();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+  btn.disabled = false;
+};
+
+/* ================= Annonces ================= */
+async function chargerAnnonces() {
+  try {
+    const { annonces } = await A('/admin/annonces');
+    $('#liste-annonces').innerHTML = annonces.map(a => `<div class="ligne-item" data-an="${a.id}">
+      ${a.expiree ? '<span class="statut annule">Expirée</span>' : badge(a.statut)} <strong>${montant(a.montant, a.devise)}</strong> <span class="petit">· ${a.jours} jours · ${esc(a.reference)} · ${heure(a.cree_le)}</span>
+      <div class="annonce" style="margin:8px 0">${a.a_image ? `<img src="${ONGD.api}/media/annonce/${a.id}?t=${token}" alt="">` : ''}<span><small>Annonce · ${esc(a.annonceur)}</small><strong>${esc(a.titre)}</strong>${a.texte ? `<em>${esc(a.texte)}</em>` : ''}</span></div>
+      <div class="petit">Contact : ${esc(a.contact)}${a.lien ? ` · lien : <a href="${esc(a.lien)}" target="_blank" rel="noopener">${esc(a.lien)}</a>` : ''}${a.fin ? ' · en ligne jusqu\'au ' + heure(a.fin) : ''}${a.motif ? ' · motif : ' + esc(a.motif) : ''}</div>
+      <div class="actions">${boutonsPaiement(a)}
+        ${a.statut === 'payee' ? '<button class="btn btn-vert btn-petit" data-act="activer">Valider et mettre en ligne</button>' : ''}
+        ${['payee', 'declare'].includes(a.statut) ? '<button class="btn btn-contour btn-petit" data-act="refuser">Refuser</button>' : ''}
+        ${a.statut === 'active' && !a.expiree ? '<button class="btn btn-contour btn-petit" data-act="arreter">Arrêter la diffusion</button>' : ''}</div>
+    </div>`).join('') || '<p class="petit">Aucune annonce pour le moment.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-annonces').onclick = async e => {
+  const pay = e.target.closest('[data-pay]'), act = e.target.closest('[data-act]');
+  if (pay && await confirmerPaiement(pay.dataset.pay, pay.dataset.s)) return charger();
+  if (!act) return;
+  let motif;
+  if (act.dataset.act === 'refuser') { motif = prompt("Motif du refus (pensez à rembourser l'annonceur) :"); if (motif === null) return; }
+  try { await A('/admin/annonces/' + act.closest('[data-an]').dataset.an, { method: 'PATCH', body: JSON.stringify({ action: act.dataset.act, motif }) }); charger(); } catch (err) { erreur(err); }
+};
+
+/* ================= Dialogue ================= */
+async function chargerSujets() {
+  try {
+    const { sujets } = await A('/admin/sujets');
+    $('#liste-sujets').innerHTML = sujets.map(s => `<div class="ligne-item" data-su="${s.id}">
+      ${badge(s.statut)} ${s.epingle ? '<span class="etiquette or">Épinglé</span>' : ''} <span class="etiquette">${esc(s.categorie)}</span>
+      <h3 style="margin:8px 0 2px">${esc(s.titre)}</h3><div class="petit">par ${esc(s.nom)} · ${heure(s.cree_le)}</div>
+      <p class="texte-long" style="margin:6px 0">${esc(s.message)}</p>
+      ${s.reponses.map(r => `<div class="message-fil${r.admin ? ' admin' : r.auto ? ' auto' : ''}" data-rep="${r.id}" style="${r.statut === 'masque' ? 'opacity:.5' : ''}">
+        <span class="auteur">${esc(r.nom)}</span> <span class="petit">${heure(r.cree_le)}${r.statut === 'masque' ? ' · masquée' : ''}</span>
+        <p class="texte-long" style="margin:4px 0">${esc(r.message)}</p>
+        <button class="btn btn-contour btn-petit" data-rep-statut="${r.statut === 'masque' ? 'visible' : 'masque'}">${r.statut === 'masque' ? 'Afficher' : 'Masquer'}</button></div>`).join('')}
+      <form class="rep-admin" style="display:flex;gap:6px;margin-top:8px" novalidate><input name="message" placeholder="Répondre au nom de l'ONGD…"><button class="btn btn-vert btn-petit">Répondre</button></form>
+      <div class="actions">
+        <button class="btn btn-contour btn-petit" data-su-a="epingle">${s.epingle ? 'Désépingler' : 'Épingler'}</button>
+        <button class="btn btn-contour btn-petit" data-su-a="statut">${s.statut === 'masque' ? 'Afficher' : 'Masquer'}</button>
+        <button class="btn btn-contour btn-petit" data-su-a="supprimer" style="color:var(--rouge)">Supprimer</button>
+      </div></div>`).join('') || '<p class="petit">Aucun sujet pour le moment.</p>';
+    $('#liste-sujets').querySelectorAll('.rep-admin').forEach(f => f.onsubmit = async e => {
+      e.preventDefault();
+      try { await A(`/admin/sujets/${f.closest('[data-su]').dataset.su}/reponses`, { method: 'POST', body: JSON.stringify({ message: f.message.value }) }); chargerSujets(); } catch (err) { erreur(err); }
+    });
+  } catch (e) { erreur(e); }
+}
+$('#liste-sujets').onclick = async e => {
+  const el = e.target.closest('[data-su]'); if (!el) return;
+  const id = el.dataset.su, a = e.target.closest('[data-su-a]'), r = e.target.closest('[data-rep-statut]');
+  try {
+    if (r) await A('/admin/reponses/' + r.closest('[data-rep]').dataset.rep, { method: 'PATCH', body: JSON.stringify({ statut: r.dataset.repStatut }) });
+    else if (a?.dataset.suA === 'epingle') await A('/admin/sujets/' + id, { method: 'PATCH', body: JSON.stringify({ epingle: a.textContent === 'Épingler' }) });
+    else if (a?.dataset.suA === 'statut') await A('/admin/sujets/' + id, { method: 'PATCH', body: JSON.stringify({ statut: a.textContent === 'Masquer' ? 'masque' : 'visible' }) });
+    else if (a?.dataset.suA === 'supprimer') { if (!confirm('Supprimer ce sujet et ses réponses ?')) return; await A('/admin/sujets/' + id, { method: 'DELETE' }); }
+    else return;
+    chargerSujets();
+  } catch (err) { erreur(err); }
+};
+
+/* ================= Direct ================= */
+async function chargerDirects() {
+  try {
+    const { directs } = await A('/admin/directs');
+    $('#liste-directs').innerHTML = directs.map(d => `<div class="ligne-item" data-di="${d.id}">
+      ${d.statut === 'en_cours' ? '<span class="badge-direct"><span class="point-rouge"></span>En direct</span>' : badge(d.statut)}
+      <span class="etiquette">${d.type === 'reunion' ? 'Réunion' : 'Live'}</span>${d.prive ? ' <span class="etiquette rouge">Avec code</span>' : ''}
+      <h3 style="margin:8px 0 2px">${esc(d.titre)}</h3><div class="petit">${d.debut ? heure(d.debut) : ''} · par ${esc(d.auteur)} · <a href="${esc(d.url)}" target="_blank" rel="noopener">${esc(d.url)}</a></div>
+      <div class="actions">
+        ${d.statut === 'prevu' ? '<button class="btn btn-vert btn-petit" data-st="en_cours">Démarrer maintenant</button>' : ''}
+        ${d.statut === 'en_cours' ? '<button class="btn btn-contour btn-petit" data-st="termine">Terminer</button>' : ''}
+        <button class="btn btn-contour btn-petit" data-st="supprimer" style="color:var(--rouge)">Supprimer</button>
+      </div></div>`).join('') || '<p class="petit">Aucun direct programmé.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-directs').onclick = async e => {
+  const b = e.target.closest('[data-st]'); if (!b) return;
+  const id = b.closest('[data-di]').dataset.di;
+  try {
+    if (b.dataset.st === 'supprimer') { if (!confirm('Supprimer ?')) return; await A('/admin/directs/' + id, { method: 'DELETE' }); }
+    else await A('/admin/directs/' + id, { method: 'PATCH', body: JSON.stringify({ statut: b.dataset.st }) });
+    chargerDirects();
+  } catch (err) { erreur(err); }
+};
+$('#form-direct').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button'); btn.disabled = true;
+  try {
+    const d = await A('/admin/directs', { method: 'POST', body: JSON.stringify({ type: f.type.value, titre: f.titre.value, description: f.description.value,
+      debut: versIso(f.debut.value), lien: f.lien.value, code: f.code.value, maintenant: f.maintenant.checked }) });
+    message(msg, d.message + ' Lien : ' + d.url, 'ok'); f.reset(); chargerDirects();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+  btn.disabled = false;
+};
+
+/* ================= Réglages ================= */
+async function chargerReglages() {
+  try {
+    const { reglages: r, ia, paiement_en_ligne } = await A('/admin/reglages');
+    $('#etat-services').innerHTML = `Assistant IA : <strong>${ia ? 'actif' : 'inactif (ajoutez ANTHROPIC_API_KEY dans Railway)'}</strong> · Paiement en ligne CinetPay : <strong>${paiement_en_ligne ? 'actif' : 'inactif'}</strong>`;
+    const f = $('#form-reglages');
+    f.taux_cdf.value = r.taux_cdf; for (const k of ['prix_document_usd', 'prix_video_usd', 'cotisation_honneur_usd', 'cotisation_vip_usd']) f[k].value = r[k]; f.infos_ia.value = r.infos_ia || ''; f.reponses_auto.checked = !!r.reponses_auto; f.mots_interdits.value = (r.mots_interdits || []).join(', ');
+    const ab = r.absence || {}; f.absence_actif.checked = !!ab.actif; f.absence_jusqu.value = ab.jusqu || ''; f.absence_message.value = ab.message || ''; f.jours_feries_supp.value = (r.jours_feries_supp || []).join('\n');
+    const fo = [...r.forfaits_annonces]; while (fo.length < 3) fo.push({ jours: '', prix_usd: '' });
+    $('#forfaits-admin').innerHTML = fo.map(x => `<div class="deux" data-forfait><div class="champ"><input type="number" min="1" data-j value="${x.jours}" placeholder="jours"></div>
+      <div class="champ"><input type="number" min="1" data-p value="${x.prix_usd}" placeholder="prix en $"></div></div>`).join('');
+  } catch (e) { erreur(e); }
+}
+$('#form-reglages').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte');
+  try {
+    const d = await A('/admin/reglages', { method: 'PATCH', body: JSON.stringify({ taux_cdf: f.taux_cdf.value, prix_document_usd: f.prix_document_usd.value, prix_video_usd: f.prix_video_usd.value,
+      cotisation_honneur_usd: f.cotisation_honneur_usd.value, cotisation_vip_usd: f.cotisation_vip_usd.value, infos_ia: f.infos_ia.value, reponses_auto: f.reponses_auto.checked,
+      mots_interdits: f.mots_interdits.value,
+      absence: { actif: f.absence_actif.checked, jusqu: f.absence_jusqu.value, message: f.absence_message.value }, jours_feries_supp: f.jours_feries_supp.value,
+      forfaits_annonces: [...document.querySelectorAll('[data-forfait]')].map(x => ({ jours: x.querySelector('[data-j]').value, prix_usd: x.querySelector('[data-p]').value })).filter(x => x.jours && x.prix_usd) }) });
+    message(msg, d.message, 'ok');
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+};
+
+/* ================= Sécurité ================= */
+async function chargerSecurite() {
+  try {
+    const s = await A('/admin/securite');
+    $('#etat-2fa').innerHTML = s.double_auth
+      ? `<div class="alerte ok">Activée : un code à 6 chiffres de votre application est demandé à chaque connexion.</div>
+         <form id="form-2fa-off" style="display:flex;gap:6px;margin-top:8px" novalidate><input name="code" inputmode="numeric" maxlength="6" placeholder="Code actuel" style="max-width:160px"><button class="btn btn-contour btn-petit">Désactiver</button></form>`
+      : `<div class="alerte info">Non activée. Recommandé : même avec votre mot de passe, personne ne peut entrer sans votre téléphone.</div>
+         <button class="btn btn-vert btn-petit" id="btn-2fa">Activer la double authentification</button>`;
+    if (s.secours) $('#etat-2fa').insertAdjacentHTML('beforeend', '<div class="alerte erreur">Mode secours actif (ONGD_2FA_SECOURS=1) : retirez cette variable de Railway dès que possible.</div>');
+    $('#sessions').textContent = s.sessions.map(x => `${x.n} session(s) ${x.role === 'admin' ? 'administrateur' : 'volontaire'}`).join(' · ') || 'Aucune autre session.';
+    const LIB = { connexion_admin: 'Connexion admin', echec_connexion_admin: '⚠ Échec de connexion admin', echec_connexion_volontaire: '⚠ Échec de connexion volontaire',
+      '2fa_activee': 'Double authentification activée', '2fa_desactivee': 'Double authentification désactivée', deconnexion_generale: 'Déconnexion de tous les appareils',
+      paiement_incoherent: '⚠ Paiement incohérent', reglages_modifies: 'Réglages modifiés' };
+    $('#journal').innerHTML = s.journal.map(j => `<div class="ligne-item" style="padding:8px 0"><strong>${esc(LIB[j.type] || j.type.replace(/_/g, ' '))}</strong> <span class="petit">· ${heure(j.cree_le)} · ${esc(j.ip || '')}${j.detail ? ' · ' + esc(j.detail) : ''}</span></div>`).join('') || '<p class="petit">Rien à signaler.</p>';
+    const b = $('#btn-2fa');
+    if (b) b.onclick = async () => {
+      const p = await A('/admin/securite/2fa/preparer', { method: 'POST' });
+      $('#config-2fa').innerHTML = `<div class="carte" style="margin-top:12px">
+        <p>1. Installez <strong>Google Authenticator</strong> (ou Microsoft Authenticator) sur votre téléphone.</p>
+        <p>2. Scannez ce code, ou choisissez « Saisir une clé » et tapez :</p>
+        <div id="qr-2fa" style="background:#fff;padding:10px;display:inline-block;border-radius:8px"></div>
+        <p class="ref" style="word-break:break-all">${esc(p.secret)}</p>
+        <p>3. Entrez le code à 6 chiffres affiché par l'application :</p>
+        <form id="form-2fa-on" style="display:flex;gap:6px" novalidate><input name="code" inputmode="numeric" maxlength="6" style="max-width:160px"><button class="btn btn-vert btn-petit">Activer</button></form>
+        <div class="alerte" hidden></div></div>`;
+      if (window.QRCode) new QRCode($('#qr-2fa'), { text: p.uri, width: 180, height: 180 }); else $('#qr-2fa').remove();
+      $('#form-2fa-on').onsubmit = async e => {
+        e.preventDefault();
+        try { const d = await A('/admin/securite/2fa/activer', { method: 'POST', body: JSON.stringify({ code: e.target.code.value }) }); $('#config-2fa').innerHTML = ''; alert(d.message); chargerSecurite(); }
+        catch (err) { message($('#config-2fa .alerte'), err.message, 'erreur'); }
+      };
+    };
+    const off = $('#form-2fa-off');
+    if (off) off.onsubmit = async e => {
+      e.preventDefault();
+      try { const d = await A('/admin/securite/2fa/desactiver', { method: 'POST', body: JSON.stringify({ code: e.target.code.value }) }); alert(d.message); chargerSecurite(); } catch (err) { erreur(err); }
+    };
+  } catch (e) { erreur(e); }
+}
+$('#btn-tout-deco').onclick = async () => {
+  if (!confirm('Déconnecter tous les autres appareils (administrateur et volontaires) ?')) return;
+  try { const d = await A('/admin/securite/deconnecter-tout', { method: 'POST' }); alert(d.message); chargerSecurite(); } catch (e) { erreur(e); }
+};
+
+/* ================= Fichiers payants ================= */
+let fichiersAdmin = [], prixDefaut = { document: 10, video: 20 };
+const poids = o => o >= 1073741824 ? (o / 1073741824).toFixed(1).replace('.', ',') + ' Go' : o >= 1048576 ? (o / 1048576).toFixed(1).replace('.', ',') + ' Mo' : Math.max(1, Math.round(o / 1024)) + ' Ko';
+const GENRES_F = { document: 'Document', photo: 'Photo', video: 'Vidéo' };
+async function chargerFichiers() {
+  try {
+    const d = await A('/admin/fichiers');
+    fichiersAdmin = d.fichiers; prixDefaut = d.prix_defaut;
+    $('#etat-stockage').innerHTML = d.stockage ? '' : '<div class="alerte erreur">Stockage non configuré : ajoutez les variables B2_* (les mêmes qu\'Eaji) sur Railway.</div>';
+    $('#prix-defaut-info').textContent = `Laisser vide = prix par défaut : ${prixDefaut.document} $ pour un document ou une photo, ${prixDefaut.video} $ pour une vidéo (modifiables dans Réglages). Mettre 0 = gratuit.`;
+    $('#liste-fichiers').innerHTML = fichiersAdmin.map(f => `<div class="ligne-item" data-f="${f.id}" style="${f.actif ? '' : 'opacity:.55'}">
+      <span class="etiquette">${GENRES_F[f.genre]}</span> <strong>${esc(f.titre)}</strong>
+      <span class="petit">· ${esc(f.nom_fichier)} · ${poids(Number(f.taille))} · ${f.prix_usd == null ? 'prix par défaut (' + (f.genre === 'video' ? prixDefaut.video : prixDefaut.document) + ' $)' : f.prix_usd ? f.prix_usd + ' $' : 'gratuit'}
+        · ${f.ventes} vente(s) · ${f.par_membres} téléchargement(s) par des membres${f.actif ? '' : ' · retiré'}</span>
+      ${f.description ? `<div class="petit">${esc(f.description)}</div>` : ''}
+      <div class="actions"><button class="btn btn-contour btn-petit" data-fa="modifier">Modifier</button>
+        <button class="btn btn-contour btn-petit" data-fa="actif">${f.actif ? 'Retirer du site' : 'Remettre sur le site'}</button>
+        <button class="btn btn-contour btn-petit" data-fa="supprimer" style="color:var(--rouge)">Supprimer</button></div>
+    </div>`).join('') || '<p class="petit">Aucun fichier publié.</p>';
+    const { achats } = await A('/admin/achats');
+    $('#liste-achats').innerHTML = achats.map(a => `<div class="ligne-item">
+      ${badge(a.statut)} <strong>${montant(a.montant, a.devise)}</strong> <span class="petit">· ${esc(a.titre)} · ${esc(a.reference)} · ${heure(a.cree_le)}</span>
+      <div>${esc(a.nom || 'Sans nom')} — ${esc(a.contact || '')}</div>
+      <div class="petit">${a.mode === 'cinetpay' ? 'Paiement en ligne' : 'Envoi manuel'}${a.operateur ? ' · ' + esc(a.operateur) : ''}${a.ref_paiement && a.mode === 'manuel' ? ' · réf. ' + esc(a.ref_paiement) : ''}${a.statut === 'paye' ? ' · ' + a.telechargements + ' téléchargement(s)' : ''}</div>
+      <div class="actions">${boutonsPaiement(a)}</div></div>`).join('') || '<p class="petit">Aucune vente pour le moment.</p>';
+  } catch (e) { erreur(e); }
+}
+$('#liste-achats').onclick = async e => { const b = e.target.closest('[data-pay]'); if (b && await confirmerPaiement(b.dataset.pay, b.dataset.s)) charger(); };
+$('#liste-fichiers').onclick = async e => {
+  const b = e.target.closest('[data-fa]'); if (!b) return;
+  const f = fichiersAdmin.find(x => x.id == b.closest('[data-f]').dataset.f);
+  try {
+    if (b.dataset.fa === 'modifier') {
+      const titre = prompt('Titre :', f.titre); if (titre === null) return;
+      const description = prompt('Description :', f.description || ''); if (description === null) return;
+      const prix = prompt('Prix en $ (vide = prix par défaut, 0 = gratuit) :', f.prix_usd ?? ''); if (prix === null) return;
+      const d = await A('/admin/fichiers/' + f.id, { method: 'PATCH', body: JSON.stringify({ titre, description, prix_usd: prix.trim(), actif: f.actif }) }); commun_toast(d.message);
+    }
+    if (b.dataset.fa === 'actif') await A('/admin/fichiers/' + f.id, { method: 'PATCH', body: JSON.stringify({ titre: f.titre, description: f.description, prix_usd: f.prix_usd ?? '', actif: !f.actif }) });
+    if (b.dataset.fa === 'supprimer') { if (!confirm('Supprimer « ' + f.titre + ' » ?')) return; const d = await A('/admin/fichiers/' + f.id, { method: 'DELETE' }); alert(d.message); }
+    chargerFichiers();
+  } catch (err) { erreur(err); }
+};
+const commun_toast = t => { const el = $('#alerte-generale'); message(el, t, 'ok'); setTimeout(() => el.hidden = true, 4000); };
+function envoyerXhr(methode, url, corps, entetes, progression) {
+  return new Promise((ok, ko) => {
+    const x = new XMLHttpRequest(); x.open(methode, url);
+    for (const [k, v] of Object.entries(entetes)) x.setRequestHeader(k, v);
+    x.upload.onprogress = e => e.lengthComputable && progression(e.loaded / e.total);
+    x.onload = () => x.status >= 200 && x.status < 300 ? ok() : ko(Object.assign(new Error('Envoi refusé (' + x.status + ')'), { status: x.status }));
+    x.onerror = () => ko(new Error('réseau'));
+    x.send(corps);
+  });
+}
+async function envoyerAuStockage(fichier, maj, genreAttendu) {
+  const p = await A('/admin/fichiers/preparer', { method: 'POST', body: JSON.stringify({ nom: fichier.name, taille: fichier.size, type: fichier.type }) });
+  if (genreAttendu && p.genre !== genreAttendu) throw new Error('Ce fichier n\'est pas une vidéo (MP4, MOV, 3GP, WebM…).');
+  maj(0);
+  try { await envoyerXhr('PUT', p.url_envoi, fichier, { 'Content-Type': p.type }, maj); }
+  catch { // envoi direct impossible : on passe par le serveur
+    maj(0);
+    await envoyerXhr('POST', `${ONGD.api}/admin/fichiers/relais?cle=${encodeURIComponent(p.cle)}&type=${encodeURIComponent(p.type)}`, fichier,
+      { 'Content-Type': 'application/octet-stream', Authorization: 'Bearer ' + token }, maj);
+  }
+  return p.cle;
+}
+$('#form-fichier').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button'), fichier = f.fichier.files[0];
+  msg.hidden = true;
+  if (!fichier) return message(msg, 'Choisissez un fichier.', 'erreur');
+  if (f.titre.value.trim().length < 3) return message(msg, 'Indiquez un titre.', 'erreur');
+  btn.disabled = true;
+  const barre = $('#barre-envoi'), maj = p => { barre.hidden = false; barre.querySelector('span').style.width = Math.round(p * 100) + '%'; barre.querySelector('em').textContent = Math.round(p * 100) + ' %'; };
+  try {
+    const cle = await envoyerAuStockage(fichier, maj);
+    const d = await A('/admin/fichiers', { method: 'POST', body: JSON.stringify({ titre: f.titre.value, description: f.description.value, prix_usd: f.prix_usd.value, cle, nom_fichier: fichier.name }) });
+    message(msg, d.message, 'ok'); f.reset(); chargerFichiers();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message === 'réseau' ? 'Envoi interrompu : vérifiez la connexion et réessayez.' : err.message, 'erreur'); }
+  barre.hidden = true; btn.disabled = false;
+};
+
+/* ================= Membres et consultations ================= */
+let vueMembres = 'membres', membresAdmin = [];
+$('#filtre-membres').onclick = e => { const b = e.target.closest('button'); if (!b) return; vueMembres = b.dataset.v;
+  document.querySelectorAll('#filtre-membres button').forEach(x => x.classList.toggle('actif', x === b)); chargerMembres(); };
+async function chargerMembres() {
+  $('#vue-liste-membres').hidden = vueMembres !== 'membres'; $('#vue-consultations').hidden = vueMembres !== 'consultations';
+  try {
+    if (vueMembres === 'membres') {
+      ({ membres: membresAdmin } = await A('/admin/membres'));
+      const n = { honneur: membresAdmin.filter(m => m.a_jour && m.categorie === 'honneur').length, vip: membresAdmin.filter(m => m.a_jour && m.categorie === 'vip').length };
+      $('#totaux-membres').innerHTML = `<div><strong>${n.honneur}</strong><span class="petit">membre(s) d'honneur à jour</span></div><div><strong>${n.vip}</strong><span class="petit">membre(s) VIP à jour</span></div>`;
+      $('#liste-membres').innerHTML = membresAdmin.map(m => `<div class="ligne-item" data-m="${m.id}">
+        <span class="etiquette ${m.categorie === 'vip' ? '' : 'or'}">${m.categorie === 'vip' ? 'VIP' : 'Honneur'}</span>
+        ${m.statut === 'suspendu' ? '<span class="statut suspendu">Suspendu</span>' : m.a_jour ? `<span class="statut">À jour → ${new Date(m.expire_le).toLocaleDateString('fr-FR')}</span>` : m.statut === 'en_attente' ? '<span class="statut en_attente">Première cotisation en attente</span>' : `<span class="statut annule">Expiré le ${new Date(m.expire_le).toLocaleDateString('fr-FR')}</span>`}
+        <strong>${esc(m.nom)}</strong> <span class="petit">+${esc(m.telephone)}${m.email ? ' · ' + esc(m.email) : ''}${m.organisation ? ' · ' + esc(m.organisation) : ''}</span>
+        ${m.cotisations.filter(c => ['declare', 'en_attente'].includes(c.statut) && c.mode === 'manuel').map(c => `<div class="petit" style="margin-top:6px">${badge(c.statut)} ${montant(Number(c.montant), c.devise)} · ${c.categorie === 'vip' ? 'VIP' : 'Honneur'} · ${esc(c.reference)}${c.ref_paiement ? ' · réf. ' + esc(c.ref_paiement) : ''}
+          <div class="actions">${boutonsPaiement(c)}</div></div>`).join('')}
+        <div class="actions">
+          ${m.statut === 'suspendu' ? '<button class="btn btn-contour btn-petit" data-ms="actif">Réactiver</button>' : '<button class="btn btn-contour btn-petit" data-ms="suspendu" style="color:var(--rouge)">Suspendre</button>'}
+          <a class="btn btn-contour btn-petit" href="https://wa.me/${esc(m.telephone)}" target="_blank" rel="noopener">WhatsApp</a>
+        </div></div>`).join('') || '<p class="petit">Aucun membre pour le moment.</p>';
+    } else {
+      const { consultations } = await A('/admin/consultations');
+      const props = consultations.filter(c => c.statut === 'proposee'), autres = consultations.filter(c => c.statut !== 'proposee');
+      const res = c => c.options.map(o => { const v = c.resultats[o] || { total: 0, honneur: 0, vip: 0 };
+        return `<div class="petit">• <strong>${esc(o)}</strong> : ${v.total} vote(s) <span>(honneur ${v.honneur || 0} · VIP ${v.vip || 0})</span></div>`; }).join('');
+      $('#liste-consultations').innerHTML =
+        (props.length ? '<h3>Propositions des membres</h3>' + props.map(c => `<div class="ligne-item" data-co="${c.id}">
+          <span class="statut en_attente">Proposée par ${esc(c.propose_par_nom || 'un membre')}</span><h3 style="margin:8px 0 2px">${esc(c.titre)}</h3>
+          <p class="texte-long" style="margin:6px 0">${esc(c.texte || '')}</p>
+          <div class="actions"><button class="btn btn-vert btn-petit" data-cs="ouverte">Soumettre au vote</button><button class="btn btn-contour btn-petit" data-cs="refusee">Ne pas retenir</button></div></div>`).join('') : '')
+        + '<h3 style="margin-top:18px">Consultations</h3>' + (autres.map(c => `<div class="ligne-item" data-co="${c.id}">
+          ${badge(c.statut)} ${c.public === 'vip' ? '<span class="etiquette">VIP seulement</span>' : '<span class="etiquette">Tous les membres</span>'}
+          <h3 style="margin:8px 0 2px">${esc(c.titre)}</h3>
+          <div class="petit">${c.date_limite ? 'Jusqu\'au ' + heure(c.date_limite) : 'Sans date limite'}${c.propose_par_nom ? ' · proposée par ' + esc(c.propose_par_nom) : ''}</div>
+          ${c.texte ? `<p class="texte-long" style="margin:6px 0">${esc(c.texte)}</p>` : ''}
+          ${res(c)}
+          ${c.avis.length ? `<details style="margin-top:6px"><summary>${c.avis.length} avis</summary>${c.avis.map(a => `<div class="message-fil"><span class="auteur">${esc(a.nom)}</span> <span class="petit">${a.categorie === 'vip' ? 'VIP' : 'Honneur'}</span><p style="margin:4px 0 0">${esc(a.texte)}</p></div>`).join('')}</details>` : ''}
+          <div class="actions">${c.statut === 'ouverte' ? '<button class="btn btn-contour btn-petit" data-cs="close">Clore le vote</button>' : '<button class="btn btn-contour btn-petit" data-cs="ouverte">Rouvrir</button>'}
+            <button class="btn btn-contour btn-petit" data-cs="supprimer" style="color:var(--rouge)">Supprimer</button></div></div>`).join('') || '<p class="petit">Aucune consultation.</p>');
+    }
+  } catch (e) { erreur(e); }
+}
+$('#liste-membres').onclick = async e => {
+  const pay = e.target.closest('[data-pay]'), ms = e.target.closest('[data-ms]');
+  if (pay && await confirmerPaiement(pay.dataset.pay, pay.dataset.s)) return charger();
+  if (ms) { if (ms.dataset.ms === 'suspendu' && !confirm('Suspendre ce membre ? Il ne pourra plus se connecter.')) return;
+    try { await A('/admin/membres/' + ms.closest('[data-m]').dataset.m, { method: 'PATCH', body: JSON.stringify({ statut: ms.dataset.ms }) }); chargerMembres(); } catch (err) { erreur(err); } }
+};
+$('#liste-consultations').onclick = async e => {
+  const b = e.target.closest('[data-cs]'); if (!b) return;
+  const id = b.closest('[data-co]').dataset.co;
+  try {
+    if (b.dataset.cs === 'supprimer') { if (!confirm('Supprimer cette consultation, ses votes et ses avis ?')) return; await A('/admin/consultations/' + id, { method: 'DELETE' }); }
+    else await A('/admin/consultations/' + id, { method: 'PATCH', body: JSON.stringify({ statut: b.dataset.cs }) });
+    charger();
+  } catch (err) { erreur(err); }
+};
+$('#form-consultation').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button'); btn.disabled = true;
+  try {
+    const d = await A('/admin/consultations', { method: 'POST', body: JSON.stringify({ titre: f.titre.value, texte: f.texte.value, options: f.options.value,
+      public: f.public.value, date_limite: versIso(f.date_limite.value) }) });
+    message(msg, d.message, 'ok'); f.reset(); chargerMembres();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+  btn.disabled = false;
+};
+$('#btn-csv-cotisations').onclick = () => telecharger('/admin/cotisations.csv', 'cotisations-membres.csv');
+
+$('#btn-diagnostic').onclick = async () => {
+  const z = $('#diagnostic'); z.innerHTML = '<p class="petit">Vérification…</p>';
+  try {
+    const d = await A('/admin/diagnostic');
+    const L = { ia: 'Assistant IA et traduction', stockage: 'Stockage des fichiers (Backblaze)', paiement: 'Paiement en ligne (CinetPay)' };
+    z.innerHTML = Object.keys(L).map(k => `<div class="alerte ${d[k].ok ? 'ok' : 'erreur'}">${d[k].ok ? '✓' : '✗'} <strong>${L[k]}</strong> : ${esc(d[k].detail || '')}</div>`).join('');
+  } catch (e) { erreur(e); z.innerHTML = ''; }
+};
+/* ================= Rôles : administrateur principal et secondaires ================= */
+const ONGLET_SECTION = { activites: 'activites', publier: 'activites', volontaires: 'volontaires', dons: 'dons', messages: 'messages', formations: 'formations',
+  boutique: 'boutique', annonces: 'annonces', dialogue: 'dialogue', direct: 'direct', fichiers: 'fichiers', membres: 'membres' };
+let moiAdmin = null;
+async function appliquerRoles() {
+  try { moiAdmin = await A('/admin/moi'); } catch (e) { erreur(e); return; }
+  const ok = o => moiAdmin.principal || (ONGLET_SECTION[o] && moiAdmin.permissions.includes(ONGLET_SECTION[o]));
+  let premier = null;
+  document.querySelectorAll('#onglets button').forEach(b => { const v = ok(b.dataset.o); b.hidden = !v; if (v && !premier) premier = b; });
+  $('#qui-admin').innerHTML = moiAdmin.principal ? '<span class="etiquette or">Administrateur principal</span>'
+    : `<span class="etiquette">${esc(moiAdmin.nom)}${moiAdmin.charge ? ' — ' + esc(moiAdmin.charge) : ''}</span>`;
+  if (!ok(onglet) && premier) premier.click(); else charger();
+}
+
+const CHARGES = {
+  'Chargé(e) de média et publications': ['activites', 'fichiers', 'annonces', 'direct', 'dialogue'],
+  'Chargé(e) des partenariats': ['messages', 'membres'],
+  'Chargé(e) des contacts': ['messages', 'dialogue'],
+  "Chargé(e) de l'emploi et des recrutements": ['volontaires', 'formations'],
+  'Chargé(e) des finances': ['dons', 'boutique', 'fichiers', 'membres'],
+  'Autre': [],
+};
+let sectionsAdmin = {}, adminsListe = [];
+function casesSections(choisies, nom) {
+  return Object.entries(sectionsAdmin).map(([k, v]) => `<label class="case" style="margin:4px 0"><input type="checkbox" name="${nom}" value="${k}" ${choisies.includes(k) ? 'checked' : ''}> ${esc(v)}</label>`).join('');
+}
+async function chargerAdmins() {
+  try {
+    const d = await A('/admin/admins');
+    sectionsAdmin = d.sections; adminsListe = d.admins;
+    const f = $('#form-admin');
+    if (!f.dataset.pret) {
+      f.charge_type.innerHTML = Object.keys(CHARGES).map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+      f.dataset.pret = '1';
+      f.charge_type.onchange = () => { $('#champ-charge-libre').hidden = f.charge_type.value !== 'Autre'; $('#cases-admin').innerHTML = casesSections(CHARGES[f.charge_type.value] || [], 'perm'); };
+      f.charge_type.onchange();
+    }
+    $('#liste-admins').innerHTML = adminsListe.map(a => `<div class="ligne-item" data-ad="${a.id}">
+      ${a.statut === 'actif' ? '<span class="statut">Actif</span>' : '<span class="statut suspendu">Suspendu</span>'}
+      <strong>${esc(a.nom)}</strong> <span class="petit">+${esc(a.telephone)}${a.charge ? ' · ' + esc(a.charge) : ''}${a.derniere_connexion ? ' · dernière connexion ' + heure(a.derniere_connexion) : ' · jamais connecté'}</span>
+      <div class="etiquettes">${a.permissions.map(p => `<span class="etiquette">${esc(sectionsAdmin[p] || p)}</span>`).join('')}</div>
+      <div class="actions">
+        <button class="btn btn-contour btn-petit" data-ada="charges">Modifier les charges</button>
+        <button class="btn btn-contour btn-petit" data-ada="mdp">Changer le mot de passe</button>
+        <button class="btn btn-contour btn-petit" data-ada="statut">${a.statut === 'actif' ? 'Suspendre' : 'Réactiver'}</button>
+        <button class="btn btn-contour btn-petit" data-ada="supprimer" style="color:var(--rouge)">Supprimer</button>
+      </div>
+      <form class="form-charges carte" hidden style="margin-top:10px" novalidate>
+        <div class="champ"><label>Charge</label><input name="charge" value="${esc(a.charge || '')}"></div>
+        ${casesSections(a.permissions, 'perm')}
+        <button class="btn btn-vert btn-petit" style="margin-top:8px">Enregistrer</button>
+      </form>
+    </div>`).join('') || '<p class="petit">Aucun administrateur secondaire.</p>';
+    $('#liste-admins').querySelectorAll('.form-charges').forEach(fc => fc.onsubmit = async e => {
+      e.preventDefault();
+      const id = fc.closest('[data-ad]').dataset.ad;
+      try { const r = await A('/admin/admins/' + id, { method: 'PATCH', body: JSON.stringify({ charge: fc.charge.value,
+        permissions: [...fc.querySelectorAll('[name=perm]:checked')].map(x => x.value) }) }); commun_toast(r.message); chargerAdmins(); } catch (err) { erreur(err); }
+    });
+  } catch (e) { erreur(e); }
+}
+$('#liste-admins').onclick = async e => {
+  const b = e.target.closest('[data-ada]'); if (!b) return;
+  const el = b.closest('[data-ad]'), a = adminsListe.find(x => x.id == el.dataset.ad);
+  try {
+    if (b.dataset.ada === 'charges') { const fc = el.querySelector('.form-charges'); fc.hidden = !fc.hidden; return; }
+    if (b.dataset.ada === 'mdp') {
+      const m = prompt('Nouveau mot de passe pour ' + a.nom + ' (8 caractères minimum) :'); if (!m) return;
+      const r = await A('/admin/admins/' + a.id, { method: 'PATCH', body: JSON.stringify({ mot_de_passe: m }) }); commun_toast(r.message);
+    }
+    if (b.dataset.ada === 'statut') await A('/admin/admins/' + a.id, { method: 'PATCH', body: JSON.stringify({ statut: a.statut === 'actif' ? 'suspendu' : 'actif' }) });
+    if (b.dataset.ada === 'supprimer') { if (!confirm('Supprimer définitivement ' + a.nom + ' ?')) return; const r = await A('/admin/admins/' + a.id, { method: 'DELETE' }); commun_toast(r.message); }
+    chargerAdmins();
+  } catch (err) { erreur(err); }
+};
+$('#form-admin').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, msg = f.querySelector('.alerte'), btn = f.querySelector('button'); msg.hidden = true; btn.disabled = true;
+  try {
+    const d = await A('/admin/admins', { method: 'POST', body: JSON.stringify({ nom: f.nom.value, telephone: f.telephone.value,
+      charge: f.charge_type.value === 'Autre' ? f.charge_libre.value : f.charge_type.value, mot_de_passe: f.mdp.value,
+      permissions: [...f.querySelectorAll('[name=perm]:checked')].map(x => x.value) }) });
+    message(msg, d.message, 'ok'); f.nom.value = f.telephone.value = f.mdp.value = f.charge_libre.value = ''; chargerAdmins();
+  } catch (err) { if (err.status === 401) erreur(err); else message(msg, err.message, 'erreur'); }
+  btn.disabled = false;
+};
+
+/* ================= Visites ================= */
+let joursVisites = 30;
+const NOMS_PAGES = { 'index.html': 'Accueil', 'formations.html': 'Formations', 'fichiers.html': 'Documents', 'membres.html': 'Membres', 'boutique.html': 'Boutique',
+  'dialogue.html': 'Dialogue', 'direct.html': 'En direct', 'annonces.html': 'Annonces', 'volontaire.html': 'Espace volontaire', 'paiement.html': 'Suivi de paiement' };
+const nomPage = p => { const [f, h] = p.split('#'); return (NOMS_PAGES[f] || f) + (h ? ' › ' + h : ''); };
+$('#periode-visites').onclick = e => { const b = e.target.closest('button'); if (!b) return; joursVisites = +b.dataset.j;
+  document.querySelectorAll('#periode-visites button').forEach(x => x.classList.toggle('actif', x === b)); chargerVisites(); };
+function barres(liste, total, nom = n => n) {
+  return liste.length ? liste.map(x => `<div style="margin:6px 0"><div style="display:flex;justify-content:space-between;gap:8px"><span>${esc(nom(x.nom))}</span><span class="petit">${x.visiteurs} visiteur(s) · ${x.vues} vue(s)</span></div>
+    <div class="progression" style="margin:3px 0 0;height:8px"><span style="width:${total ? Math.max(2, Math.round(x.vues / total * 100)) : 0}%"></span></div></div>`).join('') : '<p class="petit">Pas encore de données.</p>';
+}
+async function chargerVisites() {
+  try {
+    const d = await A('/admin/visites?jours=' + joursVisites), t = d.totaux;
+    $('#en-ligne').innerHTML = `<span class="point-rouge" style="background:var(--vert);display:inline-block;vertical-align:middle"></span> ${d.en_ligne} personne(s) sur le site en ce moment`;
+    $('#totaux-visites').innerHTML = [[t.visiteurs_jour, 'visiteurs aujourd\'hui', t.vues_jour + ' vues'], [t.visiteurs_7j, 'visiteurs sur 7 jours', t.vues_7j + ' vues'],
+      [t.visiteurs_periode, 'visiteurs sur ' + (d.jours === 365 ? '1 an' : d.jours + ' jours'), t.vues_periode + ' vues'], [t.vues_total, 'vues depuis le début', '']]
+      .map(([n, l, s]) => `<div><strong>${n.toLocaleString('fr-FR')}</strong><span class="petit">${l}${s ? ' · ' + s : ''}</span></div>`).join('');
+    // Graphique : un bâton par jour (jours sans visite compris)
+    const parJour = new Map(d.par_jour.map(x => [x.jour, x])), jours = [];
+    for (let i = d.jours - 1; i >= 0; i--) { const dt = new Date(Date.now() - i * 86400000); jours.push(dt.toLocaleDateString('en-CA', { timeZone: 'Africa/Kinshasa' })); }
+    const max = Math.max(1, ...d.par_jour.map(x => x.visiteurs));
+    $('#graphe-visites').innerHTML = jours.map(j => { const x = parJour.get(j) || { visiteurs: 0, vues: 0 };
+      return `<div class="baton" title="${new Date(j + 'T12:00').toLocaleDateString('fr-FR')} : ${x.visiteurs} visiteur(s), ${x.vues} vue(s)"><span style="height:${Math.round(x.visiteurs / max * 100)}%"></span></div>`; }).join('')
+      + `<div class="graphe-legende"><span>${new Date(jours[0] + 'T12:00').toLocaleDateString('fr-FR')}</span><span>max ${max} / jour</span><span>aujourd'hui</span></div>`;
+    const tot = t.vues_periode;
+    $('#top-pages').innerHTML = barres(d.pages, tot, nomPage);
+    $('#top-sources').innerHTML = barres(d.sources, tot, n => n === 'Direct' ? 'Direct (lien partagé, favori, adresse tapée)' : n);
+    $('#top-regions').innerHTML = barres(d.regions, tot);
+    $('#top-appareils').innerHTML = barres(d.appareils, tot);
+  } catch (e) { erreur(e); }
+}
+
+function demarrer() { montrer(true); appliquerRoles(); }
+if (token) demarrer(); else montrer(false);
+</script>
+</body>
+</html>
