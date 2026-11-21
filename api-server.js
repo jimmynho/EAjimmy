@@ -976,7 +976,8 @@ async function sendLoginOtp(creator, via = 'email', req = null, { skipFirebase =
   if (await sessions.knownDevice(creator.id, deviceKey).catch(() => false)) { await save('sms'); return { code, channel: 'ecran', known: true }; }
   if (creator.email && EMAIL_PROVIDER_CONNECTED) {
     await save('gmail');
-    const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de connexion : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).\n\nNe le donne à personne, même à quelqu'un qui dit être de l'équipe Eaji. Si ce n'est pas toi qui essaies de te connecter, change ton mot de passe.`);
+    const site = String(process.env.PUBLIC_SITE_URL || 'https://eaji.org').replace(/\/+$/, '');
+    const sent = await trySendEmail(creator.email, 'Eaji — ton code de connexion', `Ton code de connexion : ${code} (valable ${LOGIN_CODE_MINUTES} minutes).\n\nSur ton téléphone, touche ce lien pour entrer directement dans Eaji (le code s'écrit tout seul) :\n${site}/index.html?lid=${creator.id}&lc=${code}\n\nNe le donne à personne, même à quelqu'un qui dit être de l'équipe Eaji. Si ce n'est pas toi qui essaies de te connecter, change ton mot de passe.`);
     if (sent) return { code, channel: 'gmail', emailed: true };
     emailTried = true; // l'email n'est pas parti
   }
@@ -1673,7 +1674,7 @@ async function feedIds(viewerId, country) {
 async function feedItems(viewerId, country, contentId, onlyIds) {
   const items = await db.all(
     `SELECT c.id, c.title, c.content_type, c.created_at, c.visibility_scope,
-            c.storage_url, c.duration_seconds, c.sale_price, c.sound_content_id, c.ai_generated, c.media_width, c.media_height, c.text_bg, (c.storage_url = '') AS text_only,
+            c.storage_url, c.duration_seconds, c.sale_price, c.sound_content_id, c.ai_generated, c.media_width, c.media_height, c.text_bg, (c.storage_url = '') AS text_only, c.thumb_key,
             (SELECT s.title FROM content_items s WHERE s.id = c.sound_content_id) AS sound_title,
             (SELECT scr.name FROM content_items s JOIN creators scr ON scr.id = s.creator_id WHERE s.id = c.sound_content_id) AS sound_creator_name,
             cr.id AS creator_id, cr.name AS creator_name, cr.country_code AS creator_country, cr.photo_url AS creator_photo_key,
@@ -1714,6 +1715,8 @@ async function feedItems(viewerId, country, contentId, onlyIds) {
     item.locked = a.locked;
     // Contenu payant pas encore débloqué : le fichier n'est pas envoyé.
     item.fileUrl = a.locked ? null : await createDownloadUrl(item.storage_url).catch(() => null);
+    item.thumbUrl = item.thumb_key ? await createDownloadUrl(item.thumb_key).catch(() => null) : null;
+    delete item.thumb_key;
     item.creator_photo = await createDownloadUrl(item.creator_photo_key).catch(() => null);
     delete item.storage_url;
     delete item.creator_photo_key;
